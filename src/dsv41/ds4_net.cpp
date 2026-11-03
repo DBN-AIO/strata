@@ -406,11 +406,11 @@ bool ExpertHost::compute(uint32_t layer, uint32_t n_tok, uint32_t k, const int32
         }
     });
     // h -> the down matrix's activation type
-    I.pool->parallel_for(n_ent, [&](int s) {
-        const float* h = I.hf.data() + (size_t) s * (size_t) FF;
-        if (mx) gg::mx_quant(h, FF, I.ha.p + (size_t) s * hs);
-        else gg::iq_cpu_quant(fm.d_act, h, FF, I.ha.p + (size_t) s * hs);
-    });
+    // (the i-quant activation quantizer is called from one thread at a time, as the engine's lane does)
+    if (mx)
+        I.pool->parallel_for(n_ent, [&](int s) { gg::mx_quant(I.hf.data() + (size_t) s * (size_t) FF, FF, I.ha.p + (size_t) s * hs); });
+    else
+        for (int s = 0; s < n_ent; ++s) gg::iq_cpu_quant(fm.d_act, I.hf.data() + (size_t) s * (size_t) FF, FF, I.ha.p + (size_t) s * hs);
     // down -> out rows
     I.pool->parallel_for(nj * DB, [&](int j) {
         const Job& jb = jobs[(size_t) (j / DB)];
