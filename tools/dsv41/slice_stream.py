@@ -7,9 +7,13 @@ the same ds4.txt / tensors.txt (so the model fingerprint is the conductor's), th
 the served layers' expert bytes in place.  Linux and Windows (NTFS: the sparse flag is set before the file grows; a file grown
 by truncate() would be zero-filled there).
 
-  # on the host with the model:                               python3 slice_stream.py emit PACK 26-34 [E0-E1] > layers.stream
+  # on the host with the model:                               python3 slice_stream.py emit PACK 26-34 [E0-E1] [--perm perm.bin] > layers.stream
   # on the expert-server host (any pipe, e.g. through ssh):   python3 slice_stream.py apply OUT_DIR < layers.stream
   ssh nobara 'python3 slice_stream.py emit PACK 26-34' | python slice_stream.py apply C:\\AIO-strata-model\\dsv41-slice
+
+--perm FILE (plan_split.py --popularity --perm-out): the experts were renumbered hottest first and the conductor calls the servers by
+RANK (STRATA_DS4_EXPERT_PERM).  E0-E1 are then ranks, and the slice holds the bytes of the original expert at the slot of its rank, so
+the server (which knows nothing of the renumbering) finds rank r at its usual stride.  The slice's tensors.txt is unchanged.
 
 Disk used on the server = the served layers' experts (about 3.3 GB a layer for the 2.00 bpw set, 5.2 GB for a 3 bit set).
 `apply` refuses to write into a folder that already has a different slice (nothing is deleted or overwritten silently).
@@ -49,16 +53,57 @@ def read_kv(path):
     return kv
 
 
-def emit(pack, lo, hi, out, elo=0, ehi=10**9):
+def read_perm(path, n_layers, n_exp):
+    """DS4PERM1 (plan_split.py --perm-out): rank[layer][original expert]; every layer a permutation of 0..n_exp-1."""
+    try:
+        blob = open(path, "rb").read()
+    except OSError as e:
+        sys.exit("--perm %s: %s" % (path, e.strerror or e))
+    if blob[:8] != b"DS4PERM1" or len(blob) < 16:
+        sys.exit("--perm %s: not a DS4PERM1 file" % path)
+    nl, ne = struct.unpack_from("<II", blob, 8)
+    if len(blob) != 16 + nl * ne * 2:
+        sys.exit("--perm %s: %d bytes, a %d x %d table is %d" % (path, len(blob), nl, ne, 16 + nl * ne * 2))
+    if nl < n_layers or ne != n_exp:
+        sys.exit("--perm %s is for %d layers x %d experts, this pack has %d x %d" % (path, nl, ne, n_layers, n_exp))
+    rows = [list(struct.unpack_from("<%dH" % ne, blob, 16 + il * ne * 2)) for il in range(nl)]
+    for il, r in enumerate(rows):
+        if sorted(r) != list(range(ne)):
+            sys.exit("--perm %s: layer %d is not a permutation of 0-%d" % (path, il, ne - 1))
+    return rows
+
+
+def emit(pack, lo, hi, out, elo=0, ehi=10**9, perm=None):
     kv = read_kv(os.path.join(pack, "ds4.txt"))
     files, ex = parse_tensors(os.path.join(pack, "tensors.txt"))
     model_dir = kv["model_dir"]
     sizes = {i: os.path.getsize(os.path.join(model_dir, n)) for i, n in files.items()}
     # ranges to ship: the served layers' (and experts') bytes, merged per file
     rng = {}
-    for il, off, nb, fi, _, e in ex:
-        if lo <= il <= hi and elo <= e <= ehi:
-            rng.setdefault(fi, []).append((off, off + nb))
+    moved = {}   # perm: file -> [(source offset, destination offset, bytes)]
+    if perm is None:
+        for il, off, nb, fi, _, e in ex:
+            if lo <= il <= hi and elo <= e <= ehi:
+                rng.setdefault(fi, []).append((off, off + nb))
+    else:
+        n_exp = 1 + max(e for _, _, _, _, _, e in ex)
+        n_layers = 1 + max(il for il, _, _, _, _, _ in ex)
+        rows = read_perm(perm, n_layers, n_exp)
+        by = {}
+        for line_il, off, nb, fi, line, e in ex:
+            by[(line_il, e, line.split()[1].split(".")[5])] = (off, nb, fi)
+        for il in range(lo, hi + 1):
+            inv = {r: e for e, r in enumerate(rows[il])}
+            for r in range(max(elo, 0), min(ehi, n_exp - 1) + 1):
+                for w in ("w1", "w2", "w3"):
+                    if (il, r, w) not in by:
+                        continue
+                    so, sn, sf = by[(il, inv[r], w)]
+                    do, dn, df = by[(il, r, w)]
+                    if sn != dn or sf != df:
+                        sys.exit("--perm: expert %d and rank %d of layer %d (%s) differ in size or file: not a stacked pack" % (inv[r], r, il, w))
+                    moved.setdefault(df, []).append((so, do, dn))
+                    rng.setdefault(df, []).append((do, do + dn))
     merged = {}
     for fi, r in rng.items():
         r.sort()
@@ -80,7 +125,17 @@ def emit(pack, lo, hi, out, elo=0, ehi=10**9):
     for fi, m in sorted(merged.items()):
         fd = os.open(os.path.join(model_dir, files[fi]), os.O_RDONLY | getattr(os, "O_BINARY", 0))
         try:
-            for a, b in m:
+            for so, do, dn in sorted(moved.get(fi, []), key=lambda t: t[1]):   # --perm: the original expert's bytes, at its rank's slot
+                off = 0
+                while off < dn:
+                    n = min(CHUNK, dn - off)
+                    buf = os.pread(fd, n, so + off)
+                    if len(buf) != n:
+                        sys.exit("short read of %s at %d" % (files[fi], so + off))
+                    out.write(struct.pack("<IQQ", fi, do + off, n) + buf)
+                    off += n
+                    done += n
+            for a, b in (m if not moved else []):
                 off = a
                 while off < b:
                     n = min(CHUNK, b - off)
@@ -156,9 +211,16 @@ def apply(out_dir, inp):
 
 def main():
     if len(sys.argv) >= 4 and sys.argv[1] == "emit":
-        lo, hi = (int(x) for x in sys.argv[3].split("-"))
-        elo, ehi = (int(x) for x in sys.argv[4].split("-")) if len(sys.argv) > 4 else (0, 10**9)
-        emit(sys.argv[2], lo, hi, sys.stdout.buffer, elo, ehi)
+        argv, perm = list(sys.argv), None
+        if "--perm" in argv:
+            i = argv.index("--perm")
+            if i + 1 >= len(argv):
+                sys.exit("--perm needs a file")
+            perm = argv[i + 1]
+            del argv[i:i + 2]
+        lo, hi = (int(x) for x in argv[3].split("-"))
+        elo, ehi = (int(x) for x in argv[4].split("-")) if len(argv) > 4 else (0, 10**9)
+        emit(argv[2], lo, hi, sys.stdout.buffer, elo, ehi, perm)
     elif len(sys.argv) >= 3 and sys.argv[1] == "apply":
         apply(sys.argv[2], sys.stdin.buffer)
     else:
