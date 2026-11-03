@@ -168,6 +168,14 @@ int main() {
         check(sp.size() == 512 && sp[0] == std::make_pair(38, 300) && sp[1] == std::make_pair(39, 256), "served_pairs with an expert range");
     }
 
+    {   // ---- a server must be configured with the model's top-k and fingerprint (the CPU-only server was not)
+        uint8_t fp0[32] = {}, fp1[32] = {};
+        fp1[7] = 1;
+        check(!serve_cfg_problem(0, fp1).empty(), "serve_cfg_problem: top_k 0 refused");
+        check(!serve_cfg_problem(10, fp0).empty(), "serve_cfg_problem: an all-zero fingerprint refused");
+        check(serve_cfg_problem(10, fp1).empty(), "serve_cfg_problem: top_k and fingerprint set: ok");
+    }
+
     if (g_fail == 0) std::printf("net_experts_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }

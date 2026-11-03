@@ -235,6 +235,18 @@ inline std::string parse_req(const ReqLimits& L, const uint8_t* p, size_t len, R
     return std::string();
 }
 
+// ---------------------------------------------------------------- a server's own configuration
+/// Why a server's configuration cannot serve a hardened conductor, or "" when it can: the HELLO check compares the
+/// model fingerprint (all zeros = never computed) and every REQ's k against top_k (0 = every request refused).  The
+/// CPU-only server once started with neither set, so every conductor was refused ("model fingerprint differs").
+inline std::string serve_cfg_problem(int64_t top_k, const uint8_t fingerprint[32]) {
+    if (top_k <= 0) return "top_k is not set (every request would be refused as k != top-k)";
+    bool zero = true;
+    for (int i = 0; i < 32; ++i) zero = zero && fingerprint[i] == 0;
+    if (zero) return "the model fingerprint is not computed (every conductor would be refused: fingerprint differs)";
+    return std::string();
+}
+
 // ---------------------------------------------------------------- the prompt path (B3)
 /// One REQ of a prompt: tokens [t0, t0 + nt) and the number of asked-for entries in them.
 struct PromptWindow { int64_t t0 = 0, nt = 0; uint32_t want = 0; };

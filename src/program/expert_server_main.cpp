@@ -18,6 +18,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/core/net_experts.hpp"
+#include "strata/core/net_proto.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -39,6 +40,7 @@ using Clock = std::chrono::steady_clock;
 struct Options {
     std::string pack, native;
     int listen_port = 7840;
+    std::string listen_host;       ///< --listen HOST:PORT (empty: 127.0.0.1)
     std::string serve_layers;      ///< "a-b" (inclusive); empty: every layer
     int pool_workers = 0;          ///< 0: every physical core minus the host's (the engine's default)
     bool no_host_worker = false;
@@ -50,7 +52,7 @@ void usage(std::FILE* f) {
         "strata-expert-server (CPU only: no CUDA is linked or initialised)\n"
         "  --pack DIR           the model's pack folder (native_experts.txt, as for strata --pack)\n"
         "  --native SHARD1      the model's first GGUF shard (the experts are read from the shards in place)\n"
-        "  --listen PORT        TCP port (default 7840)\n"
+        "  --listen [HOST:]PORT bind address (default 127.0.0.1:7840; a bare port is loopback)\n"
         "  --serve-layers A-B   layers to hold in RAM and answer for, inclusive (default: all)\n"
         "  --pool-workers N     CPU expert pool worker count (default 0: every physical core minus the host's)\n"
         "  --no-host-worker     the calling thread does not take expert jobs (A/B arm)\n"
@@ -81,7 +83,13 @@ bool parse(int argc, char** argv, Options& o) {
         bool tv = false;
         if (a == "--pack") o.pack = next("--pack");
         else if (a == "--native") o.native = next("--native");
-        else if (a == "--listen") o.listen_port = std::atoi(next("--listen"));
+        else if (a == "--listen") {   // PORT or HOST:PORT ([v6]:PORT); a bare port binds 127.0.0.1, as the engine's server does
+            std::string why;
+            if (!strata::core::netproto::parse_hostport(next("--listen"), "127.0.0.1", 7840, true, o.listen_host, o.listen_port, why)) {
+                std::fprintf(stderr, "strata-expert-server: --listen: %s\n", why.c_str());
+                return 2;
+            }
+        }
         else if (a == "--serve-layers") o.serve_layers = next("--serve-layers");
         else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
         else if (a == "--no-host-worker") o.no_host_worker = true;
@@ -215,8 +223,17 @@ int main(int argc, char** argv) {
 
     strata::core::ExpertServeCfg sc;
     sc.port = o.listen_port;
+    if (!o.listen_host.empty()) sc.host = o.listen_host;
     sc.n_layers = g.n_layers;
     sc.n_expert = g.n_expert;
+    // what a hardened conductor checks in the handshake and in every request: the same identity generate.cpp computes
+    // (the expert layout and the model files' sizes, from the same FileExpertSource) and the model's top-k
+    sc.top_k = K;
+    {
+        std::vector<std::string> net_files;
+        for (const auto& in : src.model_inputs()) net_files.push_back(in.second);
+        sc.identity = strata::core::net_identity(net_files);
+    }
     sc.layer_lo = 0;
     sc.layer_hi = (int) g.n_layers - 1;
     if (!o.serve_layers.empty()) {
