@@ -7,6 +7,7 @@ against expert servers on localhost, and compares the 64 greedy tokens and the h
   2. two servers splitting the layers
   3. a partial split (the conductor computes the other layers itself)
   4. a server that dies mid-run (STRATA_DS4_SERVER_DIE_AFTER): the conductor falls back to its own lane, same output
+  4c. (BBXL S3) experts renumbered by popularity: the conductor calls ranks (STRATA_DS4_EXPERT_PERM), the slice is laid out by rank
   5. a conductor of the wrong engine family (qwen38) is refused at the handshake; so are a wrong token and another geometry
 Needs the built ds4_net_test and strata-dsv41-expert-server:   synthetic_split_test.py BUILD_DIR
 """
@@ -127,6 +128,44 @@ with tempfile.TemporaryDirectory() as tmp:
     stop(h)
     L = lines(r)
     check("a server on a sparse slice of layers 2-5: identical", r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and L.get("ROWHASH") == R.get("ROWHASH"), r.stderr[-200:])
+    # 4c. BBXL S3: the experts renumbered by popularity.  The conductor translates every remote call to the expert's RANK
+    # (STRATA_DS4_EXPERT_PERM); the slice holds the original expert's bytes at its rank's slot (slice_stream.py emit --perm).
+    # Ranks 0-15 stay on the conductor (its hot ones), ranks 16-31 are the server's; same tokens and expert rows as the local run.
+    import random
+    import struct
+    rng = random.Random(11)
+    perm = []
+    for _ in range(8):
+        pr = list(range(32))
+        rng.shuffle(pr)
+        perm.append(pr)
+    pf = os.path.join(tmp, "perm.bin")
+    with open(pf, "wb") as fh:
+        fh.write(b"DS4PERM1" + struct.pack("<II", 8, 32))
+        for pr in perm:
+            fh.write(struct.pack("<32H", *pr))
+    ps = os.path.join(tmp, "pslice")
+    em = subprocess.Popen([sys.executable, os.path.join(here, "slice_stream.py"), "emit", pack, "0-7", "16-31", "--perm", pf], stdout=subprocess.PIPE)
+    ap = subprocess.run([sys.executable, os.path.join(here, "slice_stream.py"), "apply", ps], stdin=em.stdout, capture_output=True, text=True)
+    em.wait()
+    check("slice_stream emit --perm | apply", em.returncode == 0 and ap.returncode == 0, ap.stderr[-200:])
+    pp = start(ps, 17851, "0-7", token, experts="16-31")
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17851=0-7/16-31"], dict(token, STRATA_DS4_EXPERT_PERM=pf))
+    stop(pp)
+    L = lines(r)
+    m = re.search(r"remote expert rows (\d+), computed locally (\d+)", L.get("STATS", ""))
+    check("renumbered experts (ranks 16-31 remote, 0-15 the conductor's): tokens and rows identical",
+          r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and L.get("ROWHASH") == R.get("ROWHASH"), r.stderr[-300:] + L.get("STATS", ""))
+    check("renumbered experts: some rows remote, some local", m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, L.get("STATS", ""))
+    bad = os.path.join(tmp, "badperm.bin")
+    with open(bad, "wb") as fh:
+        fh.write(b"DS4PERM1" + struct.pack("<II", 8, 32) + struct.pack("<32H", *([0] * 32)) * 8)
+    pp = start(ps, 17852, "0-7", token, experts="16-31")
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17852=0-7/16-31", "--expect-open-fail"], dict(token, STRATA_DS4_EXPERT_PERM=bad))
+    check("a perm file that is not a permutation is refused", "STRATA_DS4_EXPERT_PERM" in r.stdout, r.stdout + r.stderr[-200:])
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17852=0-7/16-31", "--expect-open-fail"], dict(token, STRATA_DS4_EXPERT_PERM=os.path.join(tmp, "nope.bin")))
+    check("a missing perm file is refused", "STRATA_DS4_EXPERT_PERM" in r.stdout, r.stdout + r.stderr[-200:])
+    stop(pp)
     # 5. refusals
     e = start(pack, 17845, "0-7", token)
     r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17845=0-7", "--arch", "0", "--expect-open-fail"], token)
