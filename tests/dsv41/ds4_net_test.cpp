@@ -10,6 +10,7 @@
 #include "ds4_net.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -192,6 +193,7 @@ int main(int argc, char** argv) {
     seq.push_back(tok);
     // (a recurrent carry stands in for attention's memory, so the toy does not fall into a one-token cycle)
     std::vector<float> carry(&h[(size_t) (n_prompt - 1) * D], &h[(size_t) (n_prompt - 1) * D] + D);
+    const auto decode_t0 = std::chrono::steady_clock::now();
     for (int s = 1; s < n_new; ++s) {
         std::vector<float> h1(&emb[(size_t) tok * D], &emb[(size_t) tok * D] + D);
         for (int d = 0; d < D; ++d) h1[(size_t) d] += 0.8f * carry[(size_t) d];
@@ -200,6 +202,8 @@ int main(int argc, char** argv) {
         tok = next_token(h1.data());
         seq.push_back(tok);
     }
+    const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - decode_t0).count();
+    if (n_new > 1) std::fprintf(stderr, "DECODE %d single-token steps in %.1f ms: %.3f ms a token, %.1f tok/s (the toy's own dense part included)\n", n_new - 1, decode_ms, decode_ms / (n_new - 1), 1000.0 * (n_new - 1) / decode_ms);
     std::printf("TOKENS");
     for (int t : seq) std::printf(" %d", t);
     std::printf("\nROWHASH %016llx\nROWS %ld FINITE %d\n", (unsigned long long) row_hash, rows_total, (int) !(flag & 1));

@@ -951,6 +951,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # src/dsv41/ds4_net.cpp and the protocol (ds4_net_proto.cpp wraps src/core/net_experts.cpp without the qwen38 pool).  The Metal
     # build lists its own sources and does not define it: there the flags answer "not in this build".
     target_compile_definitions(strata-dsv41 PRIVATE STRATA_DS4_NET=1)
+    # --expert-server-gpu: the served experts in VRAM, answered with the engine's window kernels (ds4_net_gpu.cu; CUDA builds only)
+    if(STRATA_ENABLE_CUDA)
+      target_sources(strata-dsv41 PRIVATE src/dsv41/ds4_net_gpu.cu)
+      target_compile_definitions(strata-dsv41 PRIVATE STRATA_DS4_NET_GPU=1)
+    endif()
     if(WIN32)
       target_link_libraries(strata-dsv41 PRIVATE ws2_32)   # the socket shim in net_experts.cpp (Winsock)
     endif()
@@ -1007,6 +1012,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(ds4_gguf_test PRIVATE strata_kernels_cpu)
       target_compile_definitions(ds4_gguf_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+    endif()
+    # the GPU expert server's rows against the CPU server's, and a layer call timed on each (docs/DEEPSEEK41_SPLIT.md "GPU expert
+    # server"); needs a GPU and a synthetic pack (tools/dsv41/make_synthetic_pack.py), built by name
+    if(STRATA_ENABLE_CUDA AND STRATA_NATIVE_EXPERTS)
+      add_executable(ds4_gpu_rows_test EXCLUDE_FROM_ALL tests/dsv41/gpu_rows_test.cpp src/dsv41/ds4_net.cpp src/dsv41/ds4_net_proto.cpp
+                     src/dsv41/ds4_net_gpu.cu src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
+                     src/dsv41/ds4_kernels.cu src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp)
+      target_include_directories(ds4_gpu_rows_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+      target_link_libraries(ds4_gpu_rows_test PRIVATE strata_prefill strata_dsv41_kernels ${_strata_gpu_runtime_target} strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(ds4_gpu_rows_test PRIVATE STRATA_DSV41_TQ_CPU=1 STRATA_DS4_NET=1 STRATA_DS4_NET_GPU=1)
+      if(WIN32)
+        target_link_libraries(ds4_gpu_rows_test PRIVATE ws2_32)
+      endif()
     endif()
     # the router on a non-finite gate input (valid, distinct picks; the same picks as the host's top-k when finite) and its
     # launch times; needs a GPU, no model; built by name
