@@ -118,9 +118,9 @@ today; a compile check is a commented stub in `build-linux.yml`), and the prompt
 ### CI
 
 `.github/workflows/build-linux.yml` configures with CUDA off and tests on push to `remote-experts` / `cpu-only-build` and on every
-pull request from this repository: configure, build everything, `ctest` (94 tests: every CPU unit and parity test of the tree plus
-the three server tests), and a check that the server links no GPU library. It runs on `runs-on: [self-hosted, linux-fast]`, not
-on GitHub-hosted runners, in under 30 minutes (`timeout-minutes: 30`); nothing is cached on D: (the pinned llama.cpp checkout and
+pull request from this repository: configure, build everything, `ctest` (93 tests run of 94 registered: every CPU unit and parity test of the
+tree plus the three server tests; five skip themselves on a CPU without AVX-512), and a check that the server links no GPU library. It runs on `runs-on: [self-hosted, linux-fast]`, not
+on GitHub-hosted runners, in 2.5 to 7 minutes on the T340 (`timeout-minutes: 30`); nothing is cached on D: (the pinned llama.cpp checkout and
 cmake live in `.strata-ci-cache` beside the runner's work folder, on the runner's system disk; the job refuses to start with less than 8 GB free). `isa_guard_check` is excluded: it fails on GCC 15 for two
 unlisted `iq_avx512.cpp` functions (`iq512_reference_gu_rows`, `iq512x_rows`), in files this change does not touch; fix the allow-list or the
 compiler flags, then drop the exclusion.
