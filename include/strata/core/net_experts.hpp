@@ -72,13 +72,21 @@ public:
     const std::vector<int32_t>& owned() const { return owned_; }
     /// The caller leaves between begin and finish (an error elsewhere): the unread RESP would desync the stream, so drop the route.
     void abandon();
+    /// The prompt path (prefill, B3): compute the entries i with mask[i] != 0 of T tokens (ids: T*k routed ids, x: T rows of
+    /// n_embd) on the server of `layer`, in windows of at most kWindowMaxT tokens (the server's limit), and copy entry i's row
+    /// to dst[i].  Synchronous, on the prompt thread (never while a decode request is in flight).  False with `err` when the
+    /// route is down or fails (it is then dropped and retried later, as in decode): the caller computes those rows itself.
+    bool prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
+                float* const* dst, std::string& err);
 
 private:
     struct Route { std::string host; int port = 7840; int lo = 0, hi = 0; intptr_t fd = -1; int top_k = 0;   // top_k: the server's, from its HELLO_ACK
                    uint64_t calls = 0, bytes_out = 0, bytes_in = 0; double rtt_ms = 0, server_ms = 0, rtt_max_ms = 0;
                    // fault handling: down since an error; retry at retry_at_ms (steady clock), backoff doubles to 30 s
                    bool down_logged = false; double retry_at_ms = 0; int backoff_ms = 0;
-                   uint64_t outages = 0, local_rows = 0, reconnects = 0; };
+                   uint64_t outages = 0, local_rows = 0, reconnects = 0;
+                   // the prompt path (prompt()): windows, rows, wall time of the calls and the server's compute
+                   uint64_t p_calls = 0, p_rows = 0, p_bytes_out = 0, p_bytes_in = 0; double p_ms = 0, p_server_ms = 0; };
     int route_of(int64_t layer) const {
         for (size_t i = 0; i < routes_.size(); ++i) if (layer >= routes_[i].lo && layer <= routes_[i].hi) return (int) i;
         return -1;

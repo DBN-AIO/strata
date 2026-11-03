@@ -130,6 +130,21 @@ int main() {
         check(served_pairs(ranked, 6, 4, 3, 2).empty() && served_pairs(ranked, 6, 4, 0, 6).empty(), "served_pairs: a bad range gives nothing");
     }
 
+    {   // ---- B3: the windows a prompt goes to the server in
+        std::vector<uint8_t> m(14 * 10, 0);   // 14 tokens x 10 entries; window limit 8
+        m[3] = 1; m[79] = 1; m[80] = 1; m[139] = 1;
+        auto w = prompt_windows(14, 10, m.data(), 8);
+        check(w.size() == 2 && w[0].t0 == 0 && w[0].nt == 8 && w[0].want == 2 && w[1].t0 == 8 && w[1].nt == 6 && w[1].want == 2,
+              "prompt_windows: 14 tokens in windows of 8 and 6, entries counted per window");
+        std::fill(m.begin(), m.begin() + 80, 0);
+        w = prompt_windows(14, 10, m.data(), 8);
+        check(w.size() == 1 && w[0].t0 == 8 && w[0].want == 2, "prompt_windows: a window with nothing asked for is left out");
+        check(prompt_windows(0, 10, m.data(), 8).empty() && prompt_windows(14, 10, m.data(), 0).empty(), "prompt_windows: empty input");
+        std::vector<uint8_t> all(16 * 10, 1);
+        w = prompt_windows(16, 10, all.data(), 8);
+        check(w.size() == 2 && w[1].t0 == 8 && w[1].nt == 8 && w[0].want == 80, "prompt_windows: exact multiple of the window");
+    }
+
     if (g_fail == 0) std::printf("net_experts_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }

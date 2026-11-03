@@ -231,6 +231,24 @@ inline std::string parse_req(const ReqLimits& L, const uint8_t* p, size_t len, R
     return std::string();
 }
 
+// ---------------------------------------------------------------- the prompt path (B3)
+/// One REQ of a prompt: tokens [t0, t0 + nt) and the number of asked-for entries in them.
+struct PromptWindow { int64_t t0 = 0, nt = 0; uint32_t want = 0; };
+/// The windows a prompt of T tokens (k entries each, mask[i] != 0 = asked for) is sent in: at most `max_tok` tokens each (the
+/// server's window limit), in order, a window with nothing asked for left out.
+inline std::vector<PromptWindow> prompt_windows(int64_t T, int64_t k, const uint8_t* mask, int64_t max_tok) {
+    std::vector<PromptWindow> out;
+    if (T <= 0 || k <= 0 || max_tok <= 0) return out;
+    for (int64_t t0 = 0; t0 < T; t0 += max_tok) {
+        PromptWindow w;
+        w.t0 = t0;
+        w.nt = T - t0 < max_tok ? T - t0 : max_tok;
+        for (int64_t i = t0 * k; i < (t0 + w.nt) * k; ++i) w.want += mask[i] ? 1u : 0u;
+        if (w.want > 0) out.push_back(w);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------- GPU expert server (--expert-server-gpu)
 /// The (layer, expert) pairs an expert server's helper GPUs are filled with, best first: the ranked (profile) pairs of the
 /// served layers lo..hi in their order, each once, then every served pair the ranking does not name, expert-major (so a
