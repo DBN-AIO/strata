@@ -1035,8 +1035,8 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         // Qwen3.8-Max's UD-IQ1_M / UD-IQ2_XXS files keep the MTP block's experts in Q2_K, which has no GPU expert kernel (the
         // trunk's IQ1_M / IQ2_XXS have): the block is left out, with a note, and the model runs without MTP drafts
         size_t sg = 0, sd = 0;
-        const strata::TensorInfo* tg = gm.find(L(g.n_layers, "ffn_gate_exps.weight"), sg);
-        const strata::TensorInfo* td = gm.find(L(g.n_layers, "ffn_down_exps.weight"), sd);
+        const strata::TensorInfo* tg = gm.find(L(g.n_layers, "ffn_gate_exps.weight"), &sg);
+        const strata::TensorInfo* td = gm.find(L(g.n_layers, "ffn_down_exps.weight"), &sd);
         if (tg && td && !K::native_expert_supported((int) tg->type, (int) td->type, g.n_embd, g.n_ff)) {
             std::fprintf(stderr, "strata-q36: the MTP block's experts are %s/%s, which the native expert kernels do not take: "
                                  "the block is not loaded, no MTP drafts\n", tg->type_name(), td->type_name());
