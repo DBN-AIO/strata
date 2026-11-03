@@ -10,6 +10,7 @@
 #include "ds4_net.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +43,12 @@ int main(int argc, char** argv) {
     unsigned seed = 1;
     long arch = -1;
     bool expect_open_fail = false;
+    // BBXL S3: --skew S makes the router prefer a hidden per-layer popularity order (score += S * -ln(1 + hidden rank)), so a real-shape toy has
+    // hot and cold experts; --count-out FILE writes the picks as the engine's expert profile (uint32 [layer][expert], what plan_split.py
+    // --popularity reads); --time prints the decode's ms a token.  All three are off by default and change nothing then.
+    float skew = 0.0f;
+    std::string count_out;
+    bool show_time = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto v = [&]() -> std::string { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); } return argv[++i]; };
@@ -54,6 +61,9 @@ int main(int argc, char** argv) {
         else if (a == "--seed") seed = (unsigned) std::atoi(v().c_str());
         else if (a == "--arch") arch = std::atol(v().c_str());
         else if (a == "--expect-open-fail") expect_open_fail = true;
+        else if (a == "--skew") skew = (float) std::atof(v().c_str());
+        else if (a == "--count-out") count_out = v();
+        else if (a == "--time") show_time = true;
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     ExpertMap map;
@@ -85,6 +95,19 @@ int main(int argc, char** argv) {
     fill(sh2, (size_t) L * D * SH, 1.0f / std::sqrt((float) SH));
     fill(outw, (size_t) vocab * D, 1.0f / std::sqrt((float) D));
 
+    std::vector<float> hot_bias;                 // [layer][expert]: -skew * ln(1 + hidden rank), the hidden order seeded per layer
+    std::vector<uint32_t> counts;
+    if (skew > 0.0f) {
+        hot_bias.assign((size_t) L * NE, 0.0f);
+        for (int l = 0; l < L; ++l) {
+            std::vector<int> o((size_t) NE);
+            for (int e = 0; e < NE; ++e) o[(size_t) e] = e;
+            std::mt19937 pr(7919u + (unsigned) l);
+            std::shuffle(o.begin(), o.end(), pr);
+            for (int r = 0; r < NE; ++r) hot_bias[(size_t) l * NE + (size_t) o[(size_t) r]] = -skew * std::log(1.0f + (float) r);
+        }
+    }
+    if (!count_out.empty()) counts.assign((size_t) L * NE, 0u);
     uint64_t row_hash = 14695981039346656037ull, flag = 0;
     long rows_total = 0;
     std::vector<int> seq;
@@ -104,7 +127,7 @@ int main(int argc, char** argv) {
                     float s = 0.0f;
                     const float* g = &gate[((size_t) l * NE + e) * D];
                     for (int d = 0; d < D; ++d) s += g[d] * xn[(size_t) t * D + d];
-                    sc[(size_t) e] = s;
+                    sc[(size_t) e] = s + (hot_bias.empty() ? 0.0f : hot_bias[(size_t) l * NE + e]);
                 }
                 std::vector<int> ord((size_t) NE);
                 for (int e = 0; e < NE; ++e) ord[(size_t) e] = e;
@@ -112,6 +135,7 @@ int main(int argc, char** argv) {
                 float mx = sc[(size_t) ord[0]], sum = 0.0f;
                 for (int j = 0; j < K; ++j) { wts[(size_t) t * K + j] = std::exp(sc[(size_t) ord[(size_t) j]] - mx); sum += wts[(size_t) t * K + j]; }
                 for (int j = 0; j < K; ++j) { wts[(size_t) t * K + j] /= sum; ids[(size_t) t * K + j] = ord[(size_t) j]; }
+                if (!counts.empty()) for (int j = 0; j < K; ++j) ++counts[(size_t) l * NE + (size_t) ord[(size_t) j]];
             }
             // the routed experts: the unit under test
             if (mode == "local") {
@@ -192,6 +216,7 @@ int main(int argc, char** argv) {
     seq.push_back(tok);
     // (a recurrent carry stands in for attention's memory, so the toy does not fall into a one-token cycle)
     std::vector<float> carry(&h[(size_t) (n_prompt - 1) * D], &h[(size_t) (n_prompt - 1) * D] + D);
+    const auto t_dec = std::chrono::steady_clock::now();
     for (int s = 1; s < n_new; ++s) {
         std::vector<float> h1(&emb[(size_t) tok * D], &emb[(size_t) tok * D] + D);
         for (int d = 0; d < D; ++d) h1[(size_t) d] += 0.8f * carry[(size_t) d];
@@ -200,6 +225,13 @@ int main(int argc, char** argv) {
         tok = next_token(h1.data());
         seq.push_back(tok);
     }
+    const double dec_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dec).count();
+    if (!count_out.empty()) {
+        std::FILE* cf = std::fopen(count_out.c_str(), "wb");
+        if (cf == nullptr || std::fwrite(counts.data(), 4, counts.size(), cf) != counts.size()) { std::fprintf(stderr, "--count-out: cannot write %s\n", count_out.c_str()); return 1; }
+        std::fclose(cf);
+    }
+    if (show_time) std::printf("DECODE %.3f ms a token over %d tokens\n", n_new > 1 ? dec_ms / (double) (n_new - 1) : 0.0, n_new - 1);
     std::printf("TOKENS");
     for (int t : seq) std::printf(" %d", t);
     std::printf("\nROWHASH %016llx\nROWS %ld FINITE %d\n", (unsigned long long) row_hash, rows_total, (int) !(flag & 1));
