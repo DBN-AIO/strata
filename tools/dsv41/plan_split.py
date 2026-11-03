@@ -135,7 +135,8 @@ def main():
         for r in out:
             print("  %-7s layers %s  %5.1f GB of %5.1f (%s-limited)" % (r["host"], ("%d-%d" % (r["first"], r["last"])) if r["layers"] else "-", r["gb"], r["cap_gb"], r["limit"]))
         print("  --remote-experts %s" % (spec or "(none)"))
-        print("  experts alone, one token: %.1f ms (%.1f tok/s ceiling)" % (ms, 1000.0 / ms if ms else 0))
+        if short <= 1e-9:
+            print("  experts alone, one token: %.1f ms (%.1f tok/s ceiling, layer after layer)" % (ms, 1000.0 / ms if ms else 0))
     if short > 1e-9:
         sys.stderr.write("REFUSED: %d layers (%.1f GB) have no host: free disk or memory on %s, or serve them from the conductor's SSD\n"
                          % (len(gb) - i, short, ", ".join(h["name"] for h in hosts)))
