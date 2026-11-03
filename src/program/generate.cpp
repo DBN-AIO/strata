@@ -40,6 +40,7 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/net_experts.hpp"
+#include "strata/core/net_proto.hpp"
 #if !defined(_WIN32)
 #include <sys/mman.h>
 #endif
@@ -913,7 +914,7 @@ struct Options {
     /// REMOTE EXPERTS (docs/REMOTE_EXPERTS.md): --expert-server serves experts to a conductor over TCP (no generation);
     /// --remote-experts host:port=lo-hi[,...] hands those layers' CPU experts to such servers.
     bool expert_server = false;
-    int listen_port = 7840;
+    std::string listen = "127.0.0.1:7840";   ///< --listen host:port | port (bind address; loopback unless written otherwise)
     std::string serve_layers;      ///< --serve-layers a-b (default: every layer)
     std::string remote_experts;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -3523,7 +3524,23 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--expert-server") o.expert_server = true;
-        else if (a == "--listen") o.listen_port = std::atoi(next("--listen"));
+        else if (a == "--listen") {
+            o.listen = next("--listen");
+            std::string lh, le;
+            int lp = 0;
+            if (!strata::core::netproto::parse_hostport(o.listen, "127.0.0.1", 7840, true, lh, lp, le)) {
+                std::fprintf(stderr, "strata generate: --listen: %s\n", le.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--expert-timeout-ms") {
+            long tv = 0;
+            if (!strata::core::netproto::parse_uint(next("--expert-timeout-ms"), 100, 600000, tv)) {
+                std::fprintf(stderr, "strata generate: --expert-timeout-ms takes 100..600000\n");
+                return 2;
+            }
+            strata::core::net_set_timeout_ms((int) tv);
+        }
         else if (a == "--serve-layers") o.serve_layers = next("--serve-layers");
         else if (a == "--remote-experts") o.remote_experts = next("--remote-experts");
         else if (a == "--vision") o.vision = true;
@@ -8464,28 +8481,43 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+    // REMOTE EXPERTS: what the two ends must agree on for identical rows (expert tensor types and layout, file sizes, CPU kernel path)
+    std::vector<std::string> net_files;
+    if (srcp != nullptr) for (const auto& in : srcp->model_inputs()) net_files.push_back(in.second);
+    const strata::core::NetIdentity net_id =
+        (o.expert_server || !o.remote_experts.empty()) ? strata::core::net_identity(net_files) : strata::core::NetIdentity();
+    if (o.expert_server && !o.remote_experts.empty()) {
+        std::fprintf(stderr, "strata generate: --expert-server and --remote-experts are exclusive: a server computes its rows itself\n");
+        return 2;
+    }
     if (!o.remote_experts.empty()) {   // REMOTE EXPERTS: hand those layers' CPU experts to expert servers
         std::string nerr;
-        if (!net_experts.open(o.remote_experts, g.n_layers, g.n_expert, nerr)) {
+        if (!net_experts.open(o.remote_experts, g.n_layers, g.n_expert, net_id, nerr)) {
             std::fprintf(stderr, "strata generate: --remote-experts: %s\n", nerr.c_str());
             return 1;
         }
         drive.d.net = &net_experts;
     }
     if (o.expert_server) {             // REMOTE EXPERTS: serve experts to a conductor, no generation
+        // A server answers with the plain CPU pool: rows a second GPU or a helper GPU computed would not be the conductor's CPU
+        // arithmetic.  Forced here (the tiers above may have been set from --expert-cache-remote / a layer split) and asserted in serve_experts.
+        drive.d.peer = nullptr;
+        drive.d.remote_count = 0;
+        drive.d.net = nullptr;
         strata::core::ExpertServeCfg sc;
-        sc.port = o.listen_port;
+        std::string lerr;
+        if (!strata::core::netproto::parse_hostport(o.listen, "127.0.0.1", 7840, true, sc.host, sc.port, lerr)) {
+            std::fprintf(stderr, "strata generate: --listen: %s\n", lerr.c_str());
+            return 2;
+        }
         sc.n_layers = g.n_layers;
         sc.n_expert = g.n_expert;
+        sc.top_k = g.n_expert_used;
+        sc.identity = net_id;
         sc.layer_lo = 0;
         sc.layer_hi = (int) g.n_layers - 1;
-        if (!o.serve_layers.empty()) {
-            const size_t dash = o.serve_layers.find('-');
-            sc.layer_lo = std::atoi(o.serve_layers.c_str());
-            sc.layer_hi = dash == std::string::npos ? sc.layer_lo : std::atoi(o.serve_layers.c_str() + dash + 1);
-        }
-        if (sc.layer_lo < 0 || sc.layer_hi < sc.layer_lo || sc.layer_hi >= g.n_layers) {
-            std::fprintf(stderr, "strata generate: --serve-layers a-b is outside 0..%lld\n", (long long) g.n_layers - 1);
+        if (!o.serve_layers.empty() && !strata::core::netproto::parse_range(o.serve_layers, 0, (long) g.n_layers - 1, sc.layer_lo, sc.layer_hi)) {
+            std::fprintf(stderr, "strata generate: --serve-layers a-b is outside 0..%lld (digits only)\n", (long long) g.n_layers - 1);
             return 2;
         }
         struct WarmCtx { strata::core::ExpertSource* src; int64_t ne; } wc{srcp, g.n_expert};
