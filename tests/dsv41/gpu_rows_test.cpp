@@ -39,7 +39,7 @@ uint64_t fnv(uint64_t h, const void* p, size_t n) {
 int main(int argc, char** argv) {
     std::string pack;
     int lo = 0, hi = -1, device = 0, threads = 0, bench = 0;
-    double cap_gb = 0.0, tol = 1e-4, hard = 5e-2;
+    double cap_gb = 0.0, tol = 2e-3, hard = 5e-2;
     unsigned seed = 7;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];

@@ -1016,16 +1016,23 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # the GPU expert server's rows against the CPU server's, and a layer call timed on each (docs/DEEPSEEK41_SPLIT.md "GPU expert
     # server"); needs a GPU and a synthetic pack (tools/dsv41/make_synthetic_pack.py), built by name
     if(STRATA_ENABLE_CUDA AND STRATA_NATIVE_EXPERTS)
-      add_executable(ds4_gpu_rows_test EXCLUDE_FROM_ALL tests/dsv41/gpu_rows_test.cpp src/dsv41/ds4_net.cpp src/dsv41/ds4_net_proto.cpp
+      set(_ds4_gpu_server_srcs src/dsv41/ds4_net.cpp src/dsv41/ds4_net_proto.cpp
                      src/dsv41/ds4_net_gpu.cu src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
                      src/dsv41/ds4_kernels.cu src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp)
-      target_include_directories(ds4_gpu_rows_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
-                                 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
-      target_link_libraries(ds4_gpu_rows_test PRIVATE strata_prefill strata_dsv41_kernels ${_strata_gpu_runtime_target} strata_kernels_cpu Threads::Threads)
-      target_compile_definitions(ds4_gpu_rows_test PRIVATE STRATA_DSV41_TQ_CPU=1 STRATA_DS4_NET=1 STRATA_DS4_NET_GPU=1)
-      if(WIN32)
-        target_link_libraries(ds4_gpu_rows_test PRIVATE ws2_32)
-      endif()
+      add_executable(ds4_gpu_rows_test EXCLUDE_FROM_ALL tests/dsv41/gpu_rows_test.cpp ${_ds4_gpu_server_srcs})
+      # the GPU expert server without the engine (no ds4_model.cu: builds in minutes): strata-dsv41-expert-server's flags plus
+      # --expert-server-gpu, for a host with a card (the rig, the stream PC); built by name
+      add_executable(strata-dsv41-expert-server-gpu EXCLUDE_FROM_ALL src/dsv41/ds4_expert_server_main.cpp ${_ds4_gpu_server_srcs})
+      set(_ds4_gpu_server_targets ds4_gpu_rows_test strata-dsv41-expert-server-gpu)
+      foreach(_t ${_ds4_gpu_server_targets})
+        target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+        target_link_libraries(${_t} PRIVATE strata_prefill strata_dsv41_kernels ${_strata_gpu_runtime_target} strata_kernels_cpu Threads::Threads)
+        target_compile_definitions(${_t} PRIVATE STRATA_DSV41_TQ_CPU=1 STRATA_DS4_NET=1 STRATA_DS4_NET_GPU=1)
+        if(WIN32)
+          target_link_libraries(${_t} PRIVATE ws2_32)
+        endif()
+      endforeach()
     endif()
     # the router on a non-finite gate input (valid, distinct picks; the same picks as the host's top-k when finite) and its
     # launch times; needs a GPU, no model; built by name
