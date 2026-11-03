@@ -632,7 +632,8 @@ bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64
                 if (!drain_one(ri)) { failed = true; break; }
             if (failed) break;
             uint64_t seq = 0;
-            if (!send_req(r, layer, x + (size_t) pw.t0 * H, ids + pw.t0 * k, pw.nt, k, own[ri].data() + pw.t0 * k, 0, seq, buf_)) {
+            // arith 1, window-invariant: a row does not depend on its window (the local reference / fallback uses it too)
+            if (!send_req(r, layer, x + (size_t) pw.t0 * H, ids + pw.t0 * k, pw.nt, k, own[ri].data() + pw.t0 * k, 1, seq, buf_)) {
                 err = "expert server " + r.host + " (prompt, layer " + std::to_string(layer) + "): send failed: " + g_why;
                 mark_down(r, err);
                 failed = true;

@@ -5002,7 +5002,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cudaEventRecord(m.cpu_ev[0], m.cs);
                             }
                             net_try = net_l && !net_fb;
-                            cpu_fn = [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, &net_err, &net_try, src_h, ids_h, slot_h, l, T, r0c, this]() -> bool {
+                            cpu_fn = [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, &net_err, &net_try, src_h, ids_h, slot_h, net_l, l, T, r0c, this]() -> bool {
                                 const auto t0 = std::chrono::steady_clock::now();
                                 if (net_try) {   // REMOTE EXPERTS: the server's rows into the same tail rows the share fills
                                     const int64_t n = T * K;
@@ -5036,18 +5036,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.cpu_jobs.clear();
                                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                     if (!on_cpu[(size_t) e]) continue;
-                                    strata::kernels::cpu::ExpertJobMulti j;
-                                    j.blob = cpu_blob[(size_t) e];
-                                    j.nt = m.cnt[(size_t) e];
-                                    for (int r = 0; r < j.nt; ++r) {
-                                        const int64_t p = (int64_t) m.off[(size_t) e] + r;
-                                        if (q2) j.act[r] = &m.cpu_actq[(size_t) src_h[(size_t) p]];
-                                        else j.nact[r] = m.cpu_nact.data() + (size_t) src_h[(size_t) p] * AB;
-                                        j.out[r] = m.cpu_rows + (size_t) (p - r0c) * N;
+                                    // a job takes at most MAXT rows: the share picks experts routed by <= MAXT tokens, a handed-out
+                                    // layer's experts (REMOTE EXPERTS, computed here as the reference arm or after a server failure) any
+                                    for (int32_t r0 = 0; r0 < m.cnt[(size_t) e]; r0 += strata::kernels::cpu::MAXT) {
+                                        strata::kernels::cpu::ExpertJobMulti j;
+                                        j.blob = cpu_blob[(size_t) e];
+                                        j.nt = std::min<int>(strata::kernels::cpu::MAXT, m.cnt[(size_t) e] - r0);
+                                        for (int r = 0; r < j.nt; ++r) {
+                                            const int64_t p = (int64_t) m.off[(size_t) e] + r0 + r;
+                                            if (q2) j.act[r] = &m.cpu_actq[(size_t) src_h[(size_t) p]];
+                                            else j.nact[r] = m.cpu_nact.data() + (size_t) src_h[(size_t) p] * AB;
+                                            j.out[r] = m.cpu_rows + (size_t) (p - r0c) * N;
+                                        }
+                                        m.cpu_jobs.push_back(j);
                                     }
-                                    m.cpu_jobs.push_back(j);
                                 }
-                                cpu_pool_->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
+                                // a handed-out layer: the window-invariant arithmetic, as the server's prompt requests use (a row does
+                                // not depend on how many rows share its job, so local and server rows are the same bits)
+                                if (net_l) cpu_pool_->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size(),
+                                                                             strata::kernels::cpu::NativeArithmetic::WindowInvariant);
+                                else cpu_pool_->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
                                 cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                                 return true;
                             };
