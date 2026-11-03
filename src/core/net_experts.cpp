@@ -7,6 +7,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/window_limits.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -184,7 +185,61 @@ NetExperts::~NetExperts() {
                          r.host.c_str(), r.port, r.lo, r.hi, (unsigned long long) r.calls, r.rtt_ms / (double) r.calls,
                          r.server_ms / (double) r.calls, r.rtt_max_ms, (double) r.bytes_out / (double) r.calls / 1024.0,
                          (double) r.bytes_in / (double) r.calls / 1024.0);
+        if (r.p_calls > 0)
+            std::fprintf(stderr, "strata net: %s:%d layers %d-%d, prompt path: %llu windows, %llu rows, %.1f ms (server compute %.1f ms), "
+                                 "%.1f MB out / %.1f MB in\n",
+                         r.host.c_str(), r.port, r.lo, r.hi, (unsigned long long) r.p_calls, (unsigned long long) r.p_rows, r.p_ms,
+                         r.p_server_ms, (double) r.p_bytes_out / 1e6, (double) r.p_bytes_in / 1e6);
     }
+}
+
+bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
+                        float* const* dst, std::string& err) {
+    const int ri = route_of(layer);
+    if (ri < 0) { err = "no expert server serves layer " + std::to_string(layer); return false; }
+    Route& r = routes_[(size_t) ri];
+    const double t0 = now_ms();
+    constexpr int64_t W = strata::kernels::kWindowMaxT;
+    std::vector<uint8_t> req, resp;
+    for (int64_t t0w = 0; t0w < T; t0w += W) {
+        const int64_t nt = std::min<int64_t>(W, T - t0w), n = nt * k;
+        const uint8_t* m = mask + t0w * k;
+        uint32_t want = 0;
+        for (int64_t i = 0; i < n; ++i) want += m[i] ? 1u : 0u;
+        if (want == 0) continue;
+        const size_t mask_len = (size_t) ((n + 3) / 4 * 4);
+        req.clear();
+        put<uint32_t>(req, (uint32_t) layer); put<uint32_t>(req, (uint32_t) nt); put<uint32_t>(req, (uint32_t) k);
+        put<uint32_t>(req, 0u); put<uint64_t>(req, ++seq_);
+        const size_t at = req.size();
+        req.resize(at + (size_t) n * 4 + mask_len + (size_t) nt * H * 4, 0);
+        std::memcpy(req.data() + at, ids + t0w * k, (size_t) n * 4);
+        for (int64_t i = 0; i < n; ++i) req[at + (size_t) n * 4 + (size_t) i] = m[i] ? 1 : 0;
+        std::memcpy(req.data() + at + (size_t) n * 4 + mask_len, x + (size_t) t0w * H, (size_t) nt * H * 4);
+        if (!send_frame((sock_t) r.fd, kReq, req.data(), req.size())) {
+            err = "expert server " + r.host + ": send failed (prompt, layer " + std::to_string(layer) + ")";
+            return false;
+        }
+        uint32_t type = 0;
+        if (!recv_frame((sock_t) r.fd, type, resp)) { err = "expert server " + r.host + ": connection lost (prompt)"; return false; }
+        if (type == kErr) { err = "expert server " + r.host + ": " + std::string(resp.begin(), resp.end()); return false; }
+        uint64_t seq = 0; double server_us = 0; uint32_t rows = 0;
+        if (type == kResp && resp.size() >= 24) {
+            std::memcpy(&seq, resp.data(), 8); std::memcpy(&server_us, resp.data() + 8, 8); std::memcpy(&rows, resp.data() + 16, 4);
+        }
+        if (type != kResp || seq != seq_ || rows != want || resp.size() != 24 + (size_t) rows * H * 4) {
+            err = "expert server " + r.host + ": prompt response does not match the request";
+            return false;
+        }
+        const float* src = (const float*) (resp.data() + 24);
+        size_t q = 0;
+        for (int64_t i = 0; i < n; ++i)
+            if (m[i]) std::memcpy(dst[(size_t) (t0w * k + i)], src + (q++) * (size_t) H, (size_t) H * 4);
+        ++r.p_calls; r.p_rows += rows; r.p_server_ms += server_us / 1000.0;
+        r.p_bytes_out += req.size() + sizeof(Hdr); r.p_bytes_in += resp.size() + sizeof(Hdr);
+    }
+    r.p_ms += now_ms() - t0;
+    return true;
 }
 
 bool NetExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, int32_t* kind,

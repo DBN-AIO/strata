@@ -43,10 +43,16 @@ public:
                int arith, std::string& err);
     /// Receive the rows of the request begun last and write them into `out` (n_tok*k rows of n_embd).
     bool finish(float* out, std::string& err);
+    /// The prompt path (prefill): compute the entries i with mask[i] != 0 of T tokens (ids: T*k routed ids, x: T rows
+    /// of n_embd) on the server for `layer`, in windows of at most kWindowMaxT tokens (the server's limit), and copy
+    /// entry i's row to dst[i].  Synchronous; uses the same connection as decode (never at the same time).
+    bool prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
+                float* const* dst, std::string& err);
 
 private:
     struct Route { std::string host; int port = 7840; int lo = 0, hi = 0; intptr_t fd = -1;
-                   uint64_t calls = 0, bytes_out = 0, bytes_in = 0; double rtt_ms = 0, server_ms = 0, rtt_max_ms = 0; };
+                   uint64_t calls = 0, bytes_out = 0, bytes_in = 0; double rtt_ms = 0, server_ms = 0, rtt_max_ms = 0;
+                   uint64_t p_calls = 0, p_rows = 0, p_bytes_out = 0, p_bytes_in = 0; double p_ms = 0, p_server_ms = 0; };
     int route_of(int64_t layer) const {
         for (size_t i = 0; i < routes_.size(); ++i) if (layer >= routes_[i].lo && layer <= routes_[i].hi) return (int) i;
         return -1;

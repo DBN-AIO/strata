@@ -19462,6 +19462,7 @@ int main(int argc, char** argv) {
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
         if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
+        if (!multi_gpu && drive.d.net != nullptr) prefill.set_net_experts(drive.d.net);   // REMOTE EXPERTS: prompt path too
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {
@@ -19542,6 +19543,11 @@ int main(int argc, char** argv) {
                      ps.ms_total > 0 ? 1000.0 * (double) ps.tokens / ps.ms_total : 0.0, (long long) ps.experts_streamed,
                      (long long) ps.experts_dma, ps.ms_experts_host, (long long) ps.experts_resident,
                      (long long) ps.experts_cpu, ps.cpu_share, ps.ms_ple);
+        if (ps.layers_net > 0)
+            std::fprintf(stderr, "strata net: prompt path: %lld experts of %lld layer-chunks computed by the expert servers "
+                                 "(%.1f ms of round trips); prompt %.1f tok/s\n",
+                         (long long) ps.experts_net, (long long) ps.layers_net, ps.ms_net,
+                         ps.ms_total > 0 ? 1000.0 * (double) ps.tokens / ps.ms_total : 0.0);
         if (ps.experts_direct > 0)
             std::fprintf(stderr, "strata generate: prompt MMQ read %lld of the %lld resident experts in their slots "
                                  "(STRATA_MMQ_DIRECT)\n", (long long) ps.experts_direct, (long long) ps.experts_resident);

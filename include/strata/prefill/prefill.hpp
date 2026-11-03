@@ -39,12 +39,15 @@ struct PrefillStats {
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     int64_t experts_direct = 0;     ///< ...of which MMQ read in their cache slots, not gathered (STRATA_MMQ_DIRECT=1)
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
+    int64_t experts_net = 0;        ///< ...computed by expert servers over the LAN (--remote-experts; set_net_experts)
+    int64_t layers_net = 0;         ///< layer-chunks whose non-resident experts went to an expert server
+    double ms_net = 0;              ///< host time of those calls (round trips included)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
     double ms_ple = 0;
 };
 
 }  // namespace strata::prefill
-namespace strata::core { class MtpDrafter; }
+namespace strata::core { class MtpDrafter; class NetExperts; }
 namespace strata::prefill {
 
 /// HIP: one tiny BF16 and one tiny FP16 product on a private handle, so the first prompt does not pay hipBLAS's one-time
@@ -286,6 +289,12 @@ public:
     /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
     /// for a chunk. Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
+    /// REMOTE EXPERTS (docs/REMOTE_EXPERTS.md): for the layers `net` serves, a chunk's non-resident experts are computed
+    /// by the expert servers (their unweighted rows land in Dm's tail, as the CPU share's do) instead of being streamed
+    /// from this host's copy, so the conductor reads none of those layers' experts for a prompt.  Applies to the chunks
+    /// staged after their routing (below stream_all_min(), one GPU, not fused); other chunks read locally as before.
+    /// STRATA_NET_PREFILL=0 turns it off (the A/B arm).  Set before `init`.
+    void set_net_experts(core::NetExperts* net) { net_ = net; }
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
@@ -322,6 +331,7 @@ private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
+    core::NetExperts* net_ = nullptr;                ///< set_net_experts
     // Layer-major prefill: the super-chunk's buffers for an n-token prompt (its size, 0 = not this prompt: `why`),
     // the run, and the buffers given back after it.  `cap` (> 0): at most that many tokens (a layer split's stages
     // share one size); lm_prepare_chain sizes every stage of a split.
