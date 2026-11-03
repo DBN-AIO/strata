@@ -21,9 +21,10 @@ kind: entries with `kind == -1` (the CPU's) of a handed-out layer get `kind = 3`
 (`NetExperts::begin`) before the local CPU work and received after it (`NetExperts::finish`). Nothing after the pool
 changes, so the result is the same bits as the local CPU run (verified, below).
 
-Not covered yet (needs its own cut): the **prompt path** (`src/prefill/prefill.cpp`) streams expert blobs to the GPU or
-computes them on the CPU itself; it reads the conductor's local copy of the experts. Until it is routed through the
-same servers the conductor still needs every expert (page cache or SSD) for prompts, even for handed-out layers.
+The **prompt path** (`src/prefill/prefill.cpp`) goes through the same servers for the chunks it stages after their
+routing: "The prompt path through the expert servers" below. Longer chunks (at or above `stream_all_min()`), a layer
+split and the fused kernels still read the conductor's local copy, and every path falls back to it when a server fails,
+so a conductor keeps its copy of handed-out layers for now.
 
 ## Files
 
@@ -325,6 +326,57 @@ Static cache (`--adapt-every 0`), so a configuration gives the same text every r
 - Against the 2.92 tok/s of the first rig measurement: that run had 14.3 ms of rig CPU compute per call (TabbyAPI busy
   beside it); in these runs the rig CPU took 2.5 ms. The GPU path does not depend on how busy the rig's six cores are.
 
+## The prompt path through the expert servers
+
+Prefill used to read every expert of a handed-out layer from the conductor's own copy (page cache or SSD) and stream it
+to the GPU. Now, for the layers `--remote-experts` hands out, the prompt path sends those layers' non-resident experts
+to the expert servers too:
+
+- Where: the host-grouped MoE of `src/prefill/prefill.cpp` (chunks staged after their routing: below
+  `stream_all_min()` tokens, one GPU, not the fused path). It reuses the CPU share's slot: the layer's MoE input goes to
+  the host, every routed expert the conductor's GPU cache does not hold becomes an "off-GPU" expert, and their
+  unweighted rows land in Dm's tail, where the combine weights them like any other row. Nothing of those experts is
+  read or streamed on the conductor (`experts streamed` drops by their count).
+- Wire: `NetExperts::prompt` sends the chunk in windows of at most `kWindowMaxT` tokens (the server's limit; the windows
+  come from `netproto::prompt_windows`), as ordinary REQ frames with the window-invariant arithmetic (`arith 1`), so a
+  row does not depend on which window it travelled in. The server is unchanged.
+- Faults: a down or failing server is handled as in decode (dropped, retried after its backoff). The prompt does not
+  fail: that layer's experts are computed on the conductor's CPU from its own copy (the CPU share's code, split into
+  jobs of at most MAXT rows), and the log says so (`prefill: layer N: ...; its K experts computed on this host`).
+- Chunks the path does not cover (long prompts at or above `stream_all_min()`, a layer split, the fused kernels) still
+  read their experts locally, as before.
+- `STRATA_NET_PREFILL`: `1` (default) the servers; `0` off (stream locally, the old path); `2` the reference arm: the
+  same experts on this host's CPU share kernels with the same arithmetic, for a bit-for-bit A/B.
+- Logged: `strata net: prompt path: 604 experts of 10 layer-chunks computed by the expert servers (189.0 ms of round
+  trips); prompt 14.9 tok/s`, and per server `prompt path: 20 windows, 1341 rows, 189.0 ms (server compute 84.4 ms),
+  1.4 MB out / 13.7 MB in`.
+
+### Measured (prompt path)
+
+Same model and conductor as above (`--adapt-every 0`, layers 38-47 on the rig, SSH tunnel). Greedy, 64 new tokens.
+
+Bits: with a CPU expert server, prompt rows from the server (`=1`) and the reference arm (`=2`, this host's CPU, same
+experts, same arithmetic) give **the same 64 tokens** in every run: 2 + 2 runs with the 14-token prompt and 1 + 1 with
+a 119-token prompt. Against the old path (`=0`, the experts streamed to the conductor's GPU) the text can differ: the
+GPU's prompt kernels round differently from the CPU's (the same caveat as the CPU share).
+
+| Prompt | path | prompt tok/s | experts read on the conductor | round trips |
+| --- | --- | ---: | ---: | ---: |
+| 14 tokens | local, streamed to the GPU (`=0`) | 14.6 / 14.2 | 2501 | - |
+| 14 tokens | GPU expert server (`=1`), one window at a time | 14.1 | 1899 | 183 ms, 20 windows |
+| 119 tokens | local, streamed to the GPU (`=0`) | 69.8 | 5568 | - |
+| 119 tokens | GPU expert server (`=1`), one window at a time | 40.7 | 4442 | 1476 ms, 150 windows |
+| 119 tokens | reference arm, this host's CPU (`=2`) | 24.7 | 4442 + 1128 on the CPU | - |
+
+(Measured on the build that also has the request pipelining, with `STRATA_NET_PIPELINE=1`: one window at a time, which
+is this change on its own. The bit-equality runs used a CPU server; pipelining does not change any row.)
+
+- The conductor no longer reads the handed-out layers' experts for a prompt (602 of 2501 blobs for 14 tokens, 1126
+  of 5568 for 119), which is what lets a conductor hold only its own layers.
+- Prompt speed: equal for a short prompt; for 119 tokens the servers are slower than the local GPU stream here
+  (41 against 70 tok/s): 111 MB of fp32 rows come back through the SSH tunnel for the 10 layers, one window at a time.
+  The levers: windows in flight (request pipelining), fp16 rows on the wire, a direct TCP path (the rig's ufw).
+
 ## NVLink
 
 The two RTX 3090 of the gaming PC are NVLink-bridged (`nvidia-smi topo -m`: NV4, four links, 14 GB/s per link shown).
@@ -336,7 +388,8 @@ the remote-expert path.
 
 ## Next steps
 
-1. Route the prompt path (prefill) through the expert servers, so the conductor needs no local copy of handed-out layers.
+1. Prompt path through the expert servers: done for chunks staged after routing ("The prompt path through the expert
+   servers"). Open: the stream-all and fused chunk paths, and a conductor without a local copy (today the fallback needs it).
 2. Expert servers on GPUs: done for CUDA helper cards ("Expert servers on GPU" above). Open: the stream PC's 5070 Ti
    (sm_120 build), a fourth helper card, and CUDA0's own spare VRAM (it holds only the dense weights in server mode).
 3. Overlap: send layer l+1's request as soon as its router output exists (today one round trip per layer, in series).
