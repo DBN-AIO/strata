@@ -16,27 +16,48 @@ import struct
 
 # name -> (ggml id, values a block, bytes a block, offsets of the fp16 scales to make finite; None: MXFP4's e8m0 byte)
 TYPES = {
+    "IQ1_M": (29, 256, 56, "iq1m"),        # no d field: the fp16 scale is spread over the top nibbles of 4 scale words (bytes 48..55)
     "IQ2_XXS": (16, 256, 66, [0]),
+    "IQ2_XS": (17, 256, 74, [0]),
     "IQ3_XXS": (18, 256, 98, [0]),
     "IQ4_XS": (23, 256, 136, [0]),
     "Q4_K": (12, 256, 144, [0, 2]),
     "MXFP4": (39, 32, 17, None),
 }
 # (gate/up, down) of each layer, cycled
-CYCLE = [("IQ2_XXS", "IQ3_XXS"), ("IQ3_XXS", "IQ4_XS"), ("IQ4_XS", "IQ4_XS"), ("Q4_K", "Q4_K"),
-         ("MXFP4", "MXFP4"), ("IQ2_XXS", "IQ2_XXS"), ("IQ3_XXS", "IQ3_XXS"), ("MXFP4", "MXFP4")]
+# (the real 2.00 bpw set mixes IQ1_M / IQ2_XXS / IQ2_XS this way: gate = up, down another type; a 3 bit set is IQ3_XXS)
+CYCLE = [("IQ1_M", "IQ1_M"), ("IQ2_XXS", "IQ1_M"), ("IQ2_XS", "IQ1_M"), ("IQ2_XXS", "IQ2_XS"),
+         ("IQ3_XXS", "IQ3_XXS"), ("IQ3_XXS", "IQ4_XS"), ("Q4_K", "Q4_K"), ("MXFP4", "MXFP4")]
 
 
-def matrix(rng, ty, n, k, n_exp):
+def matrix(rng, ty, n, k, n_exp, fast=False):
     gid, vals, bb, scales = TYPES[ty]
     assert k % vals == 0
     row = (k // vals) * bb
     total = n_exp * n * row
     buf = bytearray(rng.randbytes(total))
-    for blk in range(total // bb):
+    nb = total // bb
+    if fast:   # one finite scale for every block (timing runs at real sizes: no per-block loop)
+        d = struct.pack("<e", 0.006)
+        if scales is None:
+            buf[0::bb] = bytes([120]) * nb
+        elif scales == "iq1m":
+            h = struct.unpack("<H", d)[0]
+            for i in range(4):
+                buf[49 + 2 * i::bb] = bytes([(buf[49 + 2 * i] & 0x0F) | (((h >> (4 * i)) & 0xF) << 4)]) * nb
+        else:
+            for so in scales:
+                buf[so::bb] = bytes([d[0]]) * nb
+                buf[so + 1::bb] = bytes([d[1]]) * nb
+        return buf, n * row
+    for blk in range(nb):
         o = blk * bb
         if scales is None:
             buf[o] = rng.randrange(116, 125)
+        elif scales == "iq1m":
+            h = struct.unpack("<H", struct.pack("<e", 0.002 + 0.01 * rng.random()))[0]
+            for i in range(4):
+                buf[o + 49 + 2 * i] = (buf[o + 49 + 2 * i] & 0x0F) | (((h >> (4 * i)) & 0xF) << 4)
         else:
             for so in scales:
                 buf[o + so:o + so + 2] = struct.pack("<e", 0.002 + 0.01 * rng.random())
@@ -52,6 +73,7 @@ def main():
     ap.add_argument("--dim", type=int, default=256)
     ap.add_argument("--ff", type=int, default=256)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--fast", action="store_true", help="one scale for all blocks (for timing runs at the real 5120 x 2304 size)")
     a = ap.parse_args()
     rng = random.Random(a.seed)
     os.makedirs(a.out, exist_ok=True)
@@ -62,7 +84,7 @@ def main():
         for il in range(a.layers):
             tgu, td = CYCLE[il % len(CYCLE)]
             for w, ty, n, k in (("w1", tgu, a.ff, a.dim), ("w3", tgu, a.ff, a.dim), ("w2", td, a.dim, a.ff)):
-                buf, per = matrix(rng, ty, n, k, a.experts)
+                buf, per = matrix(rng, ty, n, k, a.experts, a.fast)
                 f.write(buf)
                 for e in range(a.experts):
                     lines.append("t layers.%d.ffn.experts.%d.%s.weight %s 0 %d %d %d %d" % (il, e, w, ty, off + e * per, per, n, k))
