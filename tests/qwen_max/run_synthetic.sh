@@ -36,8 +36,12 @@ for shape in $SHAPES; do
   SRV=$!
   i=0; until grep -q listening "$LOG" 2>/dev/null; do i=$((i+1)); [ $i -gt 300 ] && { echo "server did not start"; kill $SRV; exit 1; }; sleep 1; done
   COMMON="--model $MODEL --tokens $PROMPT --n 64 --max-context $CTX --no-warmup --expert-slots $SLOTS"
-  REF=$(STRATA_Q36_FIXED_SLOTS=1 STRATA_Q36_ARITH=wi "$CUDA/strata-q36" $COMMON 2>&1 | grep '^gen:' || true)
-  GOT=$(STRATA_Q36_FIXED_SLOTS=1 "$CUDA/strata-q36" $COMMON --remote-experts 127.0.0.1:$PORT=0-$LAST 2>&1 | grep '^gen:' || true)
+  STRATA_Q36_FIXED_SLOTS=1 STRATA_Q36_ARITH=wi "$CUDA/strata-q36" $COMMON > "$WORK/ref_$shape.log" 2>&1 || true
+  STRATA_Q36_FIXED_SLOTS=1 "$CUDA/strata-q36" $COMMON --remote-experts 127.0.0.1:$PORT=0-$LAST > "$WORK/split_$shape.log" 2>&1 || true
+  REF=$(grep '^gen:' "$WORK/ref_$shape.log" || true)
+  GOT=$(grep '^gen:' "$WORK/split_$shape.log" || true)
+  grep -h 'generated in' "$WORK/ref_$shape.log" | sed "s/^/$shape single process: /"
+  grep -h 'generated in' "$WORK/split_$shape.log" | sed "s/^/$shape split:          /"
   kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true
   if [ -n "$REF" ] && [ "$REF" = "$GOT" ]; then echo "$shape: IDENTICAL ($(echo "$REF" | wc -w) tokens)"; else echo "$shape: DIFFERENT"; echo "ref:   $REF"; echo "split: $GOT"; rc=1; fi
 done
