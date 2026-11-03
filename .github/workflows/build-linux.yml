@@ -62,7 +62,7 @@ jobs:
           case "$CI_CACHE" in /mnt/d/*|/d/*|D:*) echo "::error::the CI cache must not sit on D:"; exit 1;; esac
           g++ --version | head -1
           # cmake >= 3.24 (the tree's minimum): the runner's own when it has one, else the pinned release, checked by hash
-          if cmake --version 2>/dev/null | head -1 | awk '{split($3,v,"."); exit !(v[1]>3 || (v[1]==3 && v[2]>=24))}'; then
+          if command -v cmake >/dev/null 2>&1 && cmake --version | head -1 | awk '{split($3,v,"."); exit !(v[1]>3 || (v[1]==3 && v[2]>=24))}'; then
             echo "using $(command -v cmake)"
           else
             dir="$CI_CACHE/cmake-$CMAKE_VERSION-linux-x86_64"
