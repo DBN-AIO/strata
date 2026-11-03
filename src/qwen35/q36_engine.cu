@@ -3933,6 +3933,14 @@ int strata::qwen35::run(int argc, char** argv) {
                 std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
                 return 1;
             }
+            // a block served for only some of its experts would leave the others' rows unwritten (no host copy to compute them from)
+            for (int64_t l = 0; l < m.g.n_layers + m.g.n_mtp_layers; ++l)
+                if (net->serves(l) && !net->covers(l)) {
+                    std::fprintf(stderr, "strata-q36: --remote-experts: block %lld is served for only some of its experts (host ranges /E0-E1 must "
+                                         "together cover all %lld): this family keeps no local copy of a served block\n", (long long) l,
+                                 (long long) m.g.n_expert);
+                    return 1;
+                }
             E.net = std::move(net);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "strata-q36: --remote-experts: %s\n", e.what());
