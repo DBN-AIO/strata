@@ -23,5 +23,8 @@ inline constexpr int kVerifyNarrowT = 8;
 inline constexpr int kWindowMaxT = STRATA_VERIFY_MAX_T;
 
 static_assert(kWindowMaxT == 8 || kWindowMaxT == 12 || kWindowMaxT == 16, "STRATA_VERIFY_MAX_T is 8, 12 or 16");
+/// The per-entry tables of one window (rows x routed experts) in the expert pool dispatch: 128 for the 8-row window, 256 for 16.
+/// The expert server refuses a request that exceeds it (net_experts.cpp) instead of letting the dispatch fail.
+inline constexpr long long kWindowMaxEntries = kWindowMaxT <= 8 ? 128 : 256;
 
 }  // namespace strata::kernels

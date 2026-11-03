@@ -42,6 +42,7 @@ struct PrefillStats {
     int64_t experts_net = 0;        ///< ...computed by expert servers over the LAN (--remote-experts; set_net_experts)
     int64_t layers_net = 0;         ///< layer-chunks whose non-resident experts went to an expert server
     double ms_net = 0;              ///< host time of those calls (round trips included)
+    int64_t net_fallbacks = 0;      ///< layer-chunks whose server failed: computed on this host's CPU instead
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
     double ms_ple = 0;
 };
