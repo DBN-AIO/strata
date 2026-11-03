@@ -316,15 +316,17 @@ bool ExpertHost::open(const ExpertMap& m, int lo, int hi, int threads, std::stri
     return true;
 }
 
-uint64_t ExpertHost::warm(int lo, int hi) {
+uint64_t ExpertHost::warm(int lo, int hi, int elo, int ehi) {
     Impl& I = *p_;
     const ExpertMap& m = *I.m;
+    if (ehi < 0 || ehi >= m.n_exp) ehi = m.n_exp - 1;
+    if (elo < 0) elo = 0;
     std::atomic<uint64_t> total{0};
     std::vector<std::pair<const uint8_t*, uint64_t>> jobs;
     for (int il = lo; il <= hi; ++il) {
         const ExpertLayer& L = m.layers[(size_t) il];
         if (L.il < 0) continue;
-        for (int r = 0; r < 3; ++r) jobs.push_back({I.maps[(size_t) L.file[r]] + L.off[r], L.stride[r] * (uint64_t) m.n_exp});
+        for (int r = 0; r < 3; ++r) jobs.push_back({I.maps[(size_t) L.file[r]] + L.off[r] + L.stride[r] * (uint64_t) elo, L.stride[r] * (uint64_t) (ehi - elo + 1)});
     }
     I.pool->parallel_for((int) jobs.size(), [&](int j) {
         volatile uint8_t sink = 0;
@@ -507,7 +509,7 @@ bool Remote::run(int layer, const float* x, size_t ldx, const Item* items, int n
 
 // ================================================================== the server
 int server_main(int argc, char** argv) {
-    std::string pack, host = "127.0.0.1", layers;
+    std::string pack, host = "127.0.0.1", layers, experts;
     int port = 7840, threads = 0;
     bool warm = true, once = false;
     static const char* const with_value[] = {"--gpus", "--max-context", "--reserve-mib", "--vram-experts", "--expert-profile", "--ssd-cache",
@@ -526,11 +528,12 @@ int server_main(int argc, char** argv) {
             if (!np::parse_hostport(val("--listen"), "127.0.0.1", 7840, true, host, port, why)) { std::fprintf(stderr, "--listen: %s\n", why.c_str()); return 2; }
         }
         else if (a == "--serve-layers") layers = val("--serve-layers");
+        else if (a == "--serve-experts") experts = val("--serve-experts");
         else if (a == "--cpu-threads") threads = std::atoi(val("--cpu-threads").c_str());
         else if (a == "--no-warm") warm = false;
         else if (a == "--once") once = true;
         else if (a == "--help" || a == "-h") {
-            std::printf("strata-dsv41 --expert-server --pack DIR --listen [HOST:]PORT [--serve-layers A-B] [--cpu-threads N] [--no-warm]\n"
+            std::printf("strata-dsv41 --expert-server --pack DIR --listen [HOST:]PORT [--serve-layers A-B] [--serve-experts E0-E1] [--cpu-threads N] [--no-warm]\n"
                         "  serves the pack's routed experts of layers A-B (default: all) to a conductor started with\n"
                         "  --remote-experts HOST:PORT=A-B.  CPU only: CUDA is never touched.  STRATA_EXPERT_TOKEN sets the shared secret.\n");
             return 0;
@@ -549,18 +552,23 @@ int server_main(int argc, char** argv) {
     if (!layers.empty()) {
         if (std::sscanf(layers.c_str(), "%d-%d", &lo, &hi) != 2) { std::fprintf(stderr, "--serve-layers needs A-B\n"); return 2; }
     }
+    int elo = 0, ehi = map.n_exp - 1;   // a layer's experts may be split over hosts: --remote-experts HOST=lo-hi/e0-e1 on the conductor
+    if (!experts.empty() && (std::sscanf(experts.c_str(), "%d-%d", &elo, &ehi) != 2 || elo < 0 || ehi < elo || ehi >= map.n_exp)) {
+        std::fprintf(stderr, "--serve-experts needs A-B inside 0-%d\n", map.n_exp - 1);
+        return 2;
+    }
     ExpertHost host_;
     if (!host_.open(map, lo, hi, threads, err)) { std::fprintf(stderr, "strata-dsv41 --expert-server: %s\n", err.c_str()); return 1; }
     if (warm) {
         const double t0 = now_ms();
-        const uint64_t b = host_.warm(lo, hi);
+        const uint64_t b = host_.warm(lo, hi, elo, ehi);
         std::fprintf(stderr, "strata net: dsv41 served layers %d-%d resident %.2f GiB (touched in %.1f s)\n", lo, hi, (double) b / (1024.0 * 1024 * 1024), (now_ms() - t0) / 1000.0);
     }
     core::ExpertServeCfg cfg;
     cfg.host = host; cfg.port = port; cfg.layer_lo = lo; cfg.layer_hi = hi;
     cfg.n_layers = map.n_layers; cfg.n_expert = map.n_exp; cfg.top_k = map.top_k;
     cfg.identity = map.identity();
-    cfg.max_tok = kMaxTok; cfg.max_entries = kMaxEntries; cfg.once = once;
+    cfg.max_tok = kMaxTok; cfg.max_entries = kMaxEntries; cfg.once = once; cfg.expert_lo = elo; cfg.expert_hi = ehi;
     long die_after = 0;   // test hook: the server exits after N requests, as if the host had gone (STRATA_DS4_SERVER_DIE_AFTER)
     if (const char* v = std::getenv("STRATA_DS4_SERVER_DIE_AFTER")) die_after = std::atol(v);
     std::atomic<long> served{0};

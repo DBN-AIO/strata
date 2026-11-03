@@ -37,10 +37,11 @@ def run(args, env=None, timeout=300):
     return subprocess.run([test_bin] + args, capture_output=True, text=True, env=e, timeout=timeout)
 
 
-def start(pack, port, layers, env=None):
+def start(pack, port, layers, env=None, experts=None):
     e = dict(os.environ)
     e.update(env or {})
-    p = subprocess.Popen([srv_bin, "--pack", pack, "--listen", "127.0.0.1:%d" % port, "--serve-layers", layers, "--no-warm", "--cpu-threads", "2"],
+    p = subprocess.Popen([srv_bin, "--pack", pack, "--listen", "127.0.0.1:%d" % port, "--serve-layers", layers, "--no-warm", "--cpu-threads", "2"]
+                         + (["--serve-experts", experts] if experts else []),
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=e)
     time.sleep(1.0)
     return p
@@ -98,6 +99,15 @@ with tempfile.TemporaryDirectory() as tmp:
     stop(c)
     L = lines(r)
     check("partial split (layers 2-5 remote): identical", r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and L.get("ROWHASH") == R.get("ROWHASH"))
+    # 3b. every layer's experts split over two hosts (B5): experts 0-15 here, 16-31 there, asked at the same time
+    x1 = start(pack, 17849, "0-7", token, experts="0-15")
+    x2 = start(pack, 17850, "0-7", token, experts="16-31")
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17849=0-7/0-15,127.0.0.1:17850=0-7/16-31"], token)
+    stop(x1)
+    stop(x2)
+    L = lines(r)
+    check("experts split over two hosts (0-15 / 16-31): identical, none local", r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and L.get("ROWHASH") == R.get("ROWHASH")
+          and "computed locally 0," in L.get("STATS", ""), r.stderr[-300:] + L.get("STATS", ""))
     # 4. the server dies mid-run
     d = start(pack, 17844, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="40"))
     r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17844=0-7"], dict(token, STRATA_EXPERT_TIMEOUT_MS="1500"))

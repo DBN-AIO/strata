@@ -7,7 +7,7 @@ the same ds4.txt / tensors.txt (so the model fingerprint is the conductor's), th
 the served layers' expert bytes in place.  Linux and Windows (NTFS: the sparse flag is set before the file grows; a file grown
 by truncate() would be zero-filled there).
 
-  # on the host with the model:                               python3 slice_stream.py emit PACK 26-34 > layers.stream
+  # on the host with the model:                               python3 slice_stream.py emit PACK 26-34 [E0-E1] > layers.stream
   # on the expert-server host (any pipe, e.g. through ssh):   python3 slice_stream.py apply OUT_DIR < layers.stream
   ssh nobara 'python3 slice_stream.py emit PACK 26-34' | python slice_stream.py apply C:\\AIO-strata-model\\dsv41-slice
 
@@ -35,7 +35,7 @@ def parse_tensors(path):
             elif line.startswith("t layers.") and ".ffn.experts." in line:
                 p = line.split()
                 il = int(p[1].split(".")[1])
-                ex.append((il, int(p[4]), int(p[5]), int(p[3]), line))
+                ex.append((il, int(p[4]), int(p[5]), int(p[3]), line, int(p[1].split(".")[4])))
     return files, ex
 
 
@@ -49,15 +49,15 @@ def read_kv(path):
     return kv
 
 
-def emit(pack, lo, hi, out):
+def emit(pack, lo, hi, out, elo=0, ehi=10**9):
     kv = read_kv(os.path.join(pack, "ds4.txt"))
     files, ex = parse_tensors(os.path.join(pack, "tensors.txt"))
     model_dir = kv["model_dir"]
     sizes = {i: os.path.getsize(os.path.join(model_dir, n)) for i, n in files.items()}
-    # ranges to ship: the served layers' experts, merged per file
+    # ranges to ship: the served layers' (and experts') bytes, merged per file
     rng = {}
-    for il, off, nb, fi, _ in ex:
-        if lo <= il <= hi:
+    for il, off, nb, fi, _, e in ex:
+        if lo <= il <= hi and elo <= e <= ehi:
             rng.setdefault(fi, []).append((off, off + nb))
     merged = {}
     for fi, r in rng.items():
@@ -157,7 +157,8 @@ def apply(out_dir, inp):
 def main():
     if len(sys.argv) >= 4 and sys.argv[1] == "emit":
         lo, hi = (int(x) for x in sys.argv[3].split("-"))
-        emit(sys.argv[2], lo, hi, sys.stdout.buffer)
+        elo, ehi = (int(x) for x in sys.argv[4].split("-")) if len(sys.argv) > 4 else (0, 10**9)
+        emit(sys.argv[2], lo, hi, sys.stdout.buffer, elo, ehi)
     elif len(sys.argv) >= 3 and sys.argv[1] == "apply":
         apply(sys.argv[2], sys.stdin.buffer)
     else:

@@ -67,7 +67,7 @@ public:
     /// Maps the shards of layers lo..hi (inclusive) read-only.  threads: 0 = one per hardware thread.
     bool open(const ExpertMap& m, int lo, int hi, int threads, std::string& err);
     /// Touches every page of the layers lo..hi so the page cache holds them; returns the bytes.
-    uint64_t warm(int lo, int hi);
+    uint64_t warm(int lo, int hi, int elo = 0, int ehi = -1);   ///< (elo..ehi: only those experts of each layer; -1 = to the last)
     /// Entries i of n_tok*k with mask[i] != 0: expert ids[i] on the token i / k (x + (i / k) * dim); the row goes to
     /// out + i * dim.  Same arithmetic as the engine's cpu_experts_iq / cpu_experts_mx.
     bool compute(uint32_t layer, uint32_t n_tok, uint32_t k, const int32_t* ids, const uint8_t* mask, const float* x, float* out,
