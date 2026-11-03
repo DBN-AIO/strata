@@ -268,6 +268,63 @@ Fault checks (400 and 1000 greedy tokens, `--adapt-every 0`, tokens compared wit
 - `tools/net_experts_probe.py`: 23 checks pass (wrong/missing token, oversized pre-auth frame, 11 kinds of bad request each
   followed by a good one, busy, idle connection).
 
+## Expert servers on GPU (--expert-server-gpu)
+
+`--expert-server-gpu` (it implies `--expert-server`) lets an expert server hold its served layers' experts in VRAM and
+compute them with the GPU kernels instead of the CPU. It uses the helper GPU tiers that already exist
+(`--expert-cache-device1..3`, `RemoteExperts`, docs/SECOND_GPU.md). With the flag:
+
+- the helpers are filled with the served layers only (`netproto::served_pairs`: profile order first, then every other
+  served expert), not with pairs from all 48 layers;
+- CUDA0's own cache does not keep an expert out of the helpers (a server runs no verify window on CUDA0, so an expert
+  it held would only fall back to the CPU); CUDA0 holds the dense weights, `--expert-cache 16` is enough;
+- the RAM warm-up touches only the experts no helper holds;
+- the server logs how many served experts sit in helper VRAM, and after each session how many requested rows the GPUs
+  computed (`9443 rows asked, 9375 computed on helper GPUs (99.3%)`).
+
+Entries no helper holds stay on the server's CPU. **The rows are not bit-identical** to a CPU server's: the GPU kernels
+round differently (the same as the conductor's own cache, bench/results/2026-09-27-cache-parity), so the generated text
+can differ from a CPU-server run. Without the flag the server stays the CPU-only, bit-identical one described above.
+
+Rig command (GPUs pinned by UUID: CUDA0 = the RTX 3090 for the dense weights, CUDA1..3 = the three RTX 3060):
+
+```sh
+strata --pack PACK --native SHARD1.gguf --max-context 1024 --prefill auto --spec 2 \
+       --expert-profile data/expert-profile.bin --mmap-experts --pcie-frac 0 \
+       --expert-server-gpu --listen 127.0.0.1:7840 --serve-layers 38-47 --expert-cache 16 \
+       --gpu GPU-d526893c-...,GPU-1608aa48-...,GPU-4382b370-...,GPU-1bab2dba-... \
+       --expert-cache-device1 N1 --expert-cache-device2 N2 --expert-cache-device3 N3
+```
+
+Size each `N` from the card's live free memory: while TabbyAPI runs, a card may take only its free memory minus 1 GB,
+and a 3090 at most 6 GB in total. With about 1.36 MB per slot plus about 400 MiB of context and scratch,
+`N = (free_MiB - 1024 - 400) / 1.36`. Measured on the rig: CUDA0 (3090) +3924 MiB, each 3060 +2135..2206 MiB, all
+under their caps; 4485 of the 5120 experts of layers 38-47 (5.77 GiB) fit. The RTX 5070 (sm_120) is not used: the
+binary is built for sm_86, and the engine takes at most three helper devices.
+
+### Measured (--expert-server-gpu)
+
+Qwen3.8-Flash-Next ISTA Q2_0, 14 prompt tokens, 64 new tokens, greedy, `--spec 2`, `--pcie-frac 0`, layers 38-47 on the
+rig over an SSH tunnel (the rig's ufw blocks 7840; the server listens on 127.0.0.1). Conductor on the gaming PC,
+`--expert-cache 1100` (5664 MiB of VRAM; the 1500 slots of the first measurement peaked at 6172 MiB, over the 6 GB cap).
+Static cache (`--adapt-every 0`), so a configuration gives the same text every run. Page cache warm.
+
+| Rig server | decode tok/s | calls | round trip | server compute | rows on GPU | tokens per round |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| CPU (i5-9400, AVX2) | 11.44 | 420 | 5.814 ms | 2.541 ms | 0 % | 1.52 |
+| GPU (3 x RTX 3060) | 11.30 | 600 | 3.029 ms | 0.520 ms | 99.3 % | 1.07 |
+| GPU, the first run of the session | 3.11 (the conductor's page cache cold) | 600 | 2.955 ms | 0.508 ms | 99.3 % | 1.07 |
+
+- Per layer call the GPU server computes 4.9x faster (0.51 against 2.54 ms) and the round trip falls 48 %
+  (3.0 against 5.8 ms); what remains is the SSH tunnel and the frame copies. Remote time per decode round: CPU 58 ms,
+  GPU 30 ms.
+- Decode tok/s did not move, for a reason outside the server: the GPU server's rounding changed the text, and the new
+  text's drafts were accepted less often (1.07 against 1.52 tokens per round: 60 rounds instead of 42). Per round the GPU
+  run is faster. With the adaptive cache (the default; measured on the build before the hardening merge, same B2 logic) the
+  same pattern: GPU 17.82 / 11.96 tok/s (2.6 ms round trip), CPU 17.21 / 16.35 (4.7 ms).
+- Against the 2.92 tok/s of the first rig measurement: that run had 14.3 ms of rig CPU compute per call (TabbyAPI busy
+  beside it); in these runs the rig CPU took 2.5 ms. The GPU path does not depend on how busy the rig's six cores are.
+
 ## NVLink
 
 The two RTX 3090 of the gaming PC are NVLink-bridged (`nvidia-smi topo -m`: NV4, four links, 14 GB/s per link shown).
@@ -280,7 +337,7 @@ the remote-expert path.
 ## Next steps
 
 1. Route the prompt path (prefill) through the expert servers, so the conductor needs no local copy of handed-out layers.
-2. Expert servers on GPUs (the rig's 72 GB VRAM, the stream PC's 5070 Ti): load the served layers' experts into VRAM and
-   compute them with the GPU kernels, so the host CPU stops being the bottleneck.
+2. Expert servers on GPUs: done for CUDA helper cards ("Expert servers on GPU" above). Open: the stream PC's 5070 Ti
+   (sm_120 build), a fourth helper card, and CUDA0's own spare VRAM (it holds only the dense weights in server mode).
 3. Overlap: send layer l+1's request as soon as its router output exists (today one round trip per layer, in series).
 4. fp16 hidden states on the wire (halves the traffic). The CPU-only server for hosts without a GPU is done: "CPU-only host" above.
