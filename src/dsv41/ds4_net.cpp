@@ -378,9 +378,7 @@ bool ExpertHost::compute(uint32_t layer, uint32_t n_tok, uint32_t k, const int32
     const int GB = (FF + RB - 1) / RB, DB = (E + RB - 1) / RB, nj = (int) jobs.size();
     const size_t gr = type_row_bytes(L.type[0], E), dr = type_row_bytes(L.type[2], FF);
     // gate / up -> h
-    static const int ser = std::getenv("DS4_NET_SER") ? std::atoi(std::getenv("DS4_NET_SER")) : 0;
-    auto pf = [&](int bit, int n, const std::function<void(int)>& f) { if (ser & bit) { for (int j = 0; j < n; ++j) f(j); } else I.pool->parallel_for(n, f); };
-    pf(1, nj * GB, [&](int j) {
+    I.pool->parallel_for(nj * GB, [&](int j) {
         const Job& jb = jobs[(size_t) (j / GB)];
         const int r0 = (j % GB) * RB, r1 = std::min(FF, r0 + RB);
         const uint8_t* gate = I.mat(L, jb.e, 0);
@@ -414,13 +412,14 @@ bool ExpertHost::compute(uint32_t layer, uint32_t n_tok, uint32_t k, const int32
     else
         for (int s = 0; s < n_ent; ++s) gg::iq_cpu_quant(fm.d_act, I.hf.data() + (size_t) s * (size_t) FF, FF, I.ha.p + (size_t) s * hs);
     // down -> out rows
-    pf(2, nj * DB, [&](int j) {
+    I.pool->parallel_for(nj * DB, [&](int j) {
         const Job& jb = jobs[(size_t) (j / DB)];
         const int r0 = (j % DB) * RB, r1 = std::min(E, r0 + RB);
         const uint8_t* down = I.mat(L, jb.e, 2);
         const void* hp[kEntTok];
         float* yp[kEntTok];
-        for (int i = 0; i < jb.n; ++i) { hp[i] = I.ha.p + (size_t) jb.slot[i] * hs; yp[i] = out + (size_t) jb.ent[i] * (size_t) E; }
+        // (mx_rows writes y[i][r - r0]: the band's pointer is the row's + r0; iq_cpu_down adds r0 itself)
+        for (int i = 0; i < jb.n; ++i) { hp[i] = I.ha.p + (size_t) jb.slot[i] * hs; yp[i] = out + (size_t) jb.ent[i] * (size_t) E + (mx ? r0 : 0); }
         if (mx) gg::mx_rows(down, dr, FF, r0, r1, hp, jb.n, yp);
         else gg::iq_cpu_down(fm, down, hp, jb.n, yp, r0, r1);
     });
