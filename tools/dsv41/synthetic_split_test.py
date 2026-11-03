@@ -106,6 +106,17 @@ with tempfile.TemporaryDirectory() as tmp:
     m = re.search(r"remote expert rows (\d+), computed locally (\d+)", L.get("STATS", ""))
     check("server dies after 40 requests: output identical via the local fallback", r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and L.get("ROWHASH") == R.get("ROWHASH"), r.stderr[-300:])
     check("server dies: both remote and local rows were used", m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, L.get("STATS", ""))
+    # 4b. a server on a sparse slice (only its layers' bytes on disk): slice_stream.py emit | apply
+    sl = os.path.join(tmp, "slice")
+    em = subprocess.Popen([sys.executable, os.path.join(here, "slice_stream.py"), "emit", pack, "2-5"], stdout=subprocess.PIPE)
+    ap = subprocess.run([sys.executable, os.path.join(here, "slice_stream.py"), "apply", sl], stdin=em.stdout, capture_output=True, text=True)
+    em.wait()
+    check("slice_stream emit | apply", em.returncode == 0 and ap.returncode == 0, ap.stderr[-200:])
+    h = start(sl, 17848, "2-5", token)
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17848=2-5"], token)
+    stop(h)
+    L = lines(r)
+    check("a server on a sparse slice of layers 2-5: identical", r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and L.get("ROWHASH") == R.get("ROWHASH"), r.stderr[-200:])
     # 5. refusals
     e = start(pack, 17845, "0-7", token)
     r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17845=0-7", "--arch", "0", "--expect-open-fail"], token)

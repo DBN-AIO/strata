@@ -17,6 +17,8 @@ on:
       - 'cmake/**'
       - 'third_party/**'
       - 'tools/slice_gguf.py'
+      - 'tools/dsv41/**'
+      - 'tests/dsv41/**'
       - 'CMakeLists.txt'
       - '.github/workflows/build-linux.yml'
   pull_request:
@@ -26,6 +28,8 @@ on:
       - 'cmake/**'
       - 'third_party/**'
       - 'tools/slice_gguf.py'
+      - 'tools/dsv41/**'
+      - 'tests/dsv41/**'
       - 'CMakeLists.txt'
       - '.github/workflows/build-linux.yml'
   workflow_dispatch:
@@ -103,6 +107,16 @@ jobs:
           if ldd build-cpu/strata-expert-server | grep -Ei 'libcuda|libcudart|libcublas|libnvrtc|libamdhip'; then
             echo "::error::strata-expert-server links a GPU runtime"; exit 1
           fi
+          build-cpu/strata-dsv41-expert-server --help | head -2
+          if ldd build-cpu/strata-dsv41-expert-server | grep -Ei 'libcuda|libcudart|libcublas|libnvrtc|libamdhip'; then
+            echo "::error::strata-dsv41-expert-server links a GPU runtime"; exit 1
+          fi
+
+      # DeepSeek-V4.1-Flash experts over the LAN (docs/DEEPSEEK41_SPLIT.md): a tiny DeepSeek-shaped model with random weights in the
+      # real sets' quant types, 64 greedy tokens in one process vs. through expert servers on localhost, bit-identical expert rows;
+      # also two servers, a server that dies mid-run (local fallback), and the refusals (engine family, token, geometry).  ~10 s.
+      - name: DeepSeek split test (synthetic)
+        run: python3 tools/dsv41/synthetic_split_test.py build-cpu
 
   # DEFERRED: a Windows compile check of the same target (the server's socket shim has a Winsock branch, never compiled in CI).
   # There is no Windows runner for this repository yet; when one is registered, enable this job.
