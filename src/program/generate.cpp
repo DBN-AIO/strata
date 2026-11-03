@@ -3187,6 +3187,18 @@ static void exit_if_gpu_fatal(const std::string& err) {
     }
 }
 
+/// REMOTE EXPERTS: --serve-layers a-b (inclusive; empty = every layer) as [lo, hi].  False when out of 0..n_layers-1.
+static bool serve_layer_range(const std::string& spec, int64_t n_layers, int& lo, int& hi) {
+    lo = 0;
+    hi = (int) n_layers - 1;
+    if (!spec.empty()) {
+        const size_t dash = spec.find('-');
+        lo = std::atoi(spec.c_str());
+        hi = dash == std::string::npos ? lo : std::atoi(spec.c_str() + dash + 1);
+    }
+    return lo >= 0 && hi >= lo && hi < n_layers;
+}
+
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
 static int engine_main(int argc, char** argv) {   // main() is at the end of this file (#3431)
 #else
@@ -8367,6 +8379,31 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: remote ranking: %zu profiled pairs, "
                                  "%zu other pairs to fill CUDA1..3\n", profile.size(), ranked.size() - profile.size());
         }
+        // REMOTE EXPERTS on GPU (--expert-server with --expert-cache-device1..3): the server computes only its served
+        // layers, so the helpers hold only those, and CUDA0's own cache does not exclude any: in server mode no window
+        // runs on CUDA0, so an expert it holds would otherwise fall back to the server's CPU.
+        const strata::core::ExpertCache no_primary;
+        const strata::core::ExpertCache& helper_primary = o.expert_server ? no_primary : xcache;
+        if (o.expert_server) {
+            int slo = 0, shi = 0;
+            if (!serve_layer_range(o.serve_layers, g.n_layers, slo, shi)) {
+                std::fprintf(stderr, "strata generate: --serve-layers a-b is outside 0..%lld\n", (long long) g.n_layers - 1);
+                return 2;
+            }
+            std::vector<uint8_t> seen((size_t) g.n_layers * (size_t) g.n_expert, 0);
+            std::vector<std::pair<int32_t, int32_t>> served;
+            for (const auto& pr : ranked)
+                if (pr.first >= slo && pr.first <= shi && pr.second >= 0 && pr.second < g.n_expert &&
+                    !seen[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second]) {
+                    seen[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
+                    served.push_back(pr);
+                }
+            for (int64_t e = 0; e < g.n_expert; ++e)   // the profile may not name every served expert
+                for (int64_t l = slo; l <= shi; ++l)
+                    if (!seen[(size_t) l * (size_t) g.n_expert + (size_t) e]) served.emplace_back((int32_t) l, (int32_t) e);
+            std::fprintf(stderr, "strata net: helper GPUs hold served layers %d-%d only (%zu pairs ranked)\n", slo, shi, served.size());
+            ranked = std::move(served);
+        }
         std::array<std::vector<std::pair<int32_t, int32_t>>, 3> by_device;
         if (multi_remote) {
             // Either stripe experts for parallel GPU work, or give each layer one
@@ -8376,7 +8413,7 @@ int main(int argc, char** argv) {
             int next = 0;
             for (const auto& pair : ranked) {
                 if (pair.first < 0 || pair.first >= g.n_layers || pair.second < 0 || pair.second >= g.n_expert ||
-                    xcache.slot_of(pair.first, pair.second) >= 0) continue;
+                    helper_primary.slot_of(pair.first, pair.second) >= 0) continue;
                 const size_t index = (size_t) pair.first * (size_t) g.n_expert + (size_t) pair.second;
                 if (assigned[index]) continue;
                 int target = -1;
@@ -8412,7 +8449,7 @@ int main(int argc, char** argv) {
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
             if (remote_opt) remote_opt->attach(remote_experts[(size_t) r]);
             if (!remote_experts[(size_t) r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
-                     g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err,
+                     g.n_layers, g.n_expert, by_device[(size_t) r], helper_primary, *srcp, claimed, err,
                      o.expert_cache_remote_auto[(size_t) r])) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -8477,18 +8514,18 @@ int main(int argc, char** argv) {
         sc.port = o.listen_port;
         sc.n_layers = g.n_layers;
         sc.n_expert = g.n_expert;
-        sc.layer_lo = 0;
-        sc.layer_hi = (int) g.n_layers - 1;
-        if (!o.serve_layers.empty()) {
-            const size_t dash = o.serve_layers.find('-');
-            sc.layer_lo = std::atoi(o.serve_layers.c_str());
-            sc.layer_hi = dash == std::string::npos ? sc.layer_lo : std::atoi(o.serve_layers.c_str() + dash + 1);
-        }
-        if (sc.layer_lo < 0 || sc.layer_hi < sc.layer_lo || sc.layer_hi >= g.n_layers) {
+        if (!serve_layer_range(o.serve_layers, g.n_layers, sc.layer_lo, sc.layer_hi)) {
             std::fprintf(stderr, "strata generate: --serve-layers a-b is outside 0..%lld\n", (long long) g.n_layers - 1);
             return 2;
         }
-        struct WarmCtx { strata::core::ExpertSource* src; int64_t ne; } wc{srcp, g.n_expert};
+        struct WarmCtx { strata::core::ExpertSource* src; int64_t ne; strata::core::ExpertDispatch* d; } wc{srcp, g.n_expert, &drive.d};
+        sc.gpu_user = &drive.d;
+        sc.gpu_rows = [](void* u) -> uint64_t {   // rows the helper GPUs computed so far (RemoteExperts::computed)
+            const auto* d = (const strata::core::ExpertDispatch*) u;
+            uint64_t c = 0;
+            for (int r = 0; r < d->remote_count; ++r) c += (uint64_t) d->remote[r]->computed();
+            return c;
+        };
         sc.warm_user = &wc;
         sc.warm = [](void* u, int lo, int hi) {
             WarmCtx* w = (WarmCtx*) u;
@@ -8498,10 +8535,16 @@ int main(int argc, char** argv) {
             const auto t0 = Clock::now();
             // make the served layers' experts resident in RAM: touch every page of every expert blob of the GGUF mapped in
             // place (the page cache then holds them), and mlock what the OS allows, so no SSD read sits on an answer
-            uint64_t touched = 0, locked = 0, reads = 0;
+            uint64_t touched = 0, locked = 0, reads = 0, on_gpu = 0, gpu_bytes = 0;
             volatile uint8_t sink = 0;
+            auto helper_has = [&](int l, int64_t e) {   // a helper GPU computes it from its VRAM: no RAM copy needed
+                for (int r = 0; r < w->d->remote_count; ++r)
+                    if (w->d->remote[r]->holds(l, (int32_t) e)) return true;
+                return false;
+            };
             for (int l = lo; l <= hi; ++l) {
                 for (int64_t e = 0; e < w->ne; ++e) {
+                    if (helper_has(l, e)) { ++on_gpu; gpu_bytes += strata::kernels::cpu::expert_layout().blob_bytes(l); continue; }
                     strata::core::BlobPart bp[3];
                     const int ns = w->src->blob_parts(l, e, bp);
                     if (ns == 0) {   // the I/O-prefetch path (pread into the page cache): a blob read fills the cache
@@ -8522,6 +8565,7 @@ int main(int argc, char** argv) {
             uint64_t have = 0, want = 0;
             for (int l = lo; l <= hi; ++l)
                 for (int64_t e = 0; e < w->ne; e += 8) {
+                    if (helper_has(l, e)) continue;
                     uint64_t total = 0;
                     const uint64_t c = fs != nullptr ? fs->resident_bytes(l, e, total) : 0;
                     have += c; want += total;
@@ -8529,6 +8573,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata net: served layers %d-%d: touched %.2f GiB mapped + %llu blob reads, mlocked %.2f GiB, page-cache resident %.2f of %.2f GiB (sampled 1 in 8) in %.1f s\n",
                          lo, hi, (double) touched / 1073741824.0, (unsigned long long) reads, (double) locked / 1073741824.0, (double) have * 8.0 / 1073741824.0,
                          (double) want * 8.0 / 1073741824.0, std::chrono::duration<double>(Clock::now() - t0).count());
+            std::fprintf(stderr, "strata net: served layers %d-%d: %llu of %lld experts resident in helper GPU VRAM (%.2f GiB), "
+                                 "computed there with the GPU kernels; the rest on this host's CPU\n",
+                         lo, hi, (unsigned long long) on_gpu, (long long) (hi - lo + 1) * (long long) w->ne,
+                         (double) gpu_bytes / 1073741824.0);
         };
         return strata::core::serve_experts(drive.d, sc);
     }

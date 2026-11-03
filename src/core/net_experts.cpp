@@ -270,8 +270,9 @@ int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
         if (s == kBad) continue;
         sock_tune(s);
         std::fprintf(stderr, "strata net: conductor connected\n");
-        uint64_t calls = 0;
+        uint64_t calls = 0, rows_asked = 0;
         double compute_ms = 0;
+        const uint64_t gpu0 = cfg.gpu_rows != nullptr ? cfg.gpu_rows(cfg.gpu_user) : 0;
         bool hello = false;
         for (;;) {
             uint32_t type = 0;
@@ -339,11 +340,13 @@ int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
             for (size_t i = 0; i < n; ++i)
                 if (mask[i]) { std::memcpy(resp.data() + at + q * (size_t) H * 4, out.data() + i * (size_t) H, (size_t) H * 4); ++q; }
             if (!send_frame(s, kResp, resp.data(), resp.size())) break;
-            ++calls; compute_ms += us / 1000.0;
+            ++calls; compute_ms += us / 1000.0; rows_asked += rows;
         }
         sock_close(s);
-        std::fprintf(stderr, "strata net: conductor disconnected after %llu calls, mean compute %.3f ms\n",
-                     (unsigned long long) calls, calls ? compute_ms / (double) calls : 0.0);
+        const uint64_t on_gpu = cfg.gpu_rows != nullptr ? cfg.gpu_rows(cfg.gpu_user) - gpu0 : 0;
+        std::fprintf(stderr, "strata net: conductor disconnected after %llu calls, mean compute %.3f ms, %llu rows asked, %llu on GPU (%.1f%%)\n",
+                     (unsigned long long) calls, calls ? compute_ms / (double) calls : 0.0, (unsigned long long) rows_asked,
+                     (unsigned long long) on_gpu, rows_asked ? 100.0 * (double) on_gpu / (double) rows_asked : 0.0);
         if (cfg.once) break;
     }
     sock_close(ls);
