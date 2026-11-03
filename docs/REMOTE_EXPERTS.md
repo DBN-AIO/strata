@@ -441,6 +441,67 @@ Prompt path, windows in flight (`STRATA_NET_PIPELINE`), round-trip time of the 1
   so the window depth no longer matters there, and its CPU work also slowed the conductor's own expert streaming
   (prompt 26 tok/s). A second host that is a separate machine does not have that cost.
 
+## Full-stack run (2026-11-03): gaming PC + rig GPU + T340 CPU
+
+The `remote-experts` tip (hardening #3, CPU-only server #2, GPU servers #4, prompt path #5, pipelining #6) on three hosts.
+The conductor runs on the gaming PC: RTX 3090 GPU0 pinned by UUID, `--expert-cache 1100`, 5664 MiB of VRAM.
+The rig runs `--expert-server-gpu`: 3090 for the dense weights and 3 x RTX 3060 helpers, by UUID. The T340 runs
+`strata-expert-server`, the CPU-only build, under `nice -n 19` on its default pool (3 workers + the host thread,
+Xeon E-2234, AVX2); its sparse slice holds layers 38-43. Both servers listen on 127.0.0.1: the conductor reaches the rig
+through `ssh -L` and the T340 through `ssh -R` from the T340. Every run used `--adapt-every 0`, `--spec 2`,
+`--pcie-frac 0`, greedy and 64 new tokens, with two fixed prompts: 14 tokens ("What is the capital of France?" in the
+chat template) and 119 tokens (the same question 16 times in one turn). The page cache was warm for every number below.
+
+**Found and fixed by this run:** after #2 and #3, `strata-expert-server` never set its model identity or top-k. Every
+conductor was refused at the handshake ("model fingerprint differs"). The server now computes the identity the way
+`generate.cpp` does and sets top-k from the GGUF. `serve_experts` refuses to start without them
+(`netproto::serve_cfg_problem`), and `--listen` takes `HOST:PORT`.
+
+### Tokens: identical where they should be
+
+Each output line was hashed with md5, first 8 hex digits:
+
+| Prompt | output | runs |
+| --- | --- | --- |
+| 14 tokens | `9646d49f` | local only (x2); T340 CPU layers 38-43 with the prompt local (`=0`), through the server (`=1`) and the reference arm (`=2`); rig GPU experts 0-255 + T340 256-511 of layers 38-43 |
+| 14 tokens | `52acd8b8` | rig GPU layers 38-47; rig GPU 44-47 + T340 38-43 |
+| 119 tokens | `3de9503f` | all seven runs: local (x2), T340 (`=1`, `=2`), rig, rig + T340, split |
+
+- **CPU servers are bit-exact:** the T340 server, the decode rows and the prompt rows all give the local-only text.
+  It uses the same CPU kernels (AVX2 on both hosts) on the same bytes.
+- **The rig GPU changes the text when layers 44-47 run on its GPUs.** This is GPU rounding, as documented for
+  `--expert-server-gpu`. The 14-token prompt sits on a near tie at the second token (374 against 248046). The GPU
+  kernels' rows for layers 38-47 or 44-47 tip it to the other branch, and from there the texts differ (1.07 instead of
+  1.5 tokens per draft round).
+- The same GPU rows for layers 38-43 only (the split run) did not tip it, and no configuration tipped the 119-token
+  prompt. This is luck at a near tie, not a guarantee: only the CPU servers are exact.
+
+### tok/s
+
+| Configuration | decode, 14 tok | decode, 119 tok | prompt, 14 tok | prompt, 119 tok | remote round trip (decode) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| local only | 31.90 | 50.64 | 16.4 | 74.7 | - |
+| + T340 CPU (38-43) | 25.57 (prompt local) / 23.56 (14.25 in a third run, T340 at 7.6 ms per call) | 21.30 | 17.0 (local) / 14.8 | 42.2 | 3.3-3.7 ms (14 tok), 13.5 ms (119) |
+| + rig GPU (38-47) | 7.12 (other text, see above) | 30.79 | 15.6 | 52.2 | 3.2 ms (0.58 compute) |
+| + rig GPU (44-47) + T340 CPU (38-43) | 8.70 (other text) | 9.76 | 11.6 | 19.8 | rig 2.9 ms, T340 12.8 / 35.4 ms |
+| layers 38-43 split by expert range: rig GPU 0-255 + T340 CPU 256-511 | 15.62 | 17.31 | 11.9 | 31.1 | rig 2.2 ms, T340 9.1 / 17.5 ms, both in flight every call |
+
+Readings:
+- **On this hardware every remote layer costs speed.** The gaming PC holds the whole model in its page cache (62 GB of
+  RAM), so local is fastest. What the servers buy is capacity: a model that does not fit one host.
+- **The T340 is the slow host.** It took 2-10 ms of compute per call on the 14-token runs and 10-30 ms on the 119-token
+  runs (four cores, `nice -n 19`, the live fleet beside it). It decides every configuration it is in: the prompt path's
+  round trips were 4.3 s of the 6.0 s prompt with both servers.
+- **The expert-range split halves the T340's share and keeps the rig on its GPUs.** It beats putting whole layers on
+  the T340 (15.6 against 8.7 decode tok/s, 31.1 against 19.8 prompt tok/s) and gives the local-only text on the
+  14-token prompt.
+- **The rig GPU is fast per call** (0.5-1.0 ms of compute, about 3 ms round trip through the tunnel). Its decode tok/s
+  on the 14-token prompt is low only because the text changed and drafts stopped being accepted. On the 119-token
+  prompt, where the text stayed the same, it reached 30.8 tok/s against 21.3 for the T340.
+
+Peak VRAM of our processes: the conductor 5674 MiB (6 GiB cap). The rig 3090 +3924 MiB. Each 3060 +2123 to +2260 MiB,
+under its free memory minus 1 GB (free was 3399-3541 MiB).
+
 ## NVLink
 
 The two RTX 3090 of the gaming PC are NVLink-bridged (`nvidia-smi topo -m`: NV4, four links, 14 GB/s per link shown).
