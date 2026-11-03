@@ -4672,7 +4672,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // REMOTE EXPERTS: a handed-out layer's non-resident experts are the servers' (no local share, no
                         // local read); the layer's MoE input goes to the host for the request, as the share's does
                         static const bool net_prefill = [] { const char* v = std::getenv("STRATA_NET_PREFILL"); return v == nullptr || std::atoi(v) != 0; }();
-                        net_l = net_prefill && net_ != nullptr && net_->serves(l) && !stream_all && !m.pp && lay.native && !lay.fmt.empty();
+                        net_l = net_prefill && net_ != nullptr && net_->covers(l) && !stream_all && !m.pp && lay.native && !lay.fmt.empty();
                         if (net_l) {
                             cpu_maybe = false;
                             const size_t want = (size_t) T * N;
