@@ -4676,8 +4676,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                          lay.native && !m.pp && !lay.fmt.empty();
                         // REMOTE EXPERTS: a handed-out layer's non-resident experts are the servers' (no local share, no
                         // local read); the layer's MoE input goes to the host for the request, as the share's does
-                        static const bool net_prefill = [] { const char* v = std::getenv("STRATA_NET_PREFILL"); return v == nullptr || std::atoi(v) != 0; }();
-                        net_l = net_prefill && net_ != nullptr && net_->serves(l) && !stream_all && !m.pp && lay.native && !lay.fmt.empty();
+                        // STRATA_NET_PREFILL: 1 (default) the servers, 0 off (read and stream locally, as before), 2 the reference arm:
+                        // the same experts on this host's CPU share kernels (the server's CPU arithmetic), for an A/B of the bits
+                        static const int net_prefill = [] { const char* v = std::getenv("STRATA_NET_PREFILL"); return v == nullptr ? 1 : std::atoi(v); }();
+                        net_l = net_prefill != 0 && (net_prefill != 2 || (pool_hold.held && cpu_pool_ != nullptr)) && net_ != nullptr && net_->serves(l) && !stream_all && !m.pp && lay.native && !lay.fmt.empty();
                         if (net_l) {
                             cpu_maybe = false;
                             const size_t want = (size_t) T * N;
@@ -4824,9 +4826,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     cpu_blob.assign((size_t) m.g->n_expert, nullptr);
                                 }
                                 on_cpu[(size_t) e] = 1;
+                                if (net_prefill == 2) {   // the reference arm: this host computes them, from blobs taken here
+                                    cpu_blob[(size_t) e] = m.src->blob_stable(l, e);
+                                    if (cpu_blob[(size_t) e] == nullptr) { err = "prefill: STRATA_NET_PREFILL=2: no stable blob"; return false; }
+                                }
                                 rows_cpu += c;
                                 ++n_cpu;
                             }
+                            net_fb = net_prefill == 2;   // counted as this host's CPU experts
                         }
                         if (cpu_maybe) {
                             std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
@@ -4994,7 +5001,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.cpu_ev[0] == nullptr) { cudaEventCreate(&m.cpu_ev[0]); cudaEventCreate(&m.cpu_ev[1]); }
                                 cudaEventRecord(m.cpu_ev[0], m.cs);
                             }
-                            net_try = net_l;
+                            net_try = net_l && !net_fb;
                             cpu_fn = [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, &net_err, &net_try, src_h, ids_h, slot_h, l, T, r0c, this]() -> bool {
                                 const auto t0 = std::chrono::steady_clock::now();
                                 if (net_try) {   // REMOTE EXPERTS: the server's rows into the same tail rows the share fills
