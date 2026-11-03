@@ -10,6 +10,8 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace strata::core::netproto {
 
@@ -227,6 +229,29 @@ inline std::string parse_req(const ReqLimits& L, const uint8_t* p, size_t len, R
         v.rows += v.mask[i];
     }
     return std::string();
+}
+
+// ---------------------------------------------------------------- GPU expert server (--expert-server-gpu)
+/// The (layer, expert) pairs an expert server's helper GPUs are filled with, best first: the ranked (profile) pairs of the
+/// served layers lo..hi in their order, each once, then every served pair the ranking does not name, expert-major (so a
+/// fill that runs out of room spreads its misses across the layers).  Pairs outside lo..hi or 0..n_expert-1 are dropped:
+/// a server computes only its own layers, and a helper slot spent on another layer is a served expert left on the CPU.
+inline std::vector<std::pair<int32_t, int32_t>> served_pairs(const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                                                             int64_t n_layers, int64_t n_expert, int lo, int hi) {
+    std::vector<std::pair<int32_t, int32_t>> out;
+    if (n_layers <= 0 || n_expert <= 0 || lo < 0 || hi < lo || hi >= n_layers) return out;
+    std::vector<uint8_t> seen((size_t) n_layers * (size_t) n_expert, 0);
+    for (const auto& pr : ranked) {
+        if (pr.first < lo || pr.first > hi || pr.second < 0 || pr.second >= n_expert) continue;
+        uint8_t& s = seen[(size_t) pr.first * (size_t) n_expert + (size_t) pr.second];
+        if (s) continue;
+        s = 1;
+        out.push_back(pr);
+    }
+    for (int64_t e = 0; e < n_expert; ++e)
+        for (int64_t l = lo; l <= hi; ++l)
+            if (!seen[(size_t) l * (size_t) n_expert + (size_t) e]) out.emplace_back((int32_t) l, (int32_t) e);
+    return out;
 }
 
 }  // namespace strata::core::netproto

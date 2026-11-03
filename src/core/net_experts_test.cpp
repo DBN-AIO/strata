@@ -116,6 +116,20 @@ int main() {
         check(!parse_req(L2, p.data(), p.size(), v).empty(), "n_tok*k beyond the tables refused");
     }
 
+    {   // ---- B2: the pairs a GPU expert server's helpers hold (served layers only, profile order first, then the rest)
+        const std::vector<std::pair<int32_t, int32_t>> ranked = {{5, 1}, {2, 3}, {3, 0}, {2, 3}, {4, 9}, {3, 2}, {9, 0}, {2, 1}};
+        const auto sp = served_pairs(ranked, 6, 4, 2, 3);   // 6 layers x 4 experts, served layers 2-3
+        check(sp.size() == 8, "served_pairs: every served pair exactly once (2 layers x 4 experts)");
+        check(sp.size() >= 4 && sp[0] == std::make_pair(2, 3) && sp[1] == std::make_pair(3, 0) && sp[2] == std::make_pair(3, 2) &&
+              sp[3] == std::make_pair(2, 1), "served_pairs: profile order first, repeats and other layers dropped");
+        bool in_range = true;
+        for (const auto& p : sp) in_range = in_range && p.first >= 2 && p.first <= 3 && p.second >= 0 && p.second < 4;
+        check(in_range, "served_pairs: nothing outside the served layers or the expert count");
+        check(sp.size() == 8 && sp[4] == std::make_pair(2, 0) && sp[5] == std::make_pair(3, 1) && sp[6] == std::make_pair(2, 2) &&
+              sp[7] == std::make_pair(3, 3), "served_pairs: the unranked rest expert-major");
+        check(served_pairs(ranked, 6, 4, 3, 2).empty() && served_pairs(ranked, 6, 4, 0, 6).empty(), "served_pairs: a bad range gives nothing");
+    }
+
     if (g_fail == 0) std::printf("net_experts_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }

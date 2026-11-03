@@ -598,8 +598,10 @@ void serve_session(ExpertDispatch& d, ServerCtx& C, sock_t s, const std::string&
     std::fprintf(stderr, "strata net: conductor connected from %s\n", peer.c_str());
     sock_tune(s, true);
     set_io_timeouts(s, 0, C.tmo_ms);   // a conductor may sit idle between prompts (keepalive covers a dead one); a send never waits forever
-    uint64_t calls = 0, bad_reqs = 0;
+    uint64_t calls = 0, bad_reqs = 0, rows_asked = 0;
     double compute_ms = 0;
+    const ExpertServeCfg& cf = *C.cfg;
+    const uint64_t gpu0 = cf.gpu_rows != nullptr ? cf.gpu_rows(cf.gpu_user) : 0;
     for (;;) {
         uint32_t type = 0;
         if (!recv_frame(s, type, payload, kMaxReqFrame)) break;
@@ -637,11 +639,16 @@ void serve_session(ExpertDispatch& d, ServerCtx& C, sock_t s, const std::string&
         for (size_t i = 0; i < v.n; ++i)
             if (v.mask[i]) { std::memcpy(resp.data() + at + q * (size_t) H * 4, out.data() + i * (size_t) H, (size_t) H * 4); ++q; }
         if (!send_frame(s, kResp, resp.data(), resp.size())) break;
-        ++calls; compute_ms += us / 1000.0;
+        ++calls; compute_ms += us / 1000.0; rows_asked += v.rows;
     }
     sock_close(s);
     std::fprintf(stderr, "strata net: conductor %s disconnected after %llu calls (%llu refused), mean compute %.3f ms\n", peer.c_str(),
                  (unsigned long long) calls, (unsigned long long) bad_reqs, calls ? compute_ms / (double) calls : 0.0);
+    if (cf.gpu_rows != nullptr) {
+        const uint64_t on_gpu = cf.gpu_rows(cf.gpu_user) - gpu0;
+        std::fprintf(stderr, "strata net: %llu rows asked, %llu computed on helper GPUs (%.1f%%)\n", (unsigned long long) rows_asked,
+                     (unsigned long long) on_gpu, rows_asked ? 100.0 * (double) on_gpu / (double) rows_asked : 0.0);
+    }
 }
 
 bool is_loopback(const sockaddr* a) {
@@ -654,10 +661,16 @@ bool is_loopback(const sockaddr* a) {
 int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
     // The server answers with the plain CPU pool.  A second GPU, helper GPUs, a resident plan or a net route would compute
     // some rows on other arithmetic than the conductor's CPU kernels (and a net route would forward the request again).
-    if (d.peer != nullptr || d.remote_count != 0 || d.net != nullptr || d.plan != nullptr || d.host_res != nullptr) {
-        std::fprintf(stderr, "strata net: the expert server needs a CPU-only dispatch (no peer GPU, helper GPUs, resident plan or net route)\n");
+    // --expert-server-gpu (cfg.gpu) lets helper GPUs compute the experts they hold; they take only kind -1 entries, i.e. the
+    // asked-for ones (only_mask), and write into the same rows.
+    if (d.peer != nullptr || (d.remote_count != 0 && !cfg.gpu) || d.net != nullptr || d.plan != nullptr || d.host_res != nullptr) {
+        std::fprintf(stderr, "strata net: the expert server needs a CPU-only dispatch (no peer GPU, helper GPUs, resident plan or net route); "
+                             "helper GPUs only with --expert-server-gpu\n");
         return 1;
     }
+    if (cfg.gpu && d.remote_count > 0)
+        std::fprintf(stderr, "strata net: GPU expert server: %d helper GPU(s) compute the served experts they hold; their rows are the GPU "
+                             "kernels' (within kernel tolerance of the conductor's CPU rows, not bit-identical)\n", d.remote_count);
     ignore_sigpipe();
     if (!sock_init()) return 1;
     const int lo = cfg.layer_lo, hi = cfg.layer_hi < 0 ? (int) cfg.n_layers - 1 : cfg.layer_hi;

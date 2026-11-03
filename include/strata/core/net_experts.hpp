@@ -110,6 +110,12 @@ struct ExpertServeCfg {
     /// Called once at start with (lo, hi): make the served layers' experts resident in RAM (warm the source).
     void (*warm)(void* user, int lo, int hi) = nullptr;
     void* warm_user = nullptr;
+    /// --expert-server-gpu: the dispatch may have helper GPUs (RemoteExperts) holding served experts; their rows are the GPU
+    /// kernels' (not bit-identical to the conductor's CPU rows).  Off: a CPU-only dispatch, as before.
+    bool gpu = false;
+    /// Optional: rows computed so far by GPU expert tiers of this server (helper GPUs), for the per-connection summary.
+    uint64_t (*gpu_rows)(void* user) = nullptr;
+    void* gpu_user = nullptr;
 };
 
 /// The expert server loop: answers REQ frames with `d` (an ordinary pool dispatch with every row on the CPU).  `d` must
