@@ -2505,8 +2505,7 @@ int main(int argc, char** argv) {
 #if defined(STRATA_DS4_NET)
             return strata::ds4::net::server_main(argc, argv);
 #else
-            std::fprintf(stderr, "--expert-server: this build of strata-dsv41 has no network experts
-");
+            std::fprintf(stderr, "--expert-server: this build of strata-dsv41 has no network experts\n");
             return 2;
 #endif
         }
