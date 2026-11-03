@@ -118,6 +118,12 @@ jobs:
       - name: DeepSeek split test (synthetic)
         run: python3 tools/dsv41/synthetic_split_test.py build-cpu
 
+      # BBXL: popularity-aware placement (plan_split.py --popularity) and the rank-ordered slice (slice_stream.py emit --perm); pure python, about 2 s.
+      - name: DeepSeek split planner tests
+        run: |
+          python3 tools/dsv41/test_plan_split.py
+          python3 tools/dsv41/test_slice_perm.py
+
   # DEFERRED: a Windows compile check of the same target (the server's socket shim has a Winsock branch, never compiled in CI).
   # There is no Windows runner for this repository yet; when one is registered, enable this job.
   #
