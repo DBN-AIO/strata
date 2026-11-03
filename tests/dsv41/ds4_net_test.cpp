@@ -199,8 +199,6 @@ int main(int argc, char** argv) {
     std::printf("TOKENS");
     for (int t : seq) std::printf(" %d", t);
     std::printf("\nROWHASH %016llx\nROWS %ld FINITE %d\n", (unsigned long long) row_hash, rows_total, (int) !(flag & 1));
-    std::set<int> distinct;
-    (void) distinct;
     if (mode == "remote") std::printf("STATS %s\n", remote.stats().c_str());
     return 0;
 }
