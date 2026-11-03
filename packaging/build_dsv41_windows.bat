@@ -10,11 +10,15 @@ set "BD=%~1"
 set "SRCD=%~2"
 if "%BD%"=="" ( echo usage: build_dsv41_windows.bat ^<build dir^> [source dir] & exit /b 2 )
 if "%SRCD%"=="" set "SRCD=%~dp0.."
+rem the toolkit installer sets CUDA_PATH (to ...\v13.x): that is the toolkit CMake must find; CUDA_ROOT overrides it
+if "%CUDA_ROOT%"=="" if defined CUDA_PATH set "CUDA_ROOT=%CUDA_PATH:\=/%"
 if "%CUDA_ROOT%"=="" set "CUDA_ROOT=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0"
 if "%DSV41_ARCH%"=="" set "DSV41_ARCH=86-real;89-real;120"
 if "%BUILD_JOBS%"=="" set "BUILD_JOBS=4"
 if "%STRATA_GGML_DIR%"=="" ( echo set STRATA_GGML_DIR to the llama.cpp checkout & exit /b 2 )
-call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+rem CUDA 13.0-13.2 accept Visual Studio 2022 only (2026 from CUDA 13.3): STRATA_VCVARS names another vcvars64.bat
+if "%STRATA_VCVARS%"=="" set "STRATA_VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+call "%STRATA_VCVARS%" >nul 2>&1
 rem configure every time: cmake bakes the build id (the commit) in at configure, so a build dir left from an older commit would print the old one
 if exist "%SRCD%\CMakeLists.txt" (
   cmake -G Ninja -S "%SRCD%" -B "%BD%" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_DSV41=ON -DSTRATA_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=%DSV41_ARCH%" "-DCMAKE_CUDA_COMPILER=%CUDA_ROOT%/bin/nvcc.exe" "-DCUDAToolkit_ROOT=%CUDA_ROOT%" "-DSTRATA_GGML_DIR=%STRATA_GGML_DIR%"

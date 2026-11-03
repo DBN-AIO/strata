@@ -545,6 +545,77 @@ Readings:
 Peak VRAM of our processes: the conductor 5674 MiB (6 GiB cap). The rig 3090 +3924 MiB. Each 3060 +2123 to +2260 MiB,
 under its free memory minus 1 GB (free was 3399-3541 MiB).
 
+## DeepSeek-V4.1-Flash (src/dsv41, `strata-dsv41`)
+
+The DeepSeek engine is a separate program (`strata-dsv41`, docs/DEEPSEEK41.md) with its own MoE dispatch, and it uses the same
+network split as the Qwen engine: same protocol, same `net_experts.cpp`, same flags. Placement, measurements and the test record are in
+docs/DEEPSEEK41_SPLIT.md. Status: CPU expert servers on Linux and Windows, the conductor hook, and a synthetic-model test are done and
+tested; the conductor hook is compiled into `strata-dsv41` (CUDA 13.2, sm_86) but was not run end to end (no GPU was free); a GPU expert
+server and the prompt path through the servers are not done.
+
+### The cut point
+
+Smallest boundary, and the same one as above: **the layer's FFN input rows and the (token, expert) pairs the GPU does not hold go
+out; one un-weighted expert output row per pair (`dim` fp32) comes back.** Everything after it stays on the conductor.
+
+| What | Where (`src/dsv41/ds4_model.cu`) |
+| --- | --- |
+| attention, router (`gate_w`, top-k, score bias), shared expert, hyper-connections, residual | GPU, unchanged |
+| GPU-resident experts (VRAM slots) | GPU, unchanged |
+| **the CPU lane of one layer: classify nothing, hand over `ents` (expert, up to 16 tokens, slot0) and the input rows `x`, get `c_yd[(slot0 + i) * dim]`** | **`Impl::cpu_experts(l, x, ents, ldx, ord)`**: since this change a wrapper; the old body is `cpu_experts_local` |
+| weighted sum `h_part += w * y` over the slots, `combine`, `hc_post` | after the lane, unchanged |
+| callers that go through the wrapper | `layer()` (decode and verify windows, up to 16 tokens) and `serve_lane()` (the chunked prompt path's small windows) |
+| callers that stay local on purpose | `tune_lane`, `lane_cpu_ms`, `lane_check`, `calibrate_paths` (they time or check the local CPU lane) |
+
+`cpu_experts` sends the entries of a served layer (`Remote::run`: tokens compacted to `n_tok x dim`, ids `n_tok x k` with `k` = the
+model's top-k, mask = the pairs) through `NetExperts::begin / finish`, copies the returned rows to `c_yd`, and runs whatever did not
+come back (route down, refused, an expert no route owns, more picks than `k`) on the local lane: **any network error is a local
+computation of the same rows**, and the route is retried with backoff as for Qwen. Nothing is sent for the drafter's `mtp.*` layers.
+The server computes with the engine's own CPU row kernels (`ds4_gguf_cpu`, `ds4_iq_cpu`, `ds4_tq_cpu`, `ds4_gg_cpu`: int8 MXFP4 rows,
+IQ1_M / IQ2_XXS / IQ2_XS / IQ3_XXS / ... through Strata's AVX2 / AVX-512 rows or ggml-cpu), in the same order of operations as
+`cpu_experts_iq` / `cpu_experts_mx` (activations quantized once per token, gate/up, swiglu with the model's clamp, quantize h, down), so
+the rows are the local lane's bits (below).
+
+### What changed in the shared code
+
+- `NetIdentity` has `arch` (`kArchQwen38 = 0`, `kArchDsv41 = 1`) and `n_embd`. The HELLO's former zero pad carries `arch`; **an older
+  qwen38 conductor still sends 0 and a qwen38 server still expects 0, so the wire is compatible**, and a server refuses a conductor of
+  the other family at the handshake ("engine family differs: server dsv41, yours qwen38"), before the geometry check.
+- The hidden size on the wire is `NetIdentity::n_embd` (5120 here, `cpu::H` for Qwen); the window limits are `ExpertServeCfg::max_tok /
+  max_entries` (16 and 128 for dsv41: `kWin`, `kWin x kPicks`).
+- `serve_experts(const ExpertServeCfg&, const ExpertComputeFn&)` is the engine-independent server loop; `serve_experts(ExpertDispatch&, cfg)`
+  is a wrapper over it (behaviour unchanged). `src/dsv41/ds4_net_proto.cpp` compiles `net_experts.cpp` with `STRATA_NET_NO_QWEN`: the
+  protocol, client and loop without the Qwen expert pool, layout and kernels.
+- The dsv41 fingerprint (`ExpertMap::identity()`): SHA-256 over the geometry (dim, ffn, layers, experts, top-k, swiglu limit), every layer's
+  expert types, file indices, offsets, strides and sizes, and the shard names and sizes. `isa` is 0: the dsv41 CPU kernels give the same bits
+  on every ISA tier (checked: AVX2 Zen 3 and Coffee Lake, MSVC and GCC, same row hash).
+
+### Use
+
+```sh
+# expert server, any host (no CUDA is touched; the same flags on either binary)
+strata-dsv41-expert-server --pack PACK --listen 0.0.0.0:7840 --serve-layers 27-29 [--serve-experts 0-191] [--cpu-threads N] [--no-warm]
+strata-dsv41 --pack PACK --expert-server --listen 0.0.0.0:7840 --serve-layers 27-29     # the engine binary, returns before any CUDA call
+
+# conductor: the normal command plus one flag (the same spec as Qwen: host:port=lo-hi[/e0-e1], comma separated)
+strata-dsv41 --pack PACK ... --remote-experts 192.168.1.130:7840=27-29,192.168.1.133:7840=30-33,192.168.1.27:7840=34-39
+```
+
+`STRATA_EXPERT_TOKEN` on both ends, as for Qwen (docs above, "Security"). `PACK` on a server needs only the pack's two text files and the
+shards' experts of its layers: `tools/dsv41/slice_stream.py emit PACK 27-29 | slice_stream.py apply SLICE` writes a sparse slice (real
+shard sizes, so the fingerprint is the conductor's; on NTFS the sparse flag is set first). `tools/dsv41/plan_split.py` gives each host a
+range of layers from the host budgets and prints the `--remote-experts` line, or refuses with the shortfall (stream mode).
+
+### Tests
+
+`tools/dsv41/synthetic_split_test.py BUILD_DIR` (CI: "DeepSeek split test (synthetic)", about 10 s): a DeepSeek-shaped model with random
+weights in the real sets' types (`tools/dsv41/make_synthetic_pack.py`: 8 layers, 32 experts, top-6, shared expert and router in the
+program, gate = up type / down type mixed as in the 2.00 bpw set: IQ1_M, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_XS, Q4_K, MXFP4), 64 greedy tokens
+from a 6-token prompt window, in one process and through servers on localhost: tokens **and a hash of every expert row** equal for one
+server, two servers (layers 0-3 / 4-7), a partial split (layers 2-5, the conductor runs the rest), every layer's experts over two hosts
+(0-15 / 16-31), a server that exits after 40 requests (fallback), a server on a sparse slice; refusals for a qwen38 conductor, a wrong
+token, another expert count. `ds4_net_test` is the program (`--mode local|remote --remote SPEC`).
+
 ## NVLink
 
 The two RTX 3090 of the gaming PC are NVLink-bridged (`nvidia-smi topo -m`: NV4, four links, 14 GB/s per link shown).

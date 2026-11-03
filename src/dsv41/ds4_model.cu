@@ -23,6 +23,9 @@
 #include "ds4_gguf.cuh"
 #include "ds4_iq.cuh"
 #include "ds4_gguf_cpu.hpp"
+#if defined(STRATA_DS4_NET)
+#include "ds4_net.hpp"
+#endif
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pcie.cuh"
@@ -1253,6 +1256,9 @@ struct Model::Impl {
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
+#if defined(STRATA_DS4_NET)
+    std::unique_ptr<net::Remote> remote;   // --remote-experts: the CPU lane of the served layers runs on other PCs
+#endif
     // the state
     int64_t pos = 0;
     std::vector<int32_t> toks, ctoks;
@@ -2662,6 +2668,30 @@ struct Model::Impl {
                   std::to_string(g.ix_hd) + ", experts per token " + std::to_string(g.k_exp) + ")";
             return false;
         }
+#if defined(STRATA_DS4_NET)
+        if (!o.remote_experts.empty()) {   // before any device work: an unreachable or mismatched server is an error now, not mid-answer
+            net::ExpertMap nm;
+            if (!nm.load(o.pack, err)) {
+                err = "--remote-experts: " + err;
+                return false;
+            }
+            if (nm.dim != g.dim || nm.ff != g.ff || nm.n_layers != g.nl || nm.n_exp != g.n_exp || nm.top_k != g.k_exp) {
+                err = "--remote-experts: the pack's expert geometry differs from the engine's";
+                return false;
+            }
+            remote.reset(new net::Remote);
+            if (!remote->open(nm, o.remote_experts, err)) {
+                err = "--remote-experts: " + err;
+                remote.reset();
+                return false;
+            }
+        }
+#else
+        if (!o.remote_experts.empty()) {
+            err = "--remote-experts: this build of strata-dsv41 has no network experts";
+            return false;
+        }
+#endif
         freqs_win = rope_freqs(g.rd, 0, g.rope_theta, g.factor, g.beta_fast, g.beta_slow);
         freqs_comp = rope_freqs(g.rd, g.orig_ctx, g.comp_theta, g.factor, g.beta_fast, g.beta_slow);
 
@@ -6913,7 +6943,7 @@ struct Model::Impl {
         std::thread th([&] {
             if (svc >= 0) pin_self(svc);
             size_t set = 0;
-            auto call = [&] { cpu_experts(l, x.data(), sets[set++ % sets.size()], (size_t) g.dim); };
+            auto call = [&] { cpu_experts_local(l, x.data(), sets[set++ % sets.size()], (size_t) g.dim); };
             auto busy = [&](double ms) {
                 for (const double t0 = now_ms(); now_ms() - t0 < ms;) call();
             };
@@ -8355,10 +8385,38 @@ struct Model::Impl {
             if (m) m->store->release(layer, es.data(), (int) es.size(), ok);
         }
     };
+    // The cut point of --remote-experts (docs/REMOTE_EXPERTS.md "DeepSeek-V4.1-Flash"): every caller of the CPU lane comes through
+    // here.  In: the layer's FFN input rows (x, ldx apart) and the (token, expert) pairs the GPU does not hold (ents).  Out: each
+    // pair's un-weighted expert row in c_yd[(slot0 + i) * dim], whoever computed it.  Entries on a served layer go to the expert
+    // servers; the ones that did not come back (route down, a refused or failed call, an expert no route owns) run on the
+    // local lane below, which is the whole of this function when no server is configured.
+    void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0, const int* ord = nullptr) {
+#if defined(STRATA_DS4_NET)
+        static_assert(kEntMax <= net::kMaxTok && kWin == net::kMaxTok && kPicks == net::kMaxPicks, "ds4_net.hpp's window limits follow the engine's");
+        if (remote && !l.mtp && !ents.empty() && remote->serves(l.il)) {
+            if (ldx == 0) ldx = (size_t) g.dim;
+            std::vector<net::Remote::Item> items(ents.size());
+            for (size_t q = 0; q < ents.size(); ++q) {
+                items[q].e = ents[q].e;
+                items[q].n = ents[q].n;
+                items[q].slot0 = ents[q].slot0;
+                for (int i = 0; i < ents[q].n; ++i) items[q].tok[i] = ents[q].tok[i];
+            }
+            std::vector<char> done;
+            remote->run(l.il, x, ldx, items.data(), (int) items.size(), c_yd.data(), done);
+            std::vector<Ent> rest;
+            for (size_t q = 0; q < ents.size(); ++q)
+                if (!done[q]) rest.push_back(ents[q]);
+            if (rest.empty()) return;
+            if (rest.size() < ents.size()) return cpu_experts_local(l, x, rest, ldx, nullptr);
+        }
+#endif
+        cpu_experts_local(l, x, ents, ldx, ord);
+    }
     // DS4_MISS_SPLIT=0: the old order (wait for every read, then compute); default: the entries whose reads are done
     // computed first, the others each as its read lands (the same bits: every entry's rows are independent)
-    void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
-                     const int* ord = nullptr) {
+    void cpu_experts_local(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
+                           const int* ord = nullptr) {
         if (ldx == 0) ldx = (size_t) g.dim;
         if (l.lay.fmt == gg::kFmtMXFP4) {
             StoreHold hold(this, l, ents);
@@ -10282,7 +10340,7 @@ struct Model::Impl {
                 ents.push_back(en);
             }
             const double a = now_ms();
-            cpu_experts(l, x.data(), ents, (size_t) g.dim);
+            cpu_experts_local(l, x.data(), ents, (size_t) g.dim);
             t.push_back(now_ms() - a);
         }
         std::sort(t.begin(), t.end());
@@ -10664,7 +10722,7 @@ struct Model::Impl {
             ents[0].e = e;
             ents[0].n = 1;
             ents[0].tok[0] = 0;
-            cpu_experts(l, x.data(), ents, (size_t) E);
+            cpu_experts_local(l, x.data(), ents, (size_t) E);
             const std::vector<float> yc(c_yd.begin(), c_yd.begin() + E);
             if (!lane_pull_cal(l, C.dev, 1, &e, b.plan, b.plan2)) {
                 ++n_bad;
@@ -12375,12 +12433,12 @@ struct Model::Impl {
             for (size_t i = 0; i < x.size(); ++i) x[i] = 0.02f * std::sin(0.37f * (float) i);
             const double bytes = (double) ents.size() * (double) l.blob;
             double a = now_ms();
-            cpu_experts(l, x.data(), ents, (size_t) g.dim);
+            cpu_experts_local(l, x.data(), ents, (size_t) g.dim);
             const double t_first = now_ms() - a;
             double t_warm = 1e30;
             for (int rep = 0; rep < 2; ++rep) {
                 a = now_ms();
-                cpu_experts(l, x.data(), ents, (size_t) g.dim);
+                cpu_experts_local(l, x.data(), ents, (size_t) g.dim);
                 t_warm = std::min(t_warm, now_ms() - a);
             }
             pm.cpu = bytes / std::max(1e-3, t_warm / 1000.0);
