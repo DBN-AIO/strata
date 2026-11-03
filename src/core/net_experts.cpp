@@ -3,7 +3,6 @@
 // Threat model and flags: docs/REMOTE_EXPERTS.md ("Security").
 #include "strata/core/net_experts.hpp"
 
-#include "strata/core/expert_source.hpp"
 #include "strata/core/net_proto.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -48,7 +47,7 @@ namespace strata::core {
 namespace {
 using Clock = std::chrono::steady_clock;
 namespace np = netproto;
-constexpr int64_t H = strata::kernels::cpu::H;
+constexpr int64_t kFlashEmbd = strata::kernels::cpu::H;   // the default n_embd of a peer that does not say (Flash-Next)
 constexpr uint32_t kMagic = 0x31505853u;   // "SXP1"
 constexpr uint32_t kProtoVersion = 2;
 enum : uint32_t { kHello = 1, kHelloAck = 2, kReq = 3, kResp = 4, kErr = 5, kBye = 6, kChallenge = 7 };
@@ -336,8 +335,13 @@ NetIdentity net_identity(const std::vector<std::string>& files) {
     u64(seen.size());
     NetIdentity id;
     h.finish(id.fingerprint);
-    id.isa = (cpu_avx512_ok() ? 1u : 0u) | (cpu_avx512bw_ok() ? 2u : 0u) | (cpu_avx2_ok() ? 4u : 0u) | ((uint32_t) cpu_isa_cap() << 8);
+    id.isa = net_isa_bits();
     return id;
+}
+
+uint32_t net_isa_bits() {
+    using namespace strata::kernels::cpu;
+    return (cpu_avx512_ok() ? 1u : 0u) | (cpu_avx512bw_ok() ? 2u : 0u) | (cpu_avx2_ok() ? 4u : 0u) | ((uint32_t) cpu_isa_cap() << 8);
 }
 
 // ================================================================== client
@@ -347,6 +351,7 @@ NetIdentity net_identity(const std::vector<std::string>& files) {
 // for the slowest one instead of one host doing all of it.  The prompt path keeps up to STRATA_NET_PIPELINE windows
 // (default 4) in flight per host instead of one round trip per window.
 bool NetExperts::connect_route(Route& r, int tmo_ms, std::string& err) {
+    const int64_t H = n_embd_;
     const sock_t s = sock_connect(r.host, r.port, tmo_ms, err);
     if (s == kBad) return false;
     auto fail = [&](const std::string& m) { err = m; sock_close(s); return false; };
@@ -386,8 +391,9 @@ bool NetExperts::connect_route(Route& r, int tmo_ms, std::string& err) {
     return true;
 }
 
-bool NetExperts::open(const std::string& spec, int64_t n_layers, int64_t n_expert, const NetIdentity& id, std::string& err) {
+bool NetExperts::open(const std::string& spec, int64_t n_layers, int64_t n_expert, const NetIdentity& id, std::string& err, int64_t n_embd) {
     ignore_sigpipe();
+    n_embd_ = n_embd > 0 ? n_embd : kFlashEmbd;
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     id_ = id;
@@ -478,6 +484,7 @@ bool NetExperts::route_up(Route& r) {
 
 bool NetExperts::send_req(Route& r, int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, const uint8_t* mask,
                           int arith, uint64_t& seq, std::vector<uint8_t>& buf) {
+    const int64_t H = n_embd_;
     const int64_t n = n_tok * k;
     const size_t mask_len = (size_t) ((n + 3) / 4 * 4);
     buf.clear();
@@ -492,6 +499,7 @@ bool NetExperts::send_req(Route& r, int64_t layer, const float* x, const int32_t
 }
 
 std::string NetExperts::recv_resp(Route& r, uint64_t seq, uint32_t want, std::vector<uint8_t>& resp, double& server_us) {
+    const int64_t H = n_embd_;
     uint32_t type = 0;
     server_us = 0;
     if (!recv_frame((sock_t) r.fd, type, resp, kMaxRespFrame)) return g_why.empty() ? std::string("receive failed") : g_why;
@@ -542,6 +550,7 @@ bool NetExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_
 }
 
 bool NetExperts::finish(float* out, std::string& err) {
+    const int64_t H = n_embd_;
     if (cur_ < 0) return true;
     cur_ = -1;
     owned_.clear();   // from here: the entries the caller must compute itself (those of the hosts that failed)
@@ -577,6 +586,7 @@ bool NetExperts::finish(float* out, std::string& err) {
 
 bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
                         float* const* dst, std::string& err) {
+    const int64_t H = n_embd_;
     if (cur_ >= 0) { err = "a decode request is in flight"; return false; }
     static const int depth = [] { const char* v = std::getenv("STRATA_NET_PIPELINE"); return v ? std::max(1, std::atoi(v)) : 4; }();
     struct Req { int64_t t0w, nt; uint64_t seq; uint32_t want; };
@@ -663,6 +673,7 @@ struct Conn {
 struct Ready { sock_t s = kBad; std::string peer; };
 struct ServerCtx {
     const ExpertServeCfg* cfg = nullptr;
+    int64_t H = 0;                           // n_embd of the model being served
     np::ReqLimits lim;
     std::string token;
     int tmo_ms = kDefaultTimeoutMs;
@@ -682,6 +693,7 @@ bool log_refusal(ServerCtx& C) {   // the first 20 refusals, then every 100th: a
 
 /// One connection, off the dispatch thread: challenge, authenticate, check the model, claim the single session slot.
 void handshake_thread(ServerCtx* C, sock_t s) {
+    const int64_t H = C->H;
     const std::string peer = peer_str(s);
     auto finish_fail = [&](const std::string& tell, const std::string& log) {
         if (!tell.empty()) send_err(s, tell);
@@ -735,8 +747,9 @@ void handshake_thread(ServerCtx* C, sock_t s) {
 }
 
 /// The REQ loop of the one authenticated conductor, on the thread that owns the dispatch.
-void serve_session(ExpertDispatch& d, ServerCtx& C, sock_t s, const std::string& peer, std::vector<uint8_t>& payload,
+void serve_session(const ServeCompute& compute, ServerCtx& C, sock_t s, const std::string& peer, std::vector<uint8_t>& payload,
                    std::vector<float>& out, std::vector<uint8_t>& resp) {
+    const int64_t H = C.H;
     std::fprintf(stderr, "strata net: conductor connected from %s\n", peer.c_str());
     sock_tune(s, true);
     set_io_timeouts(s, 0, C.tmo_ms);   // a conductor may sit idle between prompts (keepalive covers a dead one); a send never waits forever
@@ -759,16 +772,9 @@ void serve_session(ExpertDispatch& d, ServerCtx& C, sock_t s, const std::string&
         }
         out.assign(v.n * (size_t) H, 0.0f);
         const double t0 = now_ms();
-        d.failed = false; d.fail = nullptr;   // a failure answers one request; it must not poison the next
-        d.layers = v.layer;
-        d.only_mask = v.mask;
-        strata::core::expert_pool_dispatch_multi(d, v.x, v.ids, v.n_tok, v.k, out.data(),
-                                                  v.arith == 1 ? strata::kernels::cpu::NativeArithmetic::WindowInvariant
-                                                               : strata::kernels::cpu::NativeArithmetic::Default);
-        d.only_mask = nullptr;
-        if (d.failed) {
-            const std::string m = std::string("expert pool failed: ") + (d.fail != nullptr ? d.fail : "?") + " (layer " + std::to_string(v.layer) + ")";
-            d.failed = false; d.fail = nullptr;
+        std::string why_failed;   // a failure answers one request; it must not poison the next (the compute callback resets its own state)
+        if (!compute((int) v.layer, (int) v.n_tok, (int) v.k, (int) v.arith, v.ids, v.mask, v.x, out.data(), why_failed)) {
+            const std::string m = std::string("expert pool failed: ") + (why_failed.empty() ? "?" : why_failed) + " (layer " + std::to_string(v.layer) + ")";
             if (!send_frame(s, kErr, m.data(), m.size())) break;
             continue;
         }
@@ -800,19 +806,7 @@ bool is_loopback(const sockaddr* a) {
 }
 }  // namespace
 
-int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
-    // The server answers with the plain CPU pool.  A second GPU, helper GPUs, a resident plan or a net route would compute
-    // some rows on other arithmetic than the conductor's CPU kernels (and a net route would forward the request again).
-    // --expert-server-gpu (cfg.gpu) lets helper GPUs compute the experts they hold; they take only kind -1 entries, i.e. the
-    // asked-for ones (only_mask), and write into the same rows.
-    if (d.peer != nullptr || (d.remote_count != 0 && !cfg.gpu) || d.net != nullptr || d.plan != nullptr || d.host_res != nullptr) {
-        std::fprintf(stderr, "strata net: the expert server needs a CPU-only dispatch (no peer GPU, helper GPUs, resident plan or net route); "
-                             "helper GPUs only with --expert-server-gpu\n");
-        return 1;
-    }
-    if (cfg.gpu && d.remote_count > 0)
-        std::fprintf(stderr, "strata net: GPU expert server: %d helper GPU(s) compute the served experts they hold; their rows are the GPU "
-                             "kernels' (within kernel tolerance of the conductor's CPU rows, not bit-identical)\n", d.remote_count);
+int serve_experts_fn(const ExpertServeCfg& cfg, const ServeCompute& compute) {
     if (const std::string why = np::serve_cfg_problem(cfg.top_k, cfg.identity.fingerprint); !why.empty()) {
         std::fprintf(stderr, "strata net: the expert server is misconfigured: %s\n", why.c_str());
         return 1;
@@ -826,7 +820,8 @@ int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
     C.cfg = &cfg;
     C.token = env_token();
     C.tmo_ms = timeout_ms();
-    C.lim.layer_lo = lo; C.lim.layer_hi = hi; C.lim.n_embd = H; C.lim.n_expert = cfg.n_expert; C.lim.top_k = cfg.top_k;
+    C.H = cfg.n_embd > 0 ? cfg.n_embd : kFlashEmbd;
+    C.lim.layer_lo = lo; C.lim.layer_hi = hi; C.lim.n_embd = C.H; C.lim.n_expert = cfg.n_expert; C.lim.top_k = cfg.top_k;
     C.lim.max_tok = strata::kernels::kWindowMaxT; C.lim.max_entries = strata::kernels::kWindowMaxEntries;
     C.lim.expert_lo = cfg.expert_lo; C.lim.expert_hi = cfg.expert_hi;   // B5: a request for an expert another host owns is refused
     ExpertServeCfg cfg2 = cfg;
@@ -921,7 +916,7 @@ int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
             r = C.ready;
             C.ready = Ready();
         }
-        serve_session(d, C, r.s, r.peer, payload, out, resp);
+        serve_session(compute, C, r.s, r.peer, payload, out, resp);
         C.busy = false;
         if (cfg.once) C.stop = true;
     }

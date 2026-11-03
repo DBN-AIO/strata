@@ -18,6 +18,8 @@ if(STRATA_BUILD_EXPERT_SERVER AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_H
   add_library(strata_expert_host STATIC
     src/core/expert_source.cpp
     src/core/net_experts.cpp
+    src/core/net_experts_dispatch.cpp
+    src/core/native_rows.cpp
     src/core/cpu_only_stubs.cpp
     src/platform/memory.cpp
     src/platform/io_priority.cpp)
@@ -27,7 +29,7 @@ if(STRATA_BUILD_EXPERT_SERVER AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_H
   target_compile_definitions(strata_expert_host PUBLIC STRATA_CPU_ONLY=1)
   target_link_libraries(strata_expert_host PUBLIC strata_kernels_cpu strata_artifact strata_warnings Threads::Threads)
 
-  add_executable(strata-expert-server src/program/expert_server_main.cpp)
+  add_executable(strata-expert-server src/program/expert_server_main.cpp src/program/q36_expert_server.cpp)
   target_link_libraries(strata-expert-server PRIVATE strata_expert_host)
   message(STATUS "Strata: CPU-only expert server enabled (strata-expert-server; no CUDA)")
 

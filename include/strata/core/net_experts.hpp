@@ -28,6 +28,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,8 @@ struct NetIdentity {
 /// `model_files`: the GGUF / experts.bin files the experts are read from (their sizes enter the fingerprint).
 NetIdentity net_identity(const std::vector<std::string>& model_files);
 std::string net_isa_name(uint32_t isa);
+/// The CPU kernel path word of NetIdentity::isa (avx512 / avx512bw / avx2 bits and the STRATA_FORCE_ISA cap).
+uint32_t net_isa_bits();
 /// Socket read/write/connect timeout in ms for both ends (default 10000; env STRATA_EXPERT_TIMEOUT_MS; --expert-timeout-ms).
 void net_set_timeout_ms(int ms);
 
@@ -58,7 +61,9 @@ public:
     /// request then goes to all of its hosts before any answer is read (B5).
     /// Connects to every server once; a failure here is an error (the user asked for it).  After that a server that fails is
     /// dropped and retried with backoff while its rows are computed locally.
-    bool open(const std::string& spec, int64_t n_layers, int64_t n_expert, const NetIdentity& id, std::string& err);
+    /// `n_embd`: the model's hidden width (the rows on the wire); 0 = Flash-Next's 2560.  Qwen3.8-Max's is 8192.
+    bool open(const std::string& spec, int64_t n_layers, int64_t n_expert, const NetIdentity& id, std::string& err,
+              int64_t n_embd = 0);
     bool active() const { return !routes_.empty(); }
     bool serves(int64_t layer) const { return route_of(layer) >= 0; }
     /// The hosts of `layer` together own every expert (B5: the prompt path hands a layer to the servers only then).
@@ -108,7 +113,7 @@ private:
     uint64_t layer_calls_ = 0, multi_calls_ = 0;
     double wait_ms_ = 0;
     std::vector<Route> routes_;
-    int64_t n_layers_ = 0, n_expert_ = 0;
+    int64_t n_layers_ = 0, n_expert_ = 0, n_embd_ = 2560;
     NetIdentity id_;
     std::string token_;
     // the request in flight
@@ -127,6 +132,7 @@ struct ExpertServeCfg {
     int expert_lo = 0, expert_hi = -1; ///< served experts of those layers (inclusive, --serve-experts); hi < 0: all
     int64_t n_layers = 0;
     int64_t n_expert = 0;
+    int64_t n_embd = 0;                ///< the model's hidden width, the rows on the wire (0: Flash-Next's 2560)
     int64_t top_k = 0;                 ///< the model's routed experts per token: a request with another k is refused
     NetIdentity identity;
     bool once = false;                 ///< serve one connection, then return
@@ -140,6 +146,15 @@ struct ExpertServeCfg {
     uint64_t (*gpu_rows)(void* user) = nullptr;
     void* gpu_user = nullptr;
 };
+
+/// What the server loop calls for one validated request: compute the rows of the entries whose mask byte is 1 (`n_tok` tokens
+/// x `k` routed experts, ids / mask of that size, `x` = n_tok rows of n_embd floats) into `rows` (entry i at rows + i*n_embd; the
+/// others are left as they are), with the arithmetic `arith` (0 default, 1 window-invariant).  False with `err` = the request failed.
+using ServeCompute = std::function<bool(int layer, int n_tok, int k, int arith, const int32_t* ids, const uint8_t* mask,
+                                        const float* x, float* rows, std::string& err)>;
+/// The model-independent expert server loop (handshake, token, validation, framing).  `serve_experts` below is Flash-Next's
+/// compute behind it; the Qwen3.6 / Qwen3.8-Max family (strata/core/native_rows.hpp) is the other.  Returns 0 on a clean stop.
+int serve_experts_fn(const ExpertServeCfg& cfg, const ServeCompute& compute);
 
 /// The expert server loop: answers REQ frames with `d` (an ordinary pool dispatch with every row on the CPU).  `d` must
 /// be a CPU-only dispatch (no peer GPU, no helper GPUs, no plan, no net): refused with 1 otherwise.  A request is validated

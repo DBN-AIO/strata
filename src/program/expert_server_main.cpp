@@ -22,6 +22,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "q36_expert_server.hpp"
 
 #include <sys/mman.h>
 
@@ -50,7 +51,7 @@ struct Options {
 void usage(std::FILE* f) {
     std::fprintf(f,
         "strata-expert-server (CPU only: no CUDA is linked or initialised)\n"
-        "  --pack DIR           the model's pack folder (native_experts.txt, as for strata --pack)\n"
+        "  --pack DIR           the model's pack folder (native_experts.txt, as for strata --pack); not for Qwen3.6 / Qwen3.8-Max\n"
         "  --native SHARD1      the model's first GGUF shard (the experts are read from the shards in place)\n"
         "  --listen [HOST:]PORT bind address (default 127.0.0.1:7840; a bare port is loopback)\n"
         "  --serve-layers A-B   layers to hold in RAM and answer for, inclusive (default: all)\n"
@@ -155,8 +156,8 @@ int main(int argc, char** argv) {
     Options o;
     if (!parse(argc, argv, o)) return 2;
     if (o.help) { usage(stdout); return 0; }
-    if (o.pack.empty() || o.native.empty()) {
-        std::fprintf(stderr, "strata-expert-server: --pack and --native are required (--help)\n");
+    if (o.native.empty()) {
+        std::fprintf(stderr, "strata-expert-server: --native is required, and --pack for a Flash-Next model (--help)\n");
         return 2;
     }
     if (o.listen_port < 1 || o.listen_port > 65535 || o.pool_workers < 0) {
@@ -185,6 +186,20 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-expert-server: reading the model's geometry from %s: %s\n", o.native.c_str(), e.what());
         return 1;
+    }
+    if (g.family == strata::ModelFamily::Qwen35Moe) {   // Qwen3.6 / Qwen3.8-Max: no pack, the experts are repacked from the GGUF
+        strata_q36::Options q;
+        q.native = o.native;
+        q.listen_host = o.listen_host;
+        q.listen_port = o.listen_port;
+        q.serve_layers = o.serve_layers;
+        q.pool_workers = o.pool_workers;
+        q.no_host_worker = o.no_host_worker;
+        return strata_q36::serve(q, g, K);
+    }
+    if (o.pack.empty()) {
+        std::fprintf(stderr, "strata-expert-server: --pack is required for a %s model (--help)\n", strata::model_family_title(g.family));
+        return 2;
     }
     if (!strata::kernels::cpu::expert_layout_load(o.pack, g.n_layers, g.n_expert, err)) {
         std::fprintf(stderr, "strata-expert-server: %s\n", err.c_str());
