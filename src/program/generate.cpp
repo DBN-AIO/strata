@@ -39,6 +39,10 @@
 #include "strata/core/ple_residency.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/coupled_draft.hpp"
+#include "strata/core/net_experts.hpp"
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#endif
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
@@ -906,6 +910,12 @@ struct Options {
     bool split_skip_if_fits = false;
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
+    /// REMOTE EXPERTS (docs/REMOTE_EXPERTS.md): --expert-server serves experts to a conductor over TCP (no generation);
+    /// --remote-experts host:port=lo-hi[,...] hands those layers' CPU experts to such servers.
+    bool expert_server = false;
+    int listen_port = 7840;
+    std::string serve_layers;      ///< --serve-layers a-b (default: every layer)
+    std::string remote_experts;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
@@ -3512,6 +3522,10 @@ int main(int argc, char** argv) {
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
+        else if (a == "--expert-server") o.expert_server = true;
+        else if (a == "--listen") o.listen_port = std::atoi(next("--listen"));
+        else if (a == "--serve-layers") o.serve_layers = next("--serve-layers");
+        else if (a == "--remote-experts") o.remote_experts = next("--remote-experts");
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
@@ -4099,6 +4113,7 @@ int main(int argc, char** argv) {
         have_tokens = true;
         o.stop_eos = true;
     }
+    if (!have_tokens && o.expert_server) { o.tokens = {248045}; o.max_new = 1; have_tokens = true; }   // the expert server never generates
     if (!have_tokens) {
         std::fprintf(stderr, "strata generate: --tokens is required (this build has no tokenizer; see the "
                              "header of src/program/generate.cpp)\n");
@@ -8428,6 +8443,7 @@ int main(int argc, char** argv) {
     }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+    strata::core::NetExperts net_experts;   // REMOTE EXPERTS: destroyed last, prints the round-trip summary
     Drive drive;
     // #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tiers leave an expert a helper GPU holds out of the primary's
     // promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds,
@@ -8448,6 +8464,74 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+    if (!o.remote_experts.empty()) {   // REMOTE EXPERTS: hand those layers' CPU experts to expert servers
+        std::string nerr;
+        if (!net_experts.open(o.remote_experts, g.n_layers, g.n_expert, nerr)) {
+            std::fprintf(stderr, "strata generate: --remote-experts: %s\n", nerr.c_str());
+            return 1;
+        }
+        drive.d.net = &net_experts;
+    }
+    if (o.expert_server) {             // REMOTE EXPERTS: serve experts to a conductor, no generation
+        strata::core::ExpertServeCfg sc;
+        sc.port = o.listen_port;
+        sc.n_layers = g.n_layers;
+        sc.n_expert = g.n_expert;
+        sc.layer_lo = 0;
+        sc.layer_hi = (int) g.n_layers - 1;
+        if (!o.serve_layers.empty()) {
+            const size_t dash = o.serve_layers.find('-');
+            sc.layer_lo = std::atoi(o.serve_layers.c_str());
+            sc.layer_hi = dash == std::string::npos ? sc.layer_lo : std::atoi(o.serve_layers.c_str() + dash + 1);
+        }
+        if (sc.layer_lo < 0 || sc.layer_hi < sc.layer_lo || sc.layer_hi >= g.n_layers) {
+            std::fprintf(stderr, "strata generate: --serve-layers a-b is outside 0..%lld\n", (long long) g.n_layers - 1);
+            return 2;
+        }
+        struct WarmCtx { strata::core::ExpertSource* src; int64_t ne; } wc{srcp, g.n_expert};
+        sc.warm_user = &wc;
+        sc.warm = [](void* u, int lo, int hi) {
+            WarmCtx* w = (WarmCtx*) u;
+            if (w->src == nullptr) return;
+            std::vector<int64_t> all((size_t) w->ne);
+            for (int64_t e = 0; e < w->ne; ++e) all[(size_t) e] = e;
+            const auto t0 = Clock::now();
+            // make the served layers' experts resident in RAM: touch every page of every expert blob of the GGUF mapped in
+            // place (the page cache then holds them), and mlock what the OS allows, so no SSD read sits on an answer
+            uint64_t touched = 0, locked = 0, reads = 0;
+            volatile uint8_t sink = 0;
+            for (int l = lo; l <= hi; ++l) {
+                for (int64_t e = 0; e < w->ne; ++e) {
+                    strata::core::BlobPart bp[3];
+                    const int ns = w->src->blob_parts(l, e, bp);
+                    if (ns == 0) {   // the I/O-prefetch path (pread into the page cache): a blob read fills the cache
+                        const uint8_t* b = w->src->blob(l, e);
+                        if (b != nullptr) { sink = sink + b[0]; ++reads; }
+                    }
+                    for (int i = 0; i < ns; ++i) {
+                        for (uint64_t o = 0; o < bp[i].n; o += 4096) sink = sink + bp[i].p[o];
+                        touched += bp[i].n;
+#if !defined(_WIN32)
+                        if (mlock(bp[i].p, bp[i].n) == 0) locked += bp[i].n;
+#endif
+                    }
+                }
+            }
+            (void) sink;
+            const auto* fs = dynamic_cast<const strata::core::FileExpertSource*>(w->src);
+            uint64_t have = 0, want = 0;
+            for (int l = lo; l <= hi; ++l)
+                for (int64_t e = 0; e < w->ne; e += 8) {
+                    uint64_t total = 0;
+                    const uint64_t c = fs != nullptr ? fs->resident_bytes(l, e, total) : 0;
+                    have += c; want += total;
+                }
+            std::fprintf(stderr, "strata net: served layers %d-%d: touched %.2f GiB mapped + %llu blob reads, mlocked %.2f GiB, page-cache resident %.2f of %.2f GiB (sampled 1 in 8) in %.1f s\n",
+                         lo, hi, (double) touched / 1073741824.0, (unsigned long long) reads, (double) locked / 1073741824.0, (double) have * 8.0 / 1073741824.0,
+                         (double) want * 8.0 / 1073741824.0, std::chrono::duration<double>(Clock::now() - t0).count());
+        };
+        return strata::core::serve_experts(drive.d, sc);
+    }
     // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
     // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
     // the A/B arm, STRATA_LOOKAHEAD_K the experts per token (default 10).

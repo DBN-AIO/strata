@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/net_experts.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
@@ -5052,6 +5053,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             kind[i] = (e >= 0 && e < d.n_expert && d.host_res != nullptr &&
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0
                     : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2 : -1;
+            if (d.only_mask != nullptr && d.only_mask[i] == 0) kind[i] = -2;   // expert server: not asked for (row left zero)
         }
     }
     if (d.peer != nullptr) {                 // multi-GPU: start the second GPU's share before the CPU's own work
@@ -5072,6 +5074,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
         }
+    }
+    bool net_active = false;
+    if (d.net != nullptr && d.net->serves(d.layers)) {   // REMOTE EXPERTS: the CPU's entries of this layer go to an expert server
+        std::string nerr;
+        static thread_local std::string net_error;
+        if (!d.net->begin(d.layers, x_f, ids, n_tok, k, kind, arithmetic == strata::kernels::cpu::NativeArithmetic::WindowInvariant ? 1 : 0, nerr)) {
+            net_error = nerr;
+            d.failed = true; d.fail = net_error.c_str(); d.fail_layer = d.layers; return;
+        }
+        net_active = true;
     }
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // the GPU's copy_rows_from_mapped zeroes the rows it computed itself (dec_batch); STRATA_VERIFY_DEVICE_PLAN's
@@ -5282,6 +5294,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (!d.remote[r]->finish(out, remote_error)) {
                 d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
             }
+    }
+    if (net_active) {                        // REMOTE EXPERTS: the expert server's rows, into the same rows
+        static thread_local std::string net_error2;
+        if (!d.net->finish(out, net_error2)) {
+            d.failed = true; d.fail = net_error2.c_str(); d.fail_layer = d.layers; return;
+        }
     }
     if (d.peer != nullptr) {                 // multi-GPU: the second GPU's rows, into the same mapped rows
         std::string perr;
