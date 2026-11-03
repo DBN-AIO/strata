@@ -813,6 +813,10 @@ int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
     if (cfg.gpu && d.remote_count > 0)
         std::fprintf(stderr, "strata net: GPU expert server: %d helper GPU(s) compute the served experts they hold; their rows are the GPU "
                              "kernels' (within kernel tolerance of the conductor's CPU rows, not bit-identical)\n", d.remote_count);
+    if (const std::string why = np::serve_cfg_problem(cfg.top_k, cfg.identity.fingerprint); !why.empty()) {
+        std::fprintf(stderr, "strata net: the expert server is misconfigured: %s\n", why.c_str());
+        return 1;
+    }
     ignore_sigpipe();
     if (!sock_init()) return 1;
     const int lo = cfg.layer_lo, hi = cfg.layer_hi < 0 ? (int) cfg.n_layers - 1 : cfg.layer_hi;
