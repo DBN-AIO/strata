@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Sparse slice of a GGUF shard for an expert server: header + every non-expert tensor + the routed-expert tensors of
 layers lo..hi.  Everything else is a hole (reads as zeros) at the same offsets, so the engine opens the file as the
-whole model.  Usage: slice_gguf.py SRC DST LO HI   (run from the Strata checkout: uses tools/gguf_reader.py)"""
+whole model.  Usage: slice_gguf.py SRC DST LO HI [--experts-only]   (run from the Strata checkout: uses tools/gguf_reader.py)
+
+--experts-only: keep only the header and the served layers' expert tensors (the dense tensors become holes too).  That is
+all strata-expert-server (the CPU-only build, no GPU) reads; the dense weights are the conductor's.  Run it on every shard
+of the model (a shard with none of the layers keeps just its header): the server opens all of them."""
 import os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gguf_reader import GGUFFile
 
-src, dst, lo, hi = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+args = [a for a in sys.argv[1:] if a != "--experts-only"]
+experts_only = len(args) != len(sys.argv) - 1
+src, dst, lo, hi = args[0], args[1], int(args[2]), int(args[3])
 g = GGUFFile(src)
 size = os.path.getsize(src)
 ts = sorted(g.tensors, key=lambda t: t.offset)
@@ -22,7 +28,7 @@ for t, off, n in spans:
     if m:
         if lo <= int(m.group(1)) <= hi:
             keep.append((off, n)); kept_exp += n
-    else:
+    elif not experts_only:
         keep.append((off, n))
 total = sum(n for _, n in keep)
 with open(src, "rb") as f, open(dst, "wb") as o:

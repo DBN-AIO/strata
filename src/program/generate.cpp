@@ -40,6 +40,7 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/net_experts.hpp"
+#include "strata/core/net_proto.hpp"
 #if !defined(_WIN32)
 #include <sys/mman.h>
 #endif
@@ -913,7 +914,10 @@ struct Options {
     /// REMOTE EXPERTS (docs/REMOTE_EXPERTS.md): --expert-server serves experts to a conductor over TCP (no generation);
     /// --remote-experts host:port=lo-hi[,...] hands those layers' CPU experts to such servers.
     bool expert_server = false;
-    int listen_port = 7840;
+    /// --expert-server-gpu: the server keeps its helper GPU tiers (--expert-cache-device1..3), filled with the served layers'
+    /// experts only, and computes those on the GPUs (docs/REMOTE_EXPERTS.md "Expert servers on GPU").
+    bool expert_server_gpu = false;
+    std::string listen = "127.0.0.1:7840";   ///< --listen host:port | port (bind address; loopback unless written otherwise)
     std::string serve_layers;      ///< --serve-layers a-b (default: every layer)
     std::string remote_experts;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -3187,18 +3191,6 @@ static void exit_if_gpu_fatal(const std::string& err) {
     }
 }
 
-/// REMOTE EXPERTS: --serve-layers a-b (inclusive; empty = every layer) as [lo, hi].  False when out of 0..n_layers-1.
-static bool serve_layer_range(const std::string& spec, int64_t n_layers, int& lo, int& hi) {
-    lo = 0;
-    hi = (int) n_layers - 1;
-    if (!spec.empty()) {
-        const size_t dash = spec.find('-');
-        lo = std::atoi(spec.c_str());
-        hi = dash == std::string::npos ? lo : std::atoi(spec.c_str() + dash + 1);
-    }
-    return lo >= 0 && hi >= lo && hi < n_layers;
-}
-
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
 static int engine_main(int argc, char** argv) {   // main() is at the end of this file (#3431)
 #else
@@ -3535,7 +3527,24 @@ int main(int argc, char** argv) {
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--expert-server") o.expert_server = true;
-        else if (a == "--listen") o.listen_port = std::atoi(next("--listen"));
+        else if (a == "--expert-server-gpu") { o.expert_server = true; o.expert_server_gpu = true; }
+        else if (a == "--listen") {
+            o.listen = next("--listen");
+            std::string lh, le;
+            int lp = 0;
+            if (!strata::core::netproto::parse_hostport(o.listen, "127.0.0.1", 7840, true, lh, lp, le)) {
+                std::fprintf(stderr, "strata generate: --listen: %s\n", le.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--expert-timeout-ms") {
+            long tv = 0;
+            if (!strata::core::netproto::parse_uint(next("--expert-timeout-ms"), 100, 600000, tv)) {
+                std::fprintf(stderr, "strata generate: --expert-timeout-ms takes 100..600000\n");
+                return 2;
+            }
+            strata::core::net_set_timeout_ms((int) tv);
+        }
         else if (a == "--serve-layers") o.serve_layers = next("--serve-layers");
         else if (a == "--remote-experts") o.remote_experts = next("--remote-experts");
         else if (a == "--vision") o.vision = true;
@@ -8379,30 +8388,18 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: remote ranking: %zu profiled pairs, "
                                  "%zu other pairs to fill CUDA1..3\n", profile.size(), ranked.size() - profile.size());
         }
-        // REMOTE EXPERTS on GPU (--expert-server with --expert-cache-device1..3): the server computes only its served
-        // layers, so the helpers hold only those, and CUDA0's own cache does not exclude any: in server mode no window
-        // runs on CUDA0, so an expert it holds would otherwise fall back to the server's CPU.
+        // --expert-server-gpu: the helpers hold the served layers only, and CUDA0's own cache does not keep an expert out of
+        // them (no verify window runs on CUDA0 in server mode, so an expert it held would only fall back to the CPU)
         const strata::core::ExpertCache no_primary;
-        const strata::core::ExpertCache& helper_primary = o.expert_server ? no_primary : xcache;
-        if (o.expert_server) {
-            int slo = 0, shi = 0;
-            if (!serve_layer_range(o.serve_layers, g.n_layers, slo, shi)) {
-                std::fprintf(stderr, "strata generate: --serve-layers a-b is outside 0..%lld\n", (long long) g.n_layers - 1);
+        const strata::core::ExpertCache& helper_primary = o.expert_server_gpu ? no_primary : xcache;
+        if (o.expert_server_gpu) {
+            int slo = 0, shi = (int) g.n_layers - 1;
+            if (!o.serve_layers.empty() && !strata::core::netproto::parse_range(o.serve_layers, 0, (long) g.n_layers - 1, slo, shi)) {
+                std::fprintf(stderr, "strata generate: --serve-layers a-b is outside 0..%lld (digits only)\n", (long long) g.n_layers - 1);
                 return 2;
             }
-            std::vector<uint8_t> seen((size_t) g.n_layers * (size_t) g.n_expert, 0);
-            std::vector<std::pair<int32_t, int32_t>> served;
-            for (const auto& pr : ranked)
-                if (pr.first >= slo && pr.first <= shi && pr.second >= 0 && pr.second < g.n_expert &&
-                    !seen[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second]) {
-                    seen[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
-                    served.push_back(pr);
-                }
-            for (int64_t e = 0; e < g.n_expert; ++e)   // the profile may not name every served expert
-                for (int64_t l = slo; l <= shi; ++l)
-                    if (!seen[(size_t) l * (size_t) g.n_expert + (size_t) e]) served.emplace_back((int32_t) l, (int32_t) e);
-            std::fprintf(stderr, "strata net: helper GPUs hold served layers %d-%d only (%zu pairs ranked)\n", slo, shi, served.size());
-            ranked = std::move(served);
+            ranked = strata::core::netproto::served_pairs(ranked, g.n_layers, g.n_expert, slo, shi);
+            std::fprintf(stderr, "strata net: helper GPUs hold served layers %d-%d only (%zu pairs ranked)\n", slo, shi, ranked.size());
         }
         std::array<std::vector<std::pair<int32_t, int32_t>>, 3> by_device;
         if (multi_remote) {
@@ -8501,31 +8498,58 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+    // REMOTE EXPERTS: what the two ends must agree on for identical rows (expert tensor types and layout, file sizes, CPU kernel path)
+    std::vector<std::string> net_files;
+    if (srcp != nullptr) for (const auto& in : srcp->model_inputs()) net_files.push_back(in.second);
+    const strata::core::NetIdentity net_id =
+        (o.expert_server || !o.remote_experts.empty()) ? strata::core::net_identity(net_files) : strata::core::NetIdentity();
+    if (o.expert_server && !o.remote_experts.empty()) {
+        std::fprintf(stderr, "strata generate: --expert-server and --remote-experts are exclusive: a server computes its rows itself\n");
+        return 2;
+    }
     if (!o.remote_experts.empty()) {   // REMOTE EXPERTS: hand those layers' CPU experts to expert servers
         std::string nerr;
-        if (!net_experts.open(o.remote_experts, g.n_layers, g.n_expert, nerr)) {
+        if (!net_experts.open(o.remote_experts, g.n_layers, g.n_expert, net_id, nerr)) {
             std::fprintf(stderr, "strata generate: --remote-experts: %s\n", nerr.c_str());
             return 1;
         }
         drive.d.net = &net_experts;
     }
     if (o.expert_server) {             // REMOTE EXPERTS: serve experts to a conductor, no generation
+        // A server answers with the plain CPU pool: rows a second GPU or a helper GPU computed would not be the conductor's CPU
+        // arithmetic.  Forced here (the tiers above may have been set from --expert-cache-remote / a layer split) and asserted in serve_experts.
+        drive.d.peer = nullptr;
+        if (!o.expert_server_gpu) drive.d.remote_count = 0;   // --expert-server-gpu keeps the helper GPUs (opt-in, not bit-identical)
+        drive.d.net = nullptr;
         strata::core::ExpertServeCfg sc;
-        sc.port = o.listen_port;
+        sc.gpu = o.expert_server_gpu;
+        if (o.expert_server_gpu && drive.d.remote_count == 0)
+            std::fprintf(stderr, "strata generate: --expert-server-gpu without --expert-cache-device1..3: every served expert stays on the CPU\n");
+        std::string lerr;
+        if (!strata::core::netproto::parse_hostport(o.listen, "127.0.0.1", 7840, true, sc.host, sc.port, lerr)) {
+            std::fprintf(stderr, "strata generate: --listen: %s\n", lerr.c_str());
+            return 2;
+        }
         sc.n_layers = g.n_layers;
         sc.n_expert = g.n_expert;
-        if (!serve_layer_range(o.serve_layers, g.n_layers, sc.layer_lo, sc.layer_hi)) {
-            std::fprintf(stderr, "strata generate: --serve-layers a-b is outside 0..%lld\n", (long long) g.n_layers - 1);
+        sc.top_k = g.n_expert_used;
+        sc.identity = net_id;
+        sc.layer_lo = 0;
+        sc.layer_hi = (int) g.n_layers - 1;
+        if (!o.serve_layers.empty() && !strata::core::netproto::parse_range(o.serve_layers, 0, (long) g.n_layers - 1, sc.layer_lo, sc.layer_hi)) {
+            std::fprintf(stderr, "strata generate: --serve-layers a-b is outside 0..%lld (digits only)\n", (long long) g.n_layers - 1);
             return 2;
         }
         struct WarmCtx { strata::core::ExpertSource* src; int64_t ne; strata::core::ExpertDispatch* d; } wc{srcp, g.n_expert, &drive.d};
-        sc.gpu_user = &drive.d;
-        sc.gpu_rows = [](void* u) -> uint64_t {   // rows the helper GPUs computed so far (RemoteExperts::computed)
-            const auto* d = (const strata::core::ExpertDispatch*) u;
-            uint64_t c = 0;
-            for (int r = 0; r < d->remote_count; ++r) c += (uint64_t) d->remote[r]->computed();
-            return c;
-        };
+        if (o.expert_server_gpu) {
+            sc.gpu_user = &drive.d;
+            sc.gpu_rows = [](void* u) -> uint64_t {   // rows the helper GPUs computed so far (RemoteExperts::computed)
+                const auto* d = (const strata::core::ExpertDispatch*) u;
+                uint64_t c = 0;
+                for (int r = 0; r < d->remote_count; ++r) c += (uint64_t) d->remote[r]->computed();
+                return c;
+            };
+        }
         sc.warm_user = &wc;
         sc.warm = [](void* u, int lo, int hi) {
             WarmCtx* w = (WarmCtx*) u;
@@ -8573,10 +8597,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata net: served layers %d-%d: touched %.2f GiB mapped + %llu blob reads, mlocked %.2f GiB, page-cache resident %.2f of %.2f GiB (sampled 1 in 8) in %.1f s\n",
                          lo, hi, (double) touched / 1073741824.0, (unsigned long long) reads, (double) locked / 1073741824.0, (double) have * 8.0 / 1073741824.0,
                          (double) want * 8.0 / 1073741824.0, std::chrono::duration<double>(Clock::now() - t0).count());
-            std::fprintf(stderr, "strata net: served layers %d-%d: %llu of %lld experts resident in helper GPU VRAM (%.2f GiB), "
-                                 "computed there with the GPU kernels; the rest on this host's CPU\n",
-                         lo, hi, (unsigned long long) on_gpu, (long long) (hi - lo + 1) * (long long) w->ne,
-                         (double) gpu_bytes / 1073741824.0);
+            if (w->d->remote_count > 0)
+                std::fprintf(stderr, "strata net: served layers %d-%d: %llu of %lld experts resident in helper GPU VRAM (%.2f GiB), "
+                                     "computed there with the GPU kernels; the rest on this host's CPU\n",
+                             lo, hi, (unsigned long long) on_gpu, (long long) (hi - lo + 1) * (long long) w->ne,
+                             (double) gpu_bytes / 1073741824.0);
         };
         return strata::core::serve_experts(drive.d, sc);
     }

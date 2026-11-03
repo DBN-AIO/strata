@@ -1932,6 +1932,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(window_limits_test src/core/window_limits_test.cpp)
   target_include_directories(window_limits_test PRIVATE include)
   add_test(NAME window_limits_test COMMAND window_limits_test)
+  # remote experts: SHA-256/HMAC vectors, strict address parsing, the server's request validation (header-only, CPU)
+  add_executable(net_experts_test src/core/net_experts_test.cpp)
+  target_include_directories(net_experts_test PRIVATE include)
+  add_test(NAME net_experts_test COMMAND net_experts_test)
   # #4677: the accepted rows a request commits are bounded to what it can emit (header-only, CPU; 2,736 cases against the old output loop)
   add_executable(serve_stop_bound_test tests/core/serve_stop_bound_test.cpp)
   target_include_directories(serve_stop_bound_test PRIVATE include)
@@ -2951,3 +2955,6 @@ option(STRATA_BUILD_SPLIT "Build strata-split: sFNX's split-every-layer engine, 
 if(STRATA_BUILD_SPLIT)
   add_subdirectory(src/split)
 endif()
+
+# the CPU-only remote-experts server (strata-expert-server): configured only without CUDA / HIP
+include(cmake/cpu_expert_server.cmake)
