@@ -41,5 +41,27 @@ if(STRATA_BUILD_EXPERT_SERVER AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_H
     # It must not link a CUDA library (the whole point of the target): readelf lists the NEEDED entries.
     add_test(NAME expert_server_links_no_cuda
              COMMAND ${CMAKE_COMMAND} -DBIN=$<TARGET_FILE:strata-expert-server> -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_no_cuda_link.cmake)
+
+    # Qwen3.8-Max (qwen35moe) split: on a Max-shaped synthetic GGUF (tools/make_synthetic_max.py: 512 experts, top-10, the Max quantisation
+    # types, tiny hidden size) a row from an expert server over loopback is the bytes the conductor's own CPU would compute, a row does not
+    # depend on its window, and a conductor with another model's fingerprint is refused (docs/QWEN_MAX.md).  The generator needs numpy.
+    add_executable(native_rows_test src/core/native_rows_test.cpp)
+    target_link_libraries(native_rows_test PRIVATE strata_expert_host)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    set(_qmax_python "")
+    foreach(_cand ${Python3_EXECUTABLE} /usr/bin/python3 python3)
+      if(NOT _cand STREQUAL "" AND _qmax_python STREQUAL "")
+        execute_process(COMMAND ${_cand} -c "import numpy" OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _qmax_probe)
+        if(_qmax_probe EQUAL 0)
+          set(_qmax_python "${_cand}")
+        endif()
+      endif()
+    endforeach()
+    if(NOT _qmax_python STREQUAL "")
+      add_test(NAME qmax_native_rows COMMAND ${_qmax_python} ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen_max/run_cpu_test.py $<TARGET_FILE:native_rows_test>)
+      set_tests_properties(qmax_native_rows PROPERTIES TIMEOUT 280 SKIP_RETURN_CODE 77)
+    else()
+      message(STATUS "Strata: no python3 with numpy: the Max-shaped native_rows test is not registered")
+    endif()
   endif()
 endif()
