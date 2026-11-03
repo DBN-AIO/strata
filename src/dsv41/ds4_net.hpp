@@ -95,6 +95,7 @@ public:
     bool run(int layer, const float* x, size_t ldx, const Item* items, int n_items, float* y, std::vector<char>& remote);
     uint64_t rows_remote() const;
     uint64_t rows_local() const;
+    uint64_t calls() const;   ///< requests sent to the servers: one per run() that reached a route (a window of any n tokens is one)
     std::string stats() const;
 private:
     struct Impl;

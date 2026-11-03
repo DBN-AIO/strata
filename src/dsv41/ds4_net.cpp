@@ -434,7 +434,7 @@ bool ExpertHost::compute(uint32_t layer, uint32_t n_tok, uint32_t k, const int32
 struct Remote::Impl {
     core::NetExperts net;
     int dim = 0, top_k = 0;
-    uint64_t n_remote = 0, n_local = 0, n_fail = 0;
+    uint64_t n_remote = 0, n_local = 0, n_fail = 0, n_calls = 0;
     std::vector<float> xc, rows;
     std::vector<int32_t> ids, kind;
 };
@@ -444,6 +444,7 @@ bool Remote::active() const { return p_->net.active(); }
 bool Remote::serves(int layer) const { return p_->net.serves(layer); }
 uint64_t Remote::rows_remote() const { return p_->n_remote; }
 uint64_t Remote::rows_local() const { return p_->n_local; }
+uint64_t Remote::calls() const { return p_->n_calls; }
 std::string Remote::stats() const {
     return "remote expert rows " + std::to_string(p_->n_remote) + ", computed locally " + std::to_string(p_->n_local) + ", failed calls " + std::to_string(p_->n_fail);
 }
@@ -489,6 +490,7 @@ bool Remote::run(int layer, const float* x, size_t ldx, const Item* items, int n
     std::string err;
     I.net.begin(layer, I.xc.data(), I.ids.data(), nt, k, I.kind.data(), 0, err);
     if (!I.net.in_flight()) { for (int q = 0; q < n_items; ++q) I.n_local += (uint64_t) items[q].n; return true; }
+    ++I.n_calls;
     I.rows.resize((size_t) nt * (size_t) k * (size_t) dim);
     const bool ok = I.net.finish(I.rows.data(), err);
     if (!ok) {

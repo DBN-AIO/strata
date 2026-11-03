@@ -2876,6 +2876,8 @@ struct Model::Impl {
 #else
             const bool remote_on = false;
 #endif
+            if (remote_on)
+                std::fprintf(stderr, "ds4: DSpark drafter kept with --remote-experts: a verify window is one batched call per served layer\n");
             if (!dspark_auto_keeps(exp_b, room_b, remote_on)) {
                 o.dspark = false;
                 std::fprintf(stderr, "ds4: DSpark not loaded: the routed experts (%.0f GB) are far more than the GPU holds (%.0f GB), where its verify "
