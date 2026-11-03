@@ -872,8 +872,7 @@ int serve_experts(const ExpertServeCfg& cfg, const ExpertComputeFn& compute) {
     C.token = env_token();
     C.tmo_ms = timeout_ms();
     C.H = cfg.identity.n_embd != 0 ? (int64_t) cfg.identity.n_embd : kQwenH;
-    if (C.H <= 0) { std::fprintf(stderr, "strata net: the expert server has no hidden size (identity.n_embd)
-"); return 1; }
+    if (C.H <= 0) { std::fprintf(stderr, "strata net: the expert server has no hidden size (identity.n_embd)\n"); return 1; }
     const int64_t H = C.H;
     C.lim.layer_lo = lo; C.lim.layer_hi = hi; C.lim.n_embd = H; C.lim.n_expert = cfg.n_expert; C.lim.top_k = cfg.top_k;
     C.lim.max_tok = cfg.max_tok > 0 ? cfg.max_tok : strata::kernels::kWindowMaxT;
