@@ -131,14 +131,58 @@ layers, top-k, kernel path), REQ (layer, n_tok, k, arithmetic, ids, mask, x), RE
 BYE. Both sides check the version; a version-1 peer is refused with a clear message. Hidden states are fp32 so the result is bit identical to the local CPU run; fp16/bf16
 on the wire would halve the traffic (about 20 KB out, 90 KB in per call at 4-token windows) and is a later option.
 
-## Windows (stream PC: RTX 5070 Ti, sm_120)
+## Windows (stream PC: Ryzen 9 5950X, RTX 5070 Ti)
 
-The server path uses no Linux-only call: sockets are behind the shim (`ws2_32` is linked by CMake on `WIN32`; `WSAStartup` is
-checked and initialised once, thread safe; `WSAPoll`, `ioctlsocket`, `SO_RCVTIMEO` in milliseconds); the warm-up `mlock` is
-`#if !defined(_WIN32)`. Build as for any Windows CUDA build of Strata (docs/SOURCE_INSTALL.md,
-"From source: Windows": Visual Studio 2022 Build Tools + CUDA 13.0-13.2), then run the same command line with
-`strata.exe`. Not built or run on the stream PC from this branch (it is the streaming machine and its D: drive is
-failing); keep it buildable.
+Built and run 2026-11-03 on the stream PC as `strata-expert-server.exe`, the CPU-only server (no CUDA toolkit is installed there
+and none is needed: it links no CUDA library). The socket shim uses Winsock (`ws2_32` is linked by `cmake/cpu_expert_server.cmake`;
+`WSAStartup` once, `WSAPoll` with `POLLRDNORM` / `POLLWRNORM`, `NOMINMAX` and `_WIN32_WINNT=0x0A00` set before `winsock2.h`); the
+warm-up `mlock` is skipped (the pages are touched, the log says `mlocked 0.00 GiB`). The CUDA engine's own `--expert-server` on the
+5070 Ti (sm_120) is not built: it needs the CUDA 13.x toolkit (Jack: NVIDIA CUDA Toolkit 13.0-13.2 installer, "Visual Studio
+integration" off), then the engine build of docs/SOURCE_INSTALL.md "From source: Windows".
+
+Toolchain used: Visual Studio Build Tools 2026 (MSVC 14.51, x64), the CMake and Ninja that ship with / beside it. All on C:.
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF
+cmake --build build-cpu --target strata-expert-server -j 6
+```
+
+Configure 55 s (it fetches the pinned llama.cpp), build about 2.5 minutes. On the stream PC run both through the capped CPU lane
+(`AIOrchestrator/tools/cpu_lane/win_job.py`, 70 % cap; it refuses in streamer mode).
+
+Model files: the server needs only a sparse slice of each GGUF shard (tools/slice_gguf.py `--experts-only`) with the real shard sizes
+and `native_experts.txt` + `index.txt` of the pack. A sparse file does not survive `scp` / `tar` to NTFS (it would be filled with
+zeros: 66 GB). Copy only the data extents and set the NTFS sparse flag first (`fsutil sparse setflag`); do not grow the file with
+Python's `truncate()` (it zero-fills on Windows): seek to size-1 and write one byte. Layers 38-43 are 3.96 GiB of data.
+
+Run (never from an agent or ssh shell: it would die with that app's job object): `tools/stream_pc/start_expert_server.ps1` registers a
+one-shot Task Scheduler task whose hidden `pythonw` launcher starts the server detached, then removes the task (the same pattern as
+TabbyAPI's `switch_local.py`). `STRATA_EXPERT_TOKEN` comes from a file, not a command line. Firewall: 7840-7843 inbound from the
+conductor only (rule `AIO BigBrain-XL expert server` on the stream PC). Stop with the PID in `<log>.pid`. See tools/stream_pc/README.md.
+
+### Measured (2026-11-03, Windows server + Linux conductor)
+
+Server: stream PC (5950X, AVX2, busy with the stream PC's usual services, TabbyAPI on the 5070 Ti), layers 38-43, 15 pool workers,
+over the house LAN (2.5 GbE). Conductor: gaming PC, Linux (nobara), RTX 3090 GPU 0 (5664 MiB), `bin-tip`, `--adapt-every 0`,
+`--pcie-frac 0`, `--spec 2`, greedy, 14 prompt tokens, 64 new tokens, shared token, `--remote-experts 192.168.1.27:7840=38-43`.
+
+| Run | decode tok/s | calls | round trip | server compute | output (md5 of the token line) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| single process, cold | 3.41 | - | - | - | `9646d49f` |
+| single process, warm | 30.02 | - | - | - | `9646d49f` |
+| Windows server, run 1 | 15.12 | 252 | 7.77 ms | 6.48 ms | `9646d49f` |
+| Windows server, run 2 | 13.52 | 252 | 7.84 ms | 6.57 ms | `9646d49f` |
+| Windows server, run 3 | 4.93 (conductor box loaded) | 270 | 8.12 ms | 6.76 ms | `9646d49f` |
+
+The 64 tokens are identical in all five runs (same CPU kernels, avx2 on both ends, same bytes). The prompt path went through the
+Windows server too (333 experts, 12 windows, 0.9 MB out / 8.2 MB in, 221-236 ms). Per decode call 23 KB out, 187 KB in; wire and
+framing are 1.2-1.4 ms of the round trip, the rest is the server's compute: 6.5 ms for 6 layers' rows is about 4x the T340's
+1.5 ms, because the stream PC is shared with the stream (TabbyAPI, ComfyUI, OBS-side services) while it computes. Resident: working
+set 2.7 GB of the 3.96 GiB mapped (Windows trims mapped pages; they stay in the standby list), private 0.26 GB, 0 MiB of VRAM (the
+5070 Ti's 10.7 GB used by TabbyAPI did not move). `probe`: `tools/net_experts_probe.py` passes all checks against the Windows server
+(wrong / missing token, oversized frame, 11 kinds of bad request, busy, idle connection). Known gap: the log line
+`page-cache resident` reads 0.00 of 0.00 GiB on Windows (`resident_bytes` has no Windows implementation).
 
 ## CPU-only host (T340)
 
@@ -175,8 +219,7 @@ The dense weights are the conductor's, not the server's. A server needs only the
 `tools/slice_gguf.py SRC DST LO HI --experts-only` (run on every shard) makes a sparse copy of just those: layers 38-43 of the
 35 GiB shard 1 are a 3.97 GiB file; shard 2 is its header only (4 KiB). `--pack` needs only `native_experts.txt` (and `index.txt`).
 
-Not covered: Windows (the Winsock branch of the socket shim and the `mlock` guard are untouched, the CMake target is UNIX-only
-today; a compile check is a commented stub in `build-linux.yml`), and the prompt path (as for any server, see "Not covered yet").
+Not covered: the prompt path (as for any server, see "Not covered yet").
 
 ### CI
 

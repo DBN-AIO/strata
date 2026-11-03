@@ -50,6 +50,12 @@ PinnedArena::PinnedArena(uint64_t, ByNeed, const std::vector<std::pair<uint64_t,
     gpu_only("PinnedArena");
 }
 
+// ArenaExpertSource::open names these on the Windows path (#285 deferred registration; STRATA_ARENA_PIN_GIB): the CPU-only server
+// maps the GGUF in place and never opens an arena, so they are never reached.
+int arena_pin_cap_gib() { return -1; }
+PinnedArena::PinnedArena(uint64_t, const std::vector<uint64_t>&, Deferred) { gpu_only("PinnedArena"); }
+void PinnedArena::register_slices(std::atomic<int>&) { gpu_only("PinnedArena"); }
+
 LoadStats load_experts_ranges(const std::string&, uint8_t*, const std::vector<uint64_t>&, const std::vector<uint64_t>&, int,
                               uint64_t, const std::atomic<int>*, const PadMap*) {
     LoadStats s;
