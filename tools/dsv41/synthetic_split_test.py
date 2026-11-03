@@ -8,6 +8,8 @@ against expert servers on localhost, and compares the 64 greedy tokens and the h
   3. a partial split (the conductor computes the other layers itself)
   4. a server that dies mid-run (STRATA_DS4_SERVER_DIE_AFTER): the conductor falls back to its own lane, same output
   5. a conductor of the wrong engine family (qwen38) is refused at the handshake; so are a wrong token and another geometry
+  6. speculative decoding (the DSpark drafter's shape): drafts verified as ONE window per layer through the servers; the tokens equal plain
+     greedy decoding's, drafts are accepted (count > 0), and the servers see one call per layer per window, not one per draft token
 Needs the built ds4_net_test and strata-dsv41-expert-server:   synthetic_split_test.py BUILD_DIR
 """
 import os
@@ -61,7 +63,7 @@ def stop(p):
 def lines(r):
     d = {}
     for ln in r.stdout.splitlines():
-        m = re.match(r"(TOKENS|ROWHASH|ROWS|STATS|OPEN_FAILED)\s*(.*)", ln)
+        m = re.match(r"(TOKENS|ROWHASH|ROWS|STATS|OPEN_FAILED|SPEC|DECODE)\s*(.*)", ln)
         if m:
             d[m.group(1)] = m.group(2)
     return d
@@ -136,6 +138,35 @@ with tempfile.TemporaryDirectory() as tmp:
     r = run(["--pack", pack3, "--mode", "remote", "--remote", "127.0.0.1:17845=0-7", "--expect-open-fail"], token)
     check("another expert count is refused", "OPEN_FAILED" in r.stdout, r.stdout)
     stop(e)
+
+    # 6. speculative decoding through the servers (a drafter, a verify window of k+1 tokens, the longest matching prefix kept)
+    plain = run(["--pack", pack, "--mode", "local", "--causal", "--tokens", "64", "--prompt", "40", "--prompt-seed", "5"])
+    P = lines(plain)
+    check("causal reference run (plain greedy)", plain.returncode == 0 and "TOKENS" in P, plain.stderr[-300:])
+    sp = lines(run(["--pack", pack, "--mode", "local", "--causal", "--tokens", "64", "--prompt", "40", "--prompt-seed", "5", "--spec", "4", "--draft-acc", "0.7"]))
+    check("spec local (oracle drafter, 70% per draft): tokens equal plain greedy", sp.get("TOKENS") == P.get("TOKENS") and "TOKENS" in sp, sp.get("TOKENS", "")[:80])
+
+    def spec_nums(d):
+        m = re.search(r"k (\d+) rounds (\d+) drafted (\d+) accepted (\d+) windows (\d+) layer_calls (\d+) wire_calls (\d+)", d.get("SPEC", ""))
+        return [int(x) for x in m.groups()] if m else None
+    sn = spec_nums(sp)
+    check("spec local: the drafter was used (accepted > 0)", sn is not None and sn[3] > 0, sp.get("SPEC", ""))
+    sg = lines(run(["--pack", pack, "--mode", "local", "--causal", "--tokens", "64", "--prompt", "40", "--prompt-seed", "5", "--spec", "4"]))
+    check("spec local (n-gram drafter): tokens equal plain greedy", sg.get("TOKENS") == P.get("TOKENS") and "TOKENS" in sg)
+    f = start(pack, 17851, "0-7", token)
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17851=0-7", "--causal", "--tokens", "64", "--prompt", "40", "--prompt-seed", "5",
+             "--spec", "4", "--draft-acc", "0.7"], token)
+    stop(f)
+    SR = lines(r)
+    check("spec through one server: tokens equal plain greedy and the local spec run", r.returncode == 0 and SR.get("TOKENS") == P.get("TOKENS"), r.stderr[-300:])
+    check("spec through one server: every expert row bit-identical to the local spec run", "ROWHASH" in SR and SR.get("ROWHASH") == sp.get("ROWHASH"))
+    sr = spec_nums(SR)
+    check("spec through one server: drafts accepted", sr is not None and sr[3] > 0, SR.get("SPEC", ""))
+    # the verify window is one wire call per layer: wire calls == layer calls (prompt chunks + windows), none one-per-draft-token
+    check("spec through one server: one call per layer per window (wire calls == layer calls)", sr is not None and sr[5] == sr[6] and sr[6] > 0, SR.get("SPEC", ""))
+    # and speculating beats a call per token: plain decode makes n_new - 1 windows, spec makes fewer
+    pn = spec_nums(lines(run(["--pack", pack, "--mode", "local", "--causal", "--tokens", "64", "--prompt", "40", "--prompt-seed", "5", "--spec", "1", "--draft-acc", "0"])))
+    check("spec: fewer layer calls than one window per token", sr is not None and pn is not None and sr[5] < pn[5], "%s vs %s" % (sr, pn))
 
 print("%d failure(s)" % len(fails))
 sys.exit(1 if fails else 0)

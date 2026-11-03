@@ -38,5 +38,8 @@ if(STRATA_BUILD_DSV41_EXPERT_SERVER AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_EN
 
   add_executable(ds4_net_test tests/dsv41/ds4_net_test.cpp)
   target_link_libraries(ds4_net_test PRIVATE strata_dsv41_expert_host)
+  add_executable(ds4_dspark_rule_test tests/dsv41/dspark_rule_test.cpp)
+  target_include_directories(ds4_dspark_rule_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+  target_compile_features(ds4_dspark_rule_test PRIVATE cxx_std_17)
   message(STATUS "Strata: CPU-only DeepSeek expert server enabled (strata-dsv41-expert-server; no CUDA)")
 endif()
