@@ -204,5 +204,7 @@ int main(int argc, char** argv) {
     for (int t : seq) std::printf(" %d", t);
     std::printf("\nROWHASH %016llx\nROWS %ld FINITE %d\n", (unsigned long long) row_hash, rows_total, (int) !(flag & 1));
     if (mode == "remote") std::printf("STATS %s\n", remote.stats().c_str());
+    if (host.calls() > 0)
+        std::fprintf(stderr, "HOST %llu calls, %.3f ms a call (this process's own lane)\n", (unsigned long long) host.calls(), host.compute_ms() / (double) host.calls());
     return 0;
 }
