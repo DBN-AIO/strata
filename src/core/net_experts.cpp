@@ -455,7 +455,7 @@ bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64
         const size_t mask_len = (size_t) ((n + 3) / 4 * 4);
         buf_.clear();
         put<uint32_t>(buf_, (uint32_t) layer); put<uint32_t>(buf_, (uint32_t) nt); put<uint32_t>(buf_, (uint32_t) k);
-        put<uint32_t>(buf_, 0u); put<uint64_t>(buf_, ++seq_);
+        put<uint32_t>(buf_, 1u); put<uint64_t>(buf_, ++seq_);   // window-invariant: a row does not depend on its window
         const size_t at = buf_.size();
         buf_.resize(at + (size_t) n * 4 + mask_len + (size_t) nt * H * 4, 0);
         std::memcpy(buf_.data() + at, ids + t0w * k, (size_t) n * 4);
