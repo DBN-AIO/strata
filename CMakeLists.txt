@@ -2955,3 +2955,6 @@ option(STRATA_BUILD_SPLIT "Build strata-split: sFNX's split-every-layer engine, 
 if(STRATA_BUILD_SPLIT)
   add_subdirectory(src/split)
 endif()
+
+# the CPU-only remote-experts server (strata-expert-server): configured only without CUDA / HIP
+include(cmake/cpu_expert_server.cmake)

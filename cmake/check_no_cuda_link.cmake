@@ -1,0 +1,22 @@
+# cmake -DBIN=<executable> -P check_no_cuda_link.cmake
+# Fails when the executable needs a CUDA / HIP runtime library (libcuda, libcudart, libcublas, libnvrtc, libamdhip64 ...).
+# The CPU-only expert server must run on a host with no GPU driver at all.
+if(NOT BIN)
+  message(FATAL_ERROR "check_no_cuda_link: pass -DBIN=<executable>")
+endif()
+find_program(_readelf readelf)
+if(NOT _readelf)
+  message(STATUS "check_no_cuda_link: readelf not found, skipped")
+  return()
+endif()
+execute_process(COMMAND ${_readelf} -d ${BIN} OUTPUT_VARIABLE _dyn RESULT_VARIABLE _rc)
+if(NOT _rc EQUAL 0)
+  message(FATAL_ERROR "check_no_cuda_link: readelf -d ${BIN} failed (${_rc})")
+endif()
+string(REGEX MATCHALL "Shared library: \\[[^]]*\\]" _needed "${_dyn}")
+message(STATUS "needed: ${_needed}")
+foreach(_n IN LISTS _needed)
+  if(_n MATCHES "(libcuda|libcudart|libcublas|libcufft|libcurand|libcusparse|libnvrtc|libnvidia|libamdhip|libhip|librocm|libnccl)")
+    message(FATAL_ERROR "the CPU-only expert server links a GPU runtime library: ${_n}")
+  endif()
+endforeach()
