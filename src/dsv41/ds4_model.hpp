@@ -33,6 +33,9 @@ struct Options {
     // the CPU lane's threads: 0 a thread a physical core, or where the host offers it the performance cores or one
     // NUMA node's cores when measured faster at load; n: at most n, a thread a core
     int cpu_threads = 0;
+    // --remote-experts host:port=lo-hi[,...]: the CPU lane's experts of those layers are computed by expert servers on other
+    // PCs (strata-dsv41 --expert-server, strata-dsv41-expert-server); any failure computes them here (docs/DEEPSEEK41_SPLIT.md)
+    std::string remote_experts;
     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
     // --profile-readonly: read the profile to place the experts, never write it back.  Without this the run's routing
     // counts go into the file, so the next run places experts differently and greedy output / KL move between runs.

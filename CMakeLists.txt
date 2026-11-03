@@ -945,7 +945,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(strata_dsv41_kernels PUBLIC ${_strata_gpu_runtime_target})
     add_executable(strata-dsv41 src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu src/dsv41/ds4_vision.cu
                    src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
-                   src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp src/platform/io_priority.cpp)
+                   src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp src/platform/io_priority.cpp
+                   src/dsv41/ds4_net.cpp src/dsv41/ds4_net_proto.cpp)
+    # DeepSeek experts over the LAN (--expert-server, --remote-experts; docs/DEEPSEEK41_SPLIT.md): the host-only module
+    # src/dsv41/ds4_net.cpp and the protocol (ds4_net_proto.cpp wraps src/core/net_experts.cpp without the qwen38 pool).  The Metal
+    # build lists its own sources and does not define it: there the flags answer "not in this build".
+    target_compile_definitions(strata-dsv41 PRIVATE STRATA_DS4_NET=1)
+    if(WIN32)
+      target_link_libraries(strata-dsv41 PRIVATE ws2_32)   # the socket shim in net_experts.cpp (Winsock)
+    endif()
     # the commit the binary was built from, readable with --version (set -DSTRATA_BUILD_ID=... for a tree without .git)
     if(NOT STRATA_BUILD_ID AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/BUILD_ID)   # (a git archive has no .git: the packer writes the commit here)
       file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/BUILD_ID STRATA_BUILD_ID LIMIT_COUNT 1)
@@ -2958,3 +2966,6 @@ endif()
 
 # the CPU-only remote-experts server (strata-expert-server): configured only without CUDA / HIP
 include(cmake/cpu_expert_server.cmake)
+
+# the CPU-only DeepSeek-V4.1-Flash expert server (strata-dsv41-expert-server): configured only without CUDA / HIP
+include(cmake/dsv41_expert_server.cmake)

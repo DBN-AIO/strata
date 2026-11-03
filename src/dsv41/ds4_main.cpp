@@ -35,6 +35,9 @@
 #include "ds4_os.hpp"
 #include "strata/platform/io_priority.hpp"
 #include "ds4_packinfo.hpp"
+#if defined(STRATA_DS4_NET)
+#include "ds4_net.hpp"
+#endif
 #include "ds4_slotmeta.hpp"
 
 #include <algorithm>
@@ -2497,6 +2500,16 @@ int main(int argc, char** argv) {
         signal(SIGABRT, [](int) { void* fr[40]; const int n = backtrace(fr, 40); backtrace_symbols_fd(fr, n, 2); _exit(134); });
     }
 #endif
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--expert-server") {   // before the options and before any device: this process computes experts for another PC
+#if defined(STRATA_DS4_NET)
+            return strata::ds4::net::server_main(argc, argv);
+#else
+            std::fprintf(stderr, "--expert-server: this build of strata-dsv41 has no network experts
+");
+            return 2;
+#endif
+        }
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1";
     int n = 0, window = 0;   // (0: the model's feed unit - a whole prompt on the chunked path; 16 for the scoring runs)
@@ -2524,6 +2537,7 @@ int main(int argc, char** argv) {
         else if (a == "--reserve-mib") o.reserve_mib = std::atoll(val("--reserve-mib").c_str());
         else if (a == "--vram-experts") { o.vram_experts = std::atof(val("--vram-experts").c_str()); o.vram_experts_auto = false; }
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val("--cpu-threads").c_str());
+        else if (a == "--remote-experts") o.remote_experts = val("--remote-experts");
         else if (a == "--expert-profile") o.profile = val("--expert-profile");
         else if (a == "--profile-readonly") o.profile_readonly = true;   // (read the placement, never write the counts back)
         else if (a == "--ssd-cache") o.ssd_cache_gb = std::atof(val("--ssd-cache").c_str());
