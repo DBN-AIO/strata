@@ -6943,7 +6943,7 @@ struct Model::Impl {
         std::thread th([&] {
             if (svc >= 0) pin_self(svc);
             size_t set = 0;
-            auto call = [&] { cpu_experts(l, x.data(), sets[set++ % sets.size()], (size_t) g.dim); };
+            auto call = [&] { cpu_experts_local(l, x.data(), sets[set++ % sets.size()], (size_t) g.dim); };
             auto busy = [&](double ms) {
                 for (const double t0 = now_ms(); now_ms() - t0 < ms;) call();
             };
@@ -10340,7 +10340,7 @@ struct Model::Impl {
                 ents.push_back(en);
             }
             const double a = now_ms();
-            cpu_experts(l, x.data(), ents, (size_t) g.dim);
+            cpu_experts_local(l, x.data(), ents, (size_t) g.dim);
             t.push_back(now_ms() - a);
         }
         std::sort(t.begin(), t.end());
@@ -10722,7 +10722,7 @@ struct Model::Impl {
             ents[0].e = e;
             ents[0].n = 1;
             ents[0].tok[0] = 0;
-            cpu_experts(l, x.data(), ents, (size_t) E);
+            cpu_experts_local(l, x.data(), ents, (size_t) E);
             const std::vector<float> yc(c_yd.begin(), c_yd.begin() + E);
             if (!lane_pull_cal(l, C.dev, 1, &e, b.plan, b.plan2)) {
                 ++n_bad;
@@ -12433,12 +12433,12 @@ struct Model::Impl {
             for (size_t i = 0; i < x.size(); ++i) x[i] = 0.02f * std::sin(0.37f * (float) i);
             const double bytes = (double) ents.size() * (double) l.blob;
             double a = now_ms();
-            cpu_experts(l, x.data(), ents, (size_t) g.dim);
+            cpu_experts_local(l, x.data(), ents, (size_t) g.dim);
             const double t_first = now_ms() - a;
             double t_warm = 1e30;
             for (int rep = 0; rep < 2; ++rep) {
                 a = now_ms();
-                cpu_experts(l, x.data(), ents, (size_t) g.dim);
+                cpu_experts_local(l, x.data(), ents, (size_t) g.dim);
                 t_warm = std::min(t_warm, now_ms() - a);
             }
             pm.cpu = bytes / std::max(1e-3, t_warm / 1000.0);
