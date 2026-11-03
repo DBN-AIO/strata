@@ -11,7 +11,7 @@
 #include "strata/core/family_layout.hpp"
 #include "strata/core/native_rows.hpp"
 #include "strata/core/net_experts.hpp"
-#include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
