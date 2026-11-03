@@ -73,6 +73,7 @@ def main():
     ap.add_argument("--dim", type=int, default=256)
     ap.add_argument("--ff", type=int, default=256)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--types", help="GATE_UP,DOWN: every layer of this type pair (default: the real 2.00 set's mix, cycled)")
     ap.add_argument("--fast", action="store_true", help="one scale for all blocks (for timing runs at the real 5120 x 2304 size)")
     a = ap.parse_args()
     rng = random.Random(a.seed)
@@ -82,7 +83,7 @@ def main():
     off = 0
     with open(os.path.join(a.out, model), "wb") as f:
         for il in range(a.layers):
-            tgu, td = CYCLE[il % len(CYCLE)]
+            tgu, td = tuple(a.types.split(",")) if a.types else CYCLE[il % len(CYCLE)]
             for w, ty, n, k in (("w1", tgu, a.ff, a.dim), ("w3", tgu, a.ff, a.dim), ("w2", td, a.dim, a.ff)):
                 buf, per = matrix(rng, ty, n, k, a.experts, a.fast)
                 f.write(buf)
