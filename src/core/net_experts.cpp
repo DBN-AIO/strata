@@ -27,6 +27,12 @@
 #include <thread>
 
 #ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX   // windows.h's min/max macros break std::min / std::max below
+#  endif
+#  ifndef _WIN32_WINNT
+#    define _WIN32_WINNT 0x0A00   // winsock2.h declares WSAPoll and POLLRDNORMAL / POLLWRNORMAL only from Vista on
+#  endif
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
 #  endif
@@ -93,7 +99,7 @@ bool err_intr(int e) { return e == WSAEINTR; }
 bool err_inprogress(int e) { return e == WSAEWOULDBLOCK; }
 bool set_nonblock(sock_t s, bool nb) { u_long v = nb ? 1 : 0; return ioctlsocket(s, FIONBIO, &v) == 0; }
 int sock_poll(sock_t s, bool want_write, int ms) {
-    WSAPOLLFD p{}; p.fd = s; p.events = want_write ? POLLWRNORMAL : POLLRDNORMAL;
+    WSAPOLLFD p{}; p.fd = s; p.events = want_write ? POLLWRNORM : POLLRDNORM;
     return WSAPoll(&p, 1, ms);
 }
 void set_io_timeouts(sock_t s, int rcv_ms, int snd_ms) {
