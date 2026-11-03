@@ -2,6 +2,8 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/net_experts.hpp"
+
+#include <functional>
 #include "strata/prefill/copy_events.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
@@ -4565,6 +4567,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     std::vector<const uint8_t*> cpu_blob;   // the CPU experts' blobs, taken on this thread (the source is not thread-safe)
                     bool net_l = false;                   // REMOTE EXPERTS: this layer's non-resident experts go to an expert server
                     std::string net_err;                  // (declared before the future: the thread writes it)
+                    bool net_try = false;                 // the CPU thread asks the server (false: computes locally, the fallback)
+                    bool net_fb = false;                  // the server failed for this layer: its experts were computed here
+                    std::function<bool()> cpu_fn;         // the CPU thread's work, run again locally when the server fails
                     double cpu_ms = 0;                    // the thread's time (the measured share)
                     std::future<bool> cpu_fut;
                     int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0;
@@ -4989,10 +4994,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.cpu_ev[0] == nullptr) { cudaEventCreate(&m.cpu_ev[0]); cudaEventCreate(&m.cpu_ev[1]); }
                                 cudaEventRecord(m.cpu_ev[0], m.cs);
                             }
-                            cpu_fut = std::async(std::launch::async, [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, &net_err, src_h, ids_h, slot_h,
-                                                                      net_l, l, T, r0c, this]() -> bool {
+                            net_try = net_l;
+                            cpu_fn = [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, &net_err, &net_try, src_h, ids_h, slot_h, l, T, r0c, this]() -> bool {
                                 const auto t0 = std::chrono::steady_clock::now();
-                                if (net_l) {   // REMOTE EXPERTS: the server's rows into the same tail rows the share fills
+                                if (net_try) {   // REMOTE EXPERTS: the server's rows into the same tail rows the share fills
                                     const int64_t n = T * K;
                                     std::vector<uint8_t> mask((size_t) n, 0);
                                     std::vector<float*> dst((size_t) n, nullptr);
@@ -5038,7 +5043,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cpu_pool_->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
                                 cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                                 return true;
-                            });
+                            };
+                            cpu_fut = std::async(std::launch::async, cpu_fn);
                         }
                         // pf_wmma: this layer's groups on the FP16 tensor-core tiles (single GPU, native pack, Q2_0 / IQ4_NL down)
                         const bool wmma_l = use_mmq && pf_wmma() && !fused_l && on_peer.empty() && lay.native &&
@@ -5932,7 +5938,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail, row_sd 1 (s_down is in them)
                         if (cpu_share_env() < 0.0) cudaEventRecord(m.cpu_ev[1], m.cs);   // after the GPU's expert work
-                        if (!cpu_fut.get()) { err = net_l ? "prefill: " + net_err : "prefill: a CPU expert has no blob"; return false; }
+                        bool cpu_ok = cpu_fut.get();
+                        if (!cpu_ok && net_l && pool_hold.held && cpu_fn) {
+                            // REMOTE EXPERTS: the server failed (down, refused, timed out): this host's CPU computes those experts,
+                            // from its own copy, as the CPU share would; the blobs are taken here (the source is not thread-safe)
+                            bool blobs = true;
+                            for (int32_t e = 0; e < m.g->n_expert && blobs; ++e)
+                                if (on_cpu[(size_t) e]) blobs = (cpu_blob[(size_t) e] = m.src->blob_stable(l, e)) != nullptr;
+                            if (blobs) {
+                                net_try = false;
+                                cpu_ok = cpu_fn();
+                                net_fb = cpu_ok;
+                                if (cpu_ok) {
+                                    ++stats_.net_fallbacks;
+                                    std::fprintf(stderr, "prefill: layer %d: %s; its %lld experts computed on this host\n", (int) l,
+                                                 net_err.c_str(), (long long) n_cpu);
+                                }
+                            }
+                        }
+                        if (!cpu_ok) { err = net_l ? "prefill: " + net_err : "prefill: a CPU expert has no blob"; return false; }
                         if (cpu_share_env() < 0.0 && n_stream > n_cpu) {
                             m.cpu_pend = true;
                             m.pend_cpu_ms = cpu_ms;
@@ -5946,7 +5970,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off)
                             cudaMemcpyAsync(m.row_sd + r0c, m.cpu_ones, (size_t) rows_cpu * sizeof(float),
                                             cudaMemcpyHostToDevice, m.cs);
-                        if (net_l) { stats_.experts_net += n_cpu; ++stats_.layers_net; stats_.ms_net += cpu_ms; }
+                        if (net_l && !net_fb) { stats_.experts_net += n_cpu; ++stats_.layers_net; stats_.ms_net += cpu_ms; }
                         else stats_.experts_cpu += n_cpu;
                     }
                     // no reading from a layer the share could not change (nothing taken) or with one-time costs

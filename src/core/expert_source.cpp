@@ -4842,7 +4842,7 @@ namespace {
 // the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
 // are fixed arrays of this many entries: a window's rows (kWindowMaxT) of the model's 10 routed experts must fit, and a
 // larger k is refused at run time rather than written past them.  128 for the 8-row window (as it was), 256 for 16.
-constexpr int64_t kMaxWindowEntries = strata::kernels::kWindowMaxT <= 8 ? 128 : 256;
+constexpr int64_t kMaxWindowEntries = strata::kernels::kWindowMaxEntries;
 static_assert(strata::kernels::kWindowMaxT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 
@@ -4862,6 +4862,73 @@ int tail_skip_rank() {
     return r;
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
+
+// REMOTE EXPERTS: the expert server failed after it was handed the entries `owned` (down, hung, a wrong answer): compute
+// those rows here with this host's CPU kernels - the arithmetic the local run would have used.  Rows are written, not summed.
+// The jobs run in batches of 16 distinct experts so a transient blob (the GGUF read in place) is never held for long.
+static bool net_rows_locally(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                             strata::kernels::cpu::NativeArithmetic arithmetic, const std::vector<int32_t>& owned) {
+    using namespace strata::kernels::cpu;
+    const ExpertLayout& lay = expert_layout();
+    const bool native = lay.native;
+    std::vector<uint8_t> need((size_t) n_tok, 0);
+    for (int32_t i : owned) need[(size_t) (i / k)] = 1;
+    for (int64_t t = 0; t < n_tok; ++t) {
+        if (!need[(size_t) t]) continue;
+        if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))
+            act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+        else if (native)
+            native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+        else
+            act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+    }
+    int njobs = 0;
+    std::vector<int64_t> batch;   // the experts whose job_of slot is set
+    auto flush = [&] {
+        if (njobs > 0) {
+            if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs, arithmetic);
+            else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+        }
+        for (int64_t e : batch) d.job_of[(size_t) e] = -1;
+        batch.clear();
+        njobs = 0;
+    };
+    for (int32_t i : owned) {
+        const int64_t e = ids[i], t = i / k;
+        int16_t& jo = d.job_of[(size_t) e];
+        if (jo < 0) {
+            if (njobs >= 16) flush();
+            const uint8_t* b = d.src->blob(d.layers, e);
+            if (b == nullptr) { flush(); return false; }
+            jo = (int16_t) njobs++;
+            batch.push_back(e);
+            ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
+            nj.blob = b; nj.nt = 0; nj.fmt = nullptr;
+        }
+        if (d.jobs_multi[(size_t) jo].nt == MAXT) {   // a window of 9..16 rows: a further job over the same blob (as the main loop does)
+            const int16_t prev = jo;
+            jo = (int16_t) njobs++;
+            ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
+            nj.blob = d.jobs_multi[(size_t) prev].blob;
+            nj.fmt = d.jobs_multi[(size_t) prev].fmt;
+            nj.nt = 0;
+        }
+        ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+        jb.act[jb.nt] = &d.act_multi[(size_t) t];
+        jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+        jb.out[jb.nt] = out + (size_t) i * H;
+        ++jb.nt;
+    }
+    flush();
+    return true;
+}
+
+// RAII: a request sent to the expert server whose answer is never read (any early return between begin and finish) would leave
+// the stream one frame behind; the route is dropped instead, and reconnects with a fresh stream.
+struct NetAbandonGuard {
+    NetExperts* n;
+    ~NetAbandonGuard() { if (n != nullptr) n->abandon(); }
+};
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
@@ -5076,14 +5143,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     bool net_active = false;
+    NetAbandonGuard net_guard{nullptr};
     if (d.net != nullptr && d.net->serves(d.layers)) {   // REMOTE EXPERTS: the CPU's entries of this layer go to an expert server
         std::string nerr;
-        static thread_local std::string net_error;
-        if (!d.net->begin(d.layers, x_f, ids, n_tok, k, kind, arithmetic == strata::kernels::cpu::NativeArithmetic::WindowInvariant ? 1 : 0, nerr)) {
-            net_error = nerr;
-            d.failed = true; d.fail = net_error.c_str(); d.fail_layer = d.layers; return;
-        }
-        net_active = true;
+        // begin() never fails the dispatch: a route that is down (or a send that fails) sends nothing, no kind changes, and the
+        // CPU work below covers those rows.  in_flight() says whether a request went out.
+        (void) d.net->begin(d.layers, x_f, ids, n_tok, k, kind, arithmetic == strata::kernels::cpu::NativeArithmetic::WindowInvariant ? 1 : 0, nerr);
+        net_active = d.net->in_flight();
+        if (net_active) net_guard.n = d.net;
     }
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // the GPU's copy_rows_from_mapped zeroes the rows it computed itself (dec_batch); STRATA_VERIFY_DEVICE_PLAN's
@@ -5297,8 +5364,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     if (net_active) {                        // REMOTE EXPERTS: the expert server's rows, into the same rows
         static thread_local std::string net_error2;
-        if (!d.net->finish(out, net_error2)) {
-            d.failed = true; d.fail = net_error2.c_str(); d.fail_layer = d.layers; return;
+        net_guard.n = nullptr;               // finish() owns the stream state from here (it drops the route itself on an error)
+        if (!d.net->finish(out, net_error2) && !net_rows_locally(d, x_f, ids, n_tok, k, out, arithmetic, d.net->owned())) {
+            d.failed = true; d.fail = "the expert source could not produce a blob"; d.fail_layer = d.layers; return;
         }
     }
     if (d.peer != nullptr) {                 // multi-GPU: the second GPU's rows, into the same mapped rows

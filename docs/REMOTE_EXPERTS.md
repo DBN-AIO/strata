@@ -43,8 +43,9 @@ engine initialises CUDA for its dense weights, about 4.3 GB VRAM with `--expert-
 ```sh
 strata --pack PACK --native SHARD1.gguf --max-context 1024 --prefill auto --spec 2 \
        --expert-profile data/expert-profile.bin --expert-cache 300 --mmap-experts --pcie-frac 0 \
-       --gpu N --expert-server --listen 7840 --serve-layers 38-47
+       --gpu N --expert-server --listen 192.168.1.130:7840 --serve-layers 38-47
 ```
+(`STRATA_EXPERT_TOKEN` set in the environment of both commands: see "Security".)
 
 Conductor (the normal command plus one flag):
 
@@ -53,8 +54,24 @@ strata ... --remote-experts 192.168.1.130:7840=38-47[,host2:7840=24-37]
 ```
 
 - Default port 7840 (several servers on one host: 7840, 7841, ...).
-- Layer ranges are inclusive and must not overlap; the handshake checks n_embd, n_expert, n_layers and that the server's
-  range covers the requested one.
+- `--listen` takes `host:port`, `[v6addr]:port` or a bare port, and **binds exactly that address**. The default is
+  `127.0.0.1:7840`: reachable from this PC only (the localhost test below). For a conductor on another PC write the
+  interface address (`192.168.1.130:7840`) or, deliberately, `0.0.0.0:7840` (every interface). Ports must be 1..65535 and
+  `--serve-layers a-b` / `--remote-experts` ranges are digits only: a typo is an error, never a silent 0.
+- Layer ranges are inclusive and must not overlap; the handshake checks the protocol version (both directions), n_embd,
+  n_expert, n_layers, a **model fingerprint**, the **CPU kernel path** and that the server's range covers the requested one.
+  The fingerprint is a SHA-256 over the expert layout (tensor types, per-layer formats, offsets, sizes) and the sizes of
+  the model files; a different quantization or file with the same geometry is refused with both fingerprints in the
+  message. The kernel path (avx512 / avx512bw / avx2 / baseline, plus an `STRATA_FORCE_ISA` cap) must match too: the AVX2
+  and AVX-512 kernels are parity-tested, not proven bit-identical, so a mixed pair is refused unless the server runs with
+  `STRATA_EXPERT_ALLOW_ISA_MISMATCH=1` (then the rows are equal within the kernels' tolerance, not bit for bit). The
+  `STRATA_*` environment knobs the CPU dispatch reads must also be the same on both hosts.
+- `--expert-server` and `--remote-experts` are exclusive. A server always runs the plain CPU pool: a peer GPU, helper GPUs
+  and a net route are forced off in server mode (and `serve_experts` refuses to start if any is set).
+- Timeouts: every socket read, write and connect on both ends gives up after 10 s (`--expert-timeout-ms N` or
+  `STRATA_EXPERT_TIMEOUT_MS`, 100..600000). The server's idle session waits for the next request without a read timeout
+  (a conductor may pause between prompts; TCP keepalive notices a dead host), but a connection that has not completed the
+  handshake within the timeout is dropped.
 - The server holds its experts in RAM: it touches every page of its layers at start (`strata net: served layers ...
   resident ...` line gives the resident GiB). `mlock` is attempted and needs `ulimit -l` headroom; without it the pages
   stay in the page cache and the OS may evict them under memory pressure.
@@ -62,26 +79,150 @@ strata ... --remote-experts 192.168.1.130:7840=38-47[,host2:7840=24-37]
 - Use `--pcie-frac 0` on conductor and server for runs that must be reproducible (the PCIe share is otherwise measured
   from CPU timing and changes which experts the GPU computes).
 
+## Security (trusted LAN only)
+
+The expert server runs another host's requests on your CPU and your page cache, and the protocol is plain TCP. Treat it
+like an NFS export: **trusted LAN only, firewall port 7840 to the conductor's IP** (`ufw allow from <conductor> to any
+port 7840 proto tcp`), and never expose it to the internet.
+
+- **Bind address.** Loopback unless you write another address after `--listen`. A non-loopback bind prints a warning with
+  the address, and a second one when no token is set.
+- **Shared secret.** Set `STRATA_EXPERT_TOKEN` (any string, 16+ random characters; never put it on a command line) in the
+  environment of the server **and** the conductor. The server sends a random 32-byte nonce; the conductor answers in HELLO
+  with `HMAC-SHA256(token, nonce || hello fields)`; the server compares in constant time and refuses with a generic
+  "authentication failed". The token never crosses the wire and a recorded HELLO cannot be replayed (new nonce per
+  connection). A server with a token refuses a conductor without one, and the other way round the conductor warns that the
+  server does not ask. What the token does **not** do: encrypt the hidden states, or authenticate the frames after the
+  handshake. Anyone who can sniff or hijack the TCP stream can still read or alter it; use a trusted segment or a tunnel
+  (`ssh -L`, WireGuard) for anything more.
+- **Requests are validated before anything runs.** Every expert id in `[0, n_expert)`, `k` equal to the model's top-k,
+  `1 <= n_tok <= the window`, `n_tok*k` within the dispatch tables, arithmetic mode 0/1, mask bytes 0/1, the layer inside
+  the served range, the payload size exact. A bad request is answered with ERR and **the connection keeps serving**; the
+  dispatch state is reset before each request, so one bad request can no longer disable the server (it did before:
+  `d.failed` stayed set until a restart). Frame sizes are capped (4 KiB before authentication, 1 MiB per request).
+- **One conductor at a time**, because the dispatch is single-threaded. Handshakes run on their own threads (at most 8 at
+  once), so an idle or half-open connection cannot block the real conductor; a second authenticated conductor gets ERR
+  "busy".
+- **SIGPIPE** is ignored in both modes and sends use `MSG_NOSIGNAL` (`SO_NOSIGPIPE` on macOS): a peer that dies mid-frame
+  gives an error, not a dead process.
+
+`tools/net_experts_probe.py` checks all of this against a running server (wrong/missing token, oversized pre-auth frame,
+each kind of bad request followed by a good one, busy, idle connection).
+
+## Faults on the conductor
+
+A server that is down, hung, or answers wrongly no longer stops generation. On any network error (send/receive failure or
+timeout, a bad or mismatched response, an ERR frame) the conductor drops that route, **computes the rows itself** with its
+own CPU kernels (it still holds every expert locally, which prefill needs anyway), logs the outage **once**
+("expert server ... lost: ...; computing those experts locally, next try in 1000 ms"), and reconnects on a later call with
+exponential backoff (1 s, 2 s, ... 30 s, with a 2 s connect timeout so a dead host costs at most 2 s per retry). The
+reconnect repeats the whole handshake (a server restarted with another model is refused). A request that is abandoned
+between send and receive (an error elsewhere in the dispatch) also drops the route, so the stream can never be left one frame
+behind. The exit summary counts outages, reconnects and locally computed rows. Output is the same bits either way, because the
+local rows use the same CPU kernels; only the speed changes.
+
 ## Wire protocol "SXP1"
 
-See the header comment of `include/strata/core/net_experts.hpp`: length-prefixed frames, little endian, one persistent
-TCP connection, `TCP_NODELAY`; HELLO/HELLO_ACK, REQ (layer, n_tok, k, arithmetic, ids, mask, x), RESP (rows of the
-masked entries in order), ERR, BYE. Hidden states are fp32 so the result is bit identical to the local CPU run; fp16/bf16
+See the header comment of `include/strata/core/net_experts.hpp`: length-prefixed frames, little endian (asserted at compile
+time, with the header and message sizes and IEEE-754 floats), one persistent TCP connection, `TCP_NODELAY`; version 2:
+CHALLENGE (server nonce), HELLO (version, geometry, kernel path, model fingerprint, HMAC), HELLO_ACK (version, served
+layers, top-k, kernel path), REQ (layer, n_tok, k, arithmetic, ids, mask, x), RESP (rows of the masked entries in order), ERR,
+BYE. Both sides check the version; a version-1 peer is refused with a clear message. Hidden states are fp32 so the result is bit identical to the local CPU run; fp16/bf16
 on the wire would halve the traffic (about 20 KB out, 90 KB in per call at 4-token windows) and is a later option.
 
 ## Windows (stream PC: RTX 5070 Ti, sm_120)
 
-The server path uses no Linux-only call: sockets are behind the shim (`ws2_32` is linked by CMake on `WIN32`);
-the warm-up `mlock` is `#if !defined(_WIN32)`. Build as for any Windows CUDA build of Strata (docs/SOURCE_INSTALL.md,
+The server path uses no Linux-only call: sockets are behind the shim (`ws2_32` is linked by CMake on `WIN32`; `WSAStartup` is
+checked and initialised once, thread safe; `WSAPoll`, `ioctlsocket`, `SO_RCVTIMEO` in milliseconds); the warm-up `mlock` is
+`#if !defined(_WIN32)`. Build as for any Windows CUDA build of Strata (docs/SOURCE_INSTALL.md,
 "From source: Windows": Visual Studio 2022 Build Tools + CUDA 13.0-13.2), then run the same command line with
 `strata.exe`. Not built or run on the stream PC from this branch (it is the streaming machine and its D: drive is
 failing); keep it buildable.
 
 ## CPU-only host (T340)
 
-The server needs the engine's CPU expert kernels and a CUDA runtime for the dense weights. A CUDA-free server build is
-the next step: the dispatch already runs every row on the CPU when `host_res == nullptr` and `plan == nullptr`, so only
-the engine's start-up (dense weights, PLE, cache) has to be skipped in `--expert-server` mode.
+`strata-expert-server` is the engine's expert server without the engine: it needs no GPU, links no CUDA library and never
+initialises CUDA. It is built by configuring with `STRATA_ENABLE_CUDA=OFF` (the default; also no HIP/SYCL), on x86-64 Linux:
+
+```sh
+cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF      # add -DSTRATA_BUILD_TESTS=ON for the CPU tests
+cmake --build build-cpu --target strata-expert-server -j8
+```
+
+It takes the engine's server command line (the same words, so one script serves both builds); flags that only configure the
+GPU engine (`--gpu`, `--expert-cache`, `--expert-profile`, `--spec`, `--pcie-frac`, `--mmap-experts`, ...) are accepted and ignored:
+
+```sh
+strata-expert-server --pack PACK --native SHARD1.gguf --expert-server --listen 7840 --serve-layers 38-43 [--pool-workers N]
+```
+
+| What | Where |
+| --- | --- |
+| CMake (option `STRATA_BUILD_EXPERT_SERVER`, default ON when CUDA/HIP/SYCL are off) | `cmake/cpu_expert_server.cmake`, included last by `CMakeLists.txt` |
+| the program: geometry from the GGUF, expert layout of the pack, `FileExpertSource` (the GGUF shards mapped in place), CPU `ExpertPool`, `serve_experts` | `src/program/expert_server_main.cpp` |
+| the CUDA engine's own `expert_source.cpp` and `net_experts.cpp`, compiled unchanged | `strata_expert_host` library |
+| the few CUDA runtime calls those make (page-locked memory, events, streams): every device call answers "no device", which they already handle | `include/strata/cpu_only/cuda_runtime.h` (`STRATA_CPU_ONLY`) |
+| the few GPU symbols they name (pinned arena, GPU expert cache, helper/peer GPU, four CUDA kernels): never reached by the server; the kernels abort with a message if they ever are | `src/core/cpu_only_stubs.cpp` |
+| tests: `expert_server_cli`, `expert_server_needs_model`, `expert_server_links_no_cuda` (readelf: no `libcuda`/`libcudart`/...) | `cmake/check_no_cuda_link.cmake` |
+
+The rows are the same bits the conductor's own CPU pool would produce: the server runs `expert_pool_dispatch_multi` with no plan,
+no residency table and no cache, exactly as the CUDA engine's `--expert-server` path does. A new CUDA call or GPU symbol in
+`expert_source.cpp` breaks the CPU-only build on purpose (CI, below); add it to the shim or the stubs after checking that the
+server cannot reach it.
+
+The dense weights are the conductor's, not the server's. A server needs only the GGUF header and the experts of its layers, so
+`tools/slice_gguf.py SRC DST LO HI --experts-only` (run on every shard) makes a sparse copy of just those: layers 38-43 of the
+35 GiB shard 1 are a 3.97 GiB file; shard 2 is its header only (4 KiB). `--pack` needs only `native_experts.txt` (and `index.txt`).
+
+Not covered: Windows (the Winsock branch of the socket shim and the `mlock` guard are untouched, the CMake target is UNIX-only
+today; a compile check is a commented stub in `build-linux.yml`), and the prompt path (as for any server, see "Not covered yet").
+
+### CI
+
+`.github/workflows/build-linux.yml` configures with CUDA off and tests on push to `remote-experts` / `cpu-only-build` and on every
+pull request from this repository: configure, build everything, `ctest` (93 tests run of 94 registered: every CPU unit and parity test of the
+tree plus the three server tests; five skip themselves on a CPU without AVX-512), and a check that the server links no GPU library. It runs on `runs-on: [self-hosted, linux-fast]`, not
+on GitHub-hosted runners, in 2.5 to 7 minutes on the T340 (`timeout-minutes: 30`); nothing is cached on D: (the pinned llama.cpp checkout and
+cmake live in `.strata-ci-cache` beside the runner's work folder, on the runner's system disk; the job refuses to start with less than 8 GB free). `isa_guard_check` is excluded: it fails on GCC 15 for two
+unlisted `iq_avx512.cpp` functions (`iq512_reference_gu_rows`, `iq512x_rows`), in files this change does not touch; fix the allow-list or the
+compiler flags, then drop the exclusion.
+
+**CI runner.** The existing `t340-fast-*` / `gaming-fast-*` runners belong to `DBN-AIO/AIO`; a runner is bound to one repository,
+so this repository needs its own. One was registered on the T340 as `t340-strata-1` (labels `self-hosted`, `linux-fast`), started by
+hand in `~/strata-runner` (`nohup ./run.sh`), not as a service. To make it permanent: `sudo ./svc.sh install dadbodnerd && sudo ./svc.sh start`
+in that folder. This repository is public: a pull request from a fork would run the fork's copy of the workflow on that machine.
+The job is skipped for fork pull requests, but the workflow file of such a pull request is the fork's own; set
+Settings > Actions > General > "Fork pull request workflows from outside collaborators" to "Require approval for all outside
+collaborators" (API: `actions/permissions/fork-pr-contributor-approval`, `approval_policy: all_external_contributors`; today it is
+`first_time_contributors`) before accepting outside pull requests.
+
+### Measured (2026-11-03): T340 as the server
+
+Server: T340 (Xeon E-2234, 4 cores / 8 threads, no AVX-512, no GPU, 61 GB RAM, Postgres and the bridge running beside it),
+GCC 15.2, `taskset -c 0-7`, layers 38-43 (6 of 48), `--pack` with `native_experts.txt` only. Conductor: gaming PC as above (RTX 3090 GPU 0
+with about 8 GB free, `cond.sh` settings, `--pcie-frac 0`, `--remote-experts 192.168.1.133:7840=38-43`), direct TCP (the T340's ufw
+allows the house LAN; no SSH tunnel). Both machines were busy with CI jobs and other work (load average 15-22 on the gaming PC),
+so the absolute tok/s move with the minute; the reference and the remote runs below alternate.
+
+| Item | Result |
+| --- | --- |
+| build on the T340 (`-j8`, `nice`) | configure 47 s (clones the pinned llama.cpp), `strata-expert-server` 2 min 40 s; the rest of the tree (all 91 tests) another 32 s; build tree 0.65 GB |
+| server residency, layers 38-43 | 3.96 GiB of experts touched and page-cache resident (3.96 of 3.96 GiB), `mlock` 0.01 GiB (`ulimit -l` is 8 MiB); process peak RSS 4.16 GB (46 MB anonymous, the rest the mapped GGUF pages); 4 threads (3 pool workers + the calling thread); 0 VRAM |
+| start-up | 0.3 s to the listening line with the pages cached |
+| 64 greedy tokens, static GPU cache (`--adapt-every 0`) | identical in 8 of 8 runs (4 single-process, 4 with the T340): same output line, same md5 |
+| decode, static cache | single process 18.4 / 21.4 / 22.5 tok/s (3.6 on the cold first run); with the T340 16.4 / 16.8 / 17.2 / 17.3 tok/s |
+| per call (one call per layer per window; 384 calls) | round trip 2.24 - 2.39 ms, server compute 1.45 - 1.56 ms, so about 0.8 ms of wire and framing; 20.1 KB out, 141.9 KB in |
+| the rig CPU server of the earlier test (layers 38-47) | 2.92 tok/s, 16.75 ms round trip, 14.32 ms compute: the T340 is about 7x faster per call |
+
+The T340 run is slower than the single process (about 17 against 20 tok/s) because the conductor's own CPU is a 16-core Ryzen
+and the T340 four cores; the layers it serves are computed one round trip in series after the router. A server that is not slower
+than the conductor, or overlap of the next layer's request (Next steps 3), changes that.
+
+**Determinism.** With the default adaptive GPU tier (`--adapt-every` > 0) a 64-token greedy run is not reproducible even
+single-process: of 4 reference runs, 1 differed from the other 3, and 2 of 5 runs with the T340 differed (one of them equal to the
+differing reference). The tier swaps experts into the GPU cache on a thread, so which expert is computed by the GPU (rounding
+differs slightly from the CPU) depends on timing under load. The remote path is not the cause: with `--adapt-every 0` the output
+is the same in all 8 runs. Use `--adapt-every 0` for any identical-tokens test.
 
 ## Measured (2026-11-03)
 
@@ -109,6 +250,24 @@ mapped from the sparse slice (3.4 GiB); VRAM 4.3 GB (dense weights + 300 cache s
 
 Direct TCP 7840 to the rig was still blocked by its ufw when this ran (the SSH tunnel stood in); the protocol is the same.
 
+### After the hardening (2026-11-03, `remote-experts-hardening`)
+
+Same conductor/server pair on the gaming PC (conductor RTX 3090 GPU0 with `--expert-cache 1100`, 5.7 GB of VRAM; server
+on GPU1 with 300 cache slots; layers 24-47 remote; 64 greedy tokens; shared token; loopback). Decode tok/s, in run order,
+old binary (`c3ee3745`) against the hardened one: before 11.13 (cold page cache), 23.23, 23.29, 23.56; after 18.61, 23.95,
+21.81, 22.82. Warm runs: 23.36 against 22.86 mean, inside the run-to-run noise (the adaptive tier moves a few tok/s);
+round trip 1.03-1.15 ms before, 1.08-1.10 ms after. The handshake and the request check cost nothing per call that shows.
+The tokens of the eight runs after the first are identical to the single-process reference; the first cold run of the old
+binary differs because the adaptive tier swapped experts at other moments (`--adapt-every 0` makes the run
+deterministic, which the fault tests below use).
+
+Fault checks (400 and 1000 greedy tokens, `--adapt-every 0`, tokens compared with the single-process run):
+- server `kill -9` mid-run: the conductor logs one "lost" line, computes the rows itself, finishes, same tokens;
+- server `SIGSTOP` (hung) with `--expert-timeout-ms 2000`: "lost: timed out waiting for the peer" after 2 s, local rows, then
+  "is back" once the server resumed; same 1000 tokens as the local run (75,695 rows computed locally during the outage);
+- `tools/net_experts_probe.py`: 23 checks pass (wrong/missing token, oversized pre-auth frame, 11 kinds of bad request each
+  followed by a good one, busy, idle connection).
+
 ## NVLink
 
 The two RTX 3090 of the gaming PC are NVLink-bridged (`nvidia-smi topo -m`: NV4, four links, 14 GB/s per link shown).
@@ -124,4 +283,4 @@ the remote-expert path.
 2. Expert servers on GPUs (the rig's 72 GB VRAM, the stream PC's 5070 Ti): load the served layers' experts into VRAM and
    compute them with the GPU kernels, so the host CPU stops being the bottleneck.
 3. Overlap: send layer l+1's request as soon as its router output exists (today one round trip per layer, in series).
-4. CPU-only server build for the T340 (no CUDA at start-up), fp16 hidden states on the wire.
+4. fp16 hidden states on the wire (halves the traffic). The CPU-only server for hosts without a GPU is done: "CPU-only host" above.
