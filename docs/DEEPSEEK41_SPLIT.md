@@ -13,6 +13,7 @@ what is DeepSeek-specific is written down in docs/REMOTE_EXPERTS.md, "DeepSeek-V
 | dsv41 expert server on Windows (stream PC) | built with MSVC 14.51 (the capped CPU lane, 32 s) and run; rows bit-identical to the Linux conductor |
 | CUDA `strata-dsv41` with `--remote-experts` / `--expert-server` | compiles and links (CUDA 13.2, sm_86, gcc 15); the server mode runs with `CUDA_VISIBLE_DEVICES=""`; **the conductor hook has not run end to end: no GPU was free** (GPU 0/1 belong to the other agent's 2.00 bpw run) |
 | synthetic DeepSeek-shaped model, local vs split, 64 tokens | passes (CI step, 15 checks) |
+| DSpark drafter with `--remote-experts` | **fixed in code, not run on real weights**: `--dspark auto` dropped the drafter in every split (the rule counted the whole pack's 132 GB of experts against the conductor's 35 GB of VRAM, `ds4_model.cu`, now `ds4_dspark_rule.hpp`); with remote experts auto now keeps it. A verify window of k + 1 tokens already went to the servers as one call per layer (`cpu_experts` -> `Remote::run`, up to `kMaxTok` = 16 tokens, one request per route); the synthetic split test proves that (wire calls == layer calls). Mechanism numbers below; the real-weights before / after is one command (below), waiting for free GPUs |
 | real weights, real split | **not run**: `/mnt/bulk/strata/models/deepseek41/RESULTS.md` did not exist when this was written (the 2.00 bpw set is on disk, 4 shards, sha256 ok). Tools are ready: `slice_stream.py`, `plan_split.py`, the server flags below |
 | GPU expert server for dsv41 (rig 72 GB VRAM, stream 5070 Ti) | not done; needs the engine's VRAM expert slots behind `serve_experts` (see "Next") |
 | prompt path through the servers | not done: the chunked prompt path streams experts from the conductor's own files, so the conductor needs the whole model on its disk |
@@ -83,6 +84,49 @@ An IQ3_XXS pack of the same shape costs 2.28 ms on the gaming PC against 1.91 ms
 (gcc 16, `-march=native`), the T340 (gcc, Coffee Lake class), the rig (the T340 binary), the Linux conductor with the **Windows (MSVC) server**,
 and the Linux conductor with the T340 and the rig (tunnel) as servers; thread counts 1 to 16 give the same hash. The CUDA engine binary's
 `--expert-server` returns the same rows as the CPU-only server (checked on the small synthetic pack).
+
+### DSpark drafter through the servers (2026-11-03, synthetic)
+
+Program: `ds4_net_test --causal --spec K` on the same synthetic pack as above (hidden 5120, expert FFN 2304, top-6, 4 layers x 48 experts, 1.7 GB), one
+`strata-dsv41-expert-server` on loopback (T340, 8 threads, other AIO services running: load average 8-10, so the numbers are noisy; read the ratios).
+The toy is causal (its memory is the previous token, so a window equals single steps), greedy; a round = a drafter proposes K tokens, ONE window of 1 + K
+tokens goes through every layer, the longest matching prefix and one token more are kept. Prompt 2048 or 16384 random tokens, a unique prefix per run (the
+toy has no attention, so the context length does not change the decode: it only costs prefill), 128 tokens, warm-up run first, decode phase only. **The
+weights are random: the accept rate is a knob here (`--draft-acc P`: an oracle drafter right with probability P per draft; "ngram" is prompt lookup),
+not a property of DSpark.** What is measured is the mechanism: round trips and compute per round.
+
+| 2k prompt, K = 4 (3 interleaved runs, median) | layer calls (= wire calls) for 127 tokens | tokens a round | decode tok/s | vs plain |
+| --- | ---: | ---: | ---: | ---: |
+| plain (one token a window) | 508 | 1.00 | 32.3 | 1.00 |
+| draft right 80 % | 148 | 3.46 | 38.5 | 1.2 |
+| draft right 50 % | 260 | 1.97 | 17.6 | 0.5 |
+| draft right 0 % (every draft refused) | 508 | 1.00 | 8.0 (single run) | 0.25 |
+
+16k prompt (single run each, same load): plain 25.3 tok/s, K = 4 at 80 %: 39.7 tok/s (the plain run met more load; the 2k pair above is the fair one).
+Calls per token: 4.0 plain, 1.17 at 80 % (K = 4), 2.05 at 50 %: **the verify window is one call per layer however many drafts it holds** (wire calls == layer
+calls in the test), so the per-layer round trip (0.75-1.2 ms, table above) is paid once per round. But **a window costs about 4.8 x one token** on these
+servers (31 ms against 6.5 ms a layer-call, K = 4, no accepted draft): the CPU lane's work is per (token, expert) pair, the 5 tokens' 30 picks are mostly different
+experts, and nothing is read once and used five times. So speculation through CPU servers breaks even at roughly 70 % of the drafts right and gains little
+above it; where the server compute is small against the round trip (a GPU expert server, a far host) it gains more. This is the number to check on
+real weights: DSpark's real accept rate and its confidence cut (`--dspark-conf`) decide, and `--dspark none` is the way out.
+
+Real weights, when the GPUs are free (Captain 1 runs it; the run changes no GPU power setting; two binaries: BASE = `dsv41-remote-experts` before this PR,
+NEW = this PR; same plan line as "Placement"; `PACK` the dsv41 pack with the DSpark blocks; `ids_2k.txt` / `ids_16k.txt` = a unique-prefix prompt as comma
+separated token ids, e.g. `python3 -c "import random;random.seed(7);print(','.join(str(random.randrange(1000,100000)) for _ in range(2048)))"`):
+
+```sh
+PLAN=192.168.1.130:7840=27-29,192.168.1.133:7840=30-33,192.168.1.27:7840=34-39   # servers up first, as in "Commands"
+for IDS in ids_2k.txt ids_16k.txt; do
+  # warm-up first: one short run (--n 16) of each binary, results dropped
+  for MODE in "BASE auto" "NEW auto" "NEW none"; do set -- $MODE
+    $1/strata-dsv41 --pack $PACK --remote-experts $PLAN --dspark $2 --ids "$(cat $IDS)" --n 128 2>&1 \
+      | grep -E "DSpark|dspark:|decode:|decode per token"          # BASE auto prints "DSpark not loaded"; NEW auto prints "DSpark drafter kept"
+  done
+done
+```
+
+The three lines per prompt are the before (BASE auto = no drafter), the after (NEW auto = drafter) and the control (NEW none = plain, must equal BASE auto).
+Read `decode: ... tok/s` and `dspark: N rounds ... tokens a round`; repeat 3 times, interleaved; tokens must be identical across the three (greedy).
 
 ## Placement
 
