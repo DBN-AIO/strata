@@ -190,9 +190,13 @@ int main(int argc, char** argv) {
     forward(n_prompt, h);
     int tok = next_token(&h[(size_t) (n_prompt - 1) * D]);
     seq.push_back(tok);
+    // (a recurrent carry stands in for attention's memory, so the toy does not fall into a one-token cycle)
+    std::vector<float> carry(&h[(size_t) (n_prompt - 1) * D], &h[(size_t) (n_prompt - 1) * D] + D);
     for (int s = 1; s < n_new; ++s) {
         std::vector<float> h1(&emb[(size_t) tok * D], &emb[(size_t) tok * D] + D);
+        for (int d = 0; d < D; ++d) h1[(size_t) d] += 0.8f * carry[(size_t) d];
         forward(1, h1);
+        carry = h1;
         tok = next_token(h1.data());
         seq.push_back(tok);
     }
