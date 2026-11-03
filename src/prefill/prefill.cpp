@@ -4679,7 +4679,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // STRATA_NET_PREFILL: 1 (default) the servers, 0 off (read and stream locally, as before), 2 the reference arm:
                         // the same experts on this host's CPU share kernels (the server's CPU arithmetic), for an A/B of the bits
                         static const int net_prefill = [] { const char* v = std::getenv("STRATA_NET_PREFILL"); return v == nullptr ? 1 : std::atoi(v); }();
-                        net_l = net_prefill != 0 && (net_prefill != 2 || (pool_hold.held && cpu_pool_ != nullptr)) && net_ != nullptr && net_->serves(l) && !stream_all && !m.pp && lay.native && !lay.fmt.empty();
+                        net_l = net_prefill != 0 && (net_prefill != 2 || (pool_hold.held && cpu_pool_ != nullptr)) && net_ != nullptr && net_->covers(l) && !stream_all && !m.pp && lay.native && !lay.fmt.empty();
                         if (net_l) {
                             cpu_maybe = false;
                             const size_t want = (size_t) T * N;

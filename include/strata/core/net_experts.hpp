@@ -53,12 +53,16 @@ public:
     NetExperts(const NetExperts&) = delete;
     NetExperts& operator=(const NetExperts&) = delete;
 
-    /// spec = "host:port=lo-hi[,host:port=lo-hi...]" (port defaults to 7840, lo-hi inclusive layers, host may be [v6]).
+    /// spec = "host:port=lo-hi[/e0-e1][,...]" (port defaults to 7840, lo-hi inclusive layers, host may be [v6]; e0-e1: the
+    /// experts this host owns for those layers, default all).  Hosts may share layers with disjoint expert ranges: a layer's
+    /// request then goes to all of its hosts before any answer is read (B5).
     /// Connects to every server once; a failure here is an error (the user asked for it).  After that a server that fails is
     /// dropped and retried with backoff while its rows are computed locally.
     bool open(const std::string& spec, int64_t n_layers, int64_t n_expert, const NetIdentity& id, std::string& err);
     bool active() const { return !routes_.empty(); }
     bool serves(int64_t layer) const { return route_of(layer) >= 0; }
+    /// The hosts of `layer` together own every expert (B5: the prompt path hands a layer to the servers only then).
+    bool covers(int64_t layer) const;
     /// Ship the entries whose kind is -1 (the CPU's) to the server for `layer`; those entries get kind 3.  When the route
     /// is down (or the send fails) nothing is sent, no kind changes, and the caller's CPU work covers the rows: always true.
     /// A request was sent exactly when in_flight().
@@ -68,7 +72,7 @@ public:
     /// Receive the rows of the request begun last and write them into `out` (n_tok*k rows of n_embd).  On false the route is
     /// dropped and `err` says why; the caller must compute owned() locally.
     bool finish(float* out, std::string& err);
-    /// The entries (indices into n_tok*k) of the request begun last.
+    /// The entries (indices into n_tok*k) of the request begun last; after a false finish(), those of the hosts that failed.
     const std::vector<int32_t>& owned() const { return owned_; }
     /// The caller leaves between begin and finish (an error elsewhere): the unread RESP would desync the stream, so drop the route.
     void abandon();
@@ -80,7 +84,7 @@ public:
                 float* const* dst, std::string& err);
 
 private:
-    struct Route { std::string host; int port = 7840; int lo = 0, hi = 0; intptr_t fd = -1; int top_k = 0;   // top_k: the server's, from its HELLO_ACK
+    struct Route { std::string host; int port = 7840; int lo = 0, hi = 0; int elo = 0, ehi = 0; intptr_t fd = -1; int top_k = 0;   // top_k: the server's, from its HELLO_ACK; elo..ehi: the experts it owns
                    uint64_t calls = 0, bytes_out = 0, bytes_in = 0; double rtt_ms = 0, server_ms = 0, rtt_max_ms = 0;
                    // fault handling: down since an error; retry at retry_at_ms (steady clock), backoff doubles to 30 s
                    bool down_logged = false; double retry_at_ms = 0; int backoff_ms = 0;
@@ -93,6 +97,16 @@ private:
     }
     bool connect_route(Route& r, int timeout_ms, std::string& err);
     void mark_down(Route& r, const std::string& why);
+    bool route_up(Route& r);
+    bool send_req(Route& r, int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, const uint8_t* mask,
+                  int arith, uint64_t& seq, std::vector<uint8_t>& buf);
+    std::string recv_resp(Route& r, uint64_t seq, uint32_t want, std::vector<uint8_t>& resp, double& server_us);
+    /// B5: per route, the decode request in flight (several hosts may hold parts of one layer)
+    struct InFlight { bool active = false; uint64_t seq = 0; double t_send = 0; std::vector<uint8_t> mask, buf; std::vector<int32_t> owned; };
+    std::vector<InFlight> inflight_;
+    std::vector<uint8_t> resp_;
+    uint64_t layer_calls_ = 0, multi_calls_ = 0;
+    double wait_ms_ = 0;
     std::vector<Route> routes_;
     int64_t n_layers_ = 0, n_expert_ = 0;
     NetIdentity id_;
@@ -110,6 +124,7 @@ struct ExpertServeCfg {
     std::string host = "127.0.0.1";    ///< bind address: loopback unless the user writes another one (0.0.0.0 = every interface)
     int port = 7840;
     int layer_lo = 0, layer_hi = -1;   ///< served layers (inclusive); hi < 0: all
+    int expert_lo = 0, expert_hi = -1; ///< served experts of those layers (inclusive, --serve-experts); hi < 0: all
     int64_t n_layers = 0;
     int64_t n_expert = 0;
     int64_t top_k = 0;                 ///< the model's routed experts per token: a request with another k is refused

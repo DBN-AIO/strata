@@ -377,6 +377,70 @@ is this change on its own. The bit-equality runs used a CPU server; pipelining d
   (41 against 70 tok/s): 111 MB of fp32 rows come back through the SSH tunnel for the 10 layers, one window at a time.
   The levers: windows in flight (request pipelining), fp16 rows on the wire, a direct TCP path (the rig's ufw).
 
+## Request pipelining across hosts
+
+A layer can be served by several hosts at once, each owning a range of its experts:
+
+```sh
+# conductor: layers 38-47, experts 0-255 on the rig, 256-511 on a second host
+strata ... --remote-experts 192.168.1.130:7840=38-47/0-255,192.168.1.30:7850=38-47/256-511
+# each server says which experts it owns
+strata ... --expert-server-gpu --serve-layers 38-47 --serve-experts 0-255 ...    # rig
+strata ... --expert-server     --serve-layers 38-47 --serve-experts 256-511 ...  # second host
+```
+
+- `host:port=lo-hi/e0-e1` (`netproto::parse_route_item`; without `/e0-e1` the host owns every expert, as before).
+  Two items may share layers only with disjoint expert ranges (`routes_conflict`): every (layer, expert) has one owner.
+- Decode: `NetExperts::begin` sends the layer's request to every host that owns one of its CPU entries, all before the
+  conductor's own CPU work; `finish` reads every answer. The hosts compute their shares of the same layer at the same
+  time, so a layer waits for the slowest host instead of one host doing all of it (it cannot overlap layers: layer
+  l+1's input is layer l's output). Entries no host owns stay on the conductor's CPU. A host that fails gives back only
+  its own entries (`owned()`), which the conductor computes itself; the other hosts' answers are still read, so their
+  streams stay in step.
+- Server: `--serve-experts e0-e1` fills the helper GPUs and the RAM warm-up with those experts only, and a request that
+  asks for another expert is refused (`parse_req`, ERR; the conductor then computes those rows itself).
+- Prompt path: a layer goes to the servers only when its hosts together own every expert (`layer_covered`); each host
+  gets its share of every window, round-robin over the hosts, with up to `STRATA_NET_PIPELINE` windows (default 4)
+  sent before the first answer is read (bounded, so neither side's socket buffers fill). `STRATA_NET_PIPELINE=1` is the
+  old one-window-at-a-time.
+- Logged: `strata net: decode: 410 layer calls, 410 with 2+ hosts in flight at once; mean wait for the answers after the
+  local CPU work 2.299 ms`.
+
+### Measured (request pipelining)
+
+Same model and conductor (`--adapt-every 0`). Rig: the GPU expert server over the SSH tunnel. Second host: an expert
+server on the gaming PC itself (loopback, CPU experts, dense weights on its second 3090), so it shares the conductor's
+CPU; there was no other free host to put it on.
+
+Decode, 14-token prompt, 64 tokens (all three gave the same text):
+
+| Layers 38-47 on | decode tok/s | layer calls | 2+ hosts at once | wait after the local CPU work |
+| --- | ---: | ---: | ---: | ---: |
+| the rig only (all 512 experts) | 11.86 / 17.45 | 420 / 410 | 0 | 3.345 / 3.232 ms |
+| rig 38-42 + gaming PC 43-47 (layer split, possible before) | 4.29 / 3.45 | 420 | 0 | 3.835 / 3.558 ms |
+| rig experts 0-255 + gaming PC 256-511 (this change) | 15.26 / 15.05 | 410 / 420 | all | 2.299 / 2.146 ms |
+
+- With the experts split across two hosts the conductor waits 33 % less per layer (2.22 against 3.29 ms): each host
+  answers half the rows, at the same time (rig round trip 2.0 ms, 102 KB back instead of 187 KB). The rig's helper GPUs
+  then hold all 2560 of its experts (100 % of its rows on GPU).
+- Decode tok/s is within the noise of these runs (the conductor's own work dominates; the second host competes with
+  it for the gaming PC's cores: in the layer-split runs that host took 3.9-4.0 ms per call and the conductor slowed to
+  4.3 / 3.5 tok/s).
+
+Prompt path, windows in flight (`STRATA_NET_PIPELINE`), round-trip time of the 10 handed-out layers:
+
+| Prompt | hosts | 1 window at a time | 4 in flight (default) |
+| --- | --- | ---: | ---: |
+| 14 tokens | rig | 183 ms | 152 ms |
+| 119 tokens | rig | 1476 ms (40.7 tok/s) | 991 ms (49.0 tok/s) |
+| 14 tokens | rig + gaming PC (experts split) | - | 105 / 83 ms |
+| 119 tokens | rig + gaming PC (experts split) | 888 ms | 917 ms |
+
+- On one host, four windows in flight cut the prompt's round-trip time by a third for 119 tokens (prompt 41 -> 49 tok/s).
+- With the second host on the conductor's own CPU, that host is the bottleneck (630 ms of compute for its 150 windows),
+  so the window depth no longer matters there, and its CPU work also slowed the conductor's own expert streaming
+  (prompt 26 tok/s). A second host that is a separate machine does not have that cost.
+
 ## NVLink
 
 The two RTX 3090 of the gaming PC are NVLink-bridged (`nvidia-smi topo -m`: NV4, four links, 14 GB/s per link shown).
@@ -392,5 +456,6 @@ the remote-expert path.
    servers"). Open: the stream-all and fused chunk paths, and a conductor without a local copy (today the fallback needs it).
 2. Expert servers on GPUs: done for CUDA helper cards ("Expert servers on GPU" above). Open: the stream PC's 5070 Ti
    (sm_120 build), a fourth helper card, and CUDA0's own spare VRAM (it holds only the dense weights in server mode).
-3. Overlap: send layer l+1's request as soon as its router output exists (today one round trip per layer, in series).
+3. Overlap: done as far as the data allows ("Request pipelining across hosts"): one layer's experts split across hosts run
+   at the same time, and the prompt path keeps several windows in flight. Layer l+1 cannot start before layer l's output.
 4. fp16 hidden states on the wire (halves the traffic). The CPU-only server for hosts without a GPU is done: "CPU-only host" above.

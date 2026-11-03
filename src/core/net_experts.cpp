@@ -341,6 +341,11 @@ NetIdentity net_identity(const std::vector<std::string>& files) {
 }
 
 // ================================================================== client
+// B5 (request pipelining across hosts): several hosts may serve one layer, each owning a range of its experts
+// (host:port=lo-hi/e0-e1).  begin() sends the layer's request to every owning host before the conductor's own CPU work and
+// finish() collects all answers, so the hosts compute their shares of the same layer at the same time and the layer waits
+// for the slowest one instead of one host doing all of it.  The prompt path keeps up to STRATA_NET_PIPELINE windows
+// (default 4) in flight per host instead of one round trip per window.
 bool NetExperts::connect_route(Route& r, int tmo_ms, std::string& err) {
     const sock_t s = sock_connect(r.host, r.port, tmo_ms, err);
     if (s == kBad) return false;
@@ -388,36 +393,44 @@ bool NetExperts::open(const std::string& spec, int64_t n_layers, int64_t n_exper
     id_ = id;
     token_ = env_token();
     size_t pos = 0;
+    std::vector<np::RouteSpec> specs;
     while (pos < spec.size()) {
         size_t end = spec.find(',', pos);
         if (end == std::string::npos) end = spec.size();
         const std::string item = spec.substr(pos, end - pos);
         pos = end + 1;
         if (item.empty()) continue;
-        const size_t eq = item.rfind('=');
-        if (eq == std::string::npos) { err = "--remote-experts item needs host:port=lo-hi: " + item; return false; }
-        Route r;
+        np::RouteSpec rs;
         std::string why;
-        if (!np::parse_hostport(item.substr(0, eq), "", 7840, false, r.host, r.port, why)) { err = "--remote-experts " + why; return false; }
-        if (!np::parse_range(item.substr(eq + 1), 0, (long) n_layers - 1, r.lo, r.hi)) { err = "layer range out of range: " + item; return false; }
-        for (const Route& o : routes_)
-            if (!(r.hi < o.lo || r.lo > o.hi)) { err = "overlapping layer ranges in --remote-experts"; return false; }
+        if (!np::parse_route_item(item, n_layers, n_expert, rs, why)) { err = "--remote-experts " + why; return false; }
+        for (const np::RouteSpec& o : specs)   // two hosts may share layers only with disjoint expert ranges
+            if (np::routes_conflict(rs, o)) { err = "overlapping layer and expert ranges in --remote-experts: " + item; return false; }
+        specs.push_back(rs);
+        Route r;
+        r.host = rs.host; r.port = rs.port; r.lo = rs.lo; r.hi = rs.hi; r.elo = rs.elo; r.ehi = rs.ehi;
         if (!connect_route(r, timeout_ms(), err)) return false;
-        std::fprintf(stderr, "strata net: expert server %s:%d serves layers %d-%d for this conductor (auth %s, %s kernels, timeout %d ms)\n",
-                     r.host.c_str(), r.port, r.lo, r.hi, token_.empty() ? "off" : "token", net_isa_name(id_.isa).c_str(), timeout_ms());
+        std::fprintf(stderr, "strata net: expert server %s:%d serves layers %d-%d experts %d-%d for this conductor (auth %s, %s kernels, timeout %d ms)\n",
+                     r.host.c_str(), r.port, r.lo, r.hi, r.elo, r.ehi, token_.empty() ? "off" : "token", net_isa_name(id_.isa).c_str(), timeout_ms());
         routes_.push_back(r);
     }
     if (routes_.empty()) { err = "--remote-experts is empty"; return false; }
+    inflight_.assign(routes_.size(), InFlight());
     return true;
+}
+
+bool NetExperts::covers(int64_t layer) const {
+    std::vector<np::RouteSpec> rs;
+    for (const Route& r : routes_) { np::RouteSpec s; s.lo = r.lo; s.hi = r.hi; s.elo = r.elo; s.ehi = r.ehi; rs.push_back(s); }
+    return np::layer_covered(rs, layer, n_expert_);
 }
 
 NetExperts::~NetExperts() {
     for (Route& r : routes_) {
         if (r.fd >= 0) { send_frame((sock_t) r.fd, kBye, nullptr, 0); sock_close((sock_t) r.fd); }
         if (r.calls > 0)
-            std::fprintf(stderr, "strata net: %s:%d layers %d-%d: %llu calls, mean round trip %.3f ms (server compute %.3f ms, max rtt %.3f ms), "
-                                 "%.1f KB out / %.1f KB in per call\n",
-                         r.host.c_str(), r.port, r.lo, r.hi, (unsigned long long) r.calls, r.rtt_ms / (double) r.calls,
+            std::fprintf(stderr, "strata net: %s:%d layers %d-%d experts %d-%d: %llu calls, mean round trip %.3f ms (server compute %.3f ms, "
+                                 "max rtt %.3f ms), %.1f KB out / %.1f KB in per call\n",
+                         r.host.c_str(), r.port, r.lo, r.hi, r.elo, r.ehi, (unsigned long long) r.calls, r.rtt_ms / (double) r.calls,
                          r.server_ms / (double) r.calls, r.rtt_max_ms, (double) r.bytes_out / (double) r.calls / 1024.0,
                          (double) r.bytes_in / (double) r.calls / 1024.0);
         if (r.p_calls > 0)
@@ -429,58 +442,10 @@ NetExperts::~NetExperts() {
             std::fprintf(stderr, "strata net: %s:%d: %llu outage(s), %llu reconnect(s), %llu expert rows computed locally instead\n",
                          r.host.c_str(), r.port, (unsigned long long) r.outages, (unsigned long long) r.reconnects, (unsigned long long) r.local_rows);
     }
-}
-
-bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
-                        float* const* dst, std::string& err) {
-    const int ri = route_of(layer);
-    if (ri < 0) { err = "no expert server serves layer " + std::to_string(layer); return false; }
-    if (cur_ >= 0) { err = "a decode request is in flight"; return false; }
-    Route& r = routes_[(size_t) ri];
-    if (r.top_k > 0 && k != r.top_k) { err = "the server routes " + std::to_string(r.top_k) + " experts per token, not " + std::to_string(k); return false; }
-    if (r.fd < 0) {   // down: as in begin(), retry once the backoff has passed
-        if (now_ms() < r.retry_at_ms) { err = "expert server " + r.host + " is down"; return false; }
-        std::string cerr;
-        if (!connect_route(r, std::min(timeout_ms(), 2000), cerr)) { mark_down(r, cerr); err = cerr; return false; }
-        ++r.reconnects;
-        std::fprintf(stderr, "strata net: expert server %s:%d (layers %d-%d) is back\n", r.host.c_str(), r.port, r.lo, r.hi);
-    }
-    auto fail = [&](const std::string& m) { err = "expert server " + r.host + " (prompt, layer " + std::to_string(layer) + "): " + m; mark_down(r, err); return false; };
-    const double t_start = now_ms();
-    std::vector<uint8_t> resp;
-    for (const np::PromptWindow& pw : np::prompt_windows(T, k, mask, strata::kernels::kWindowMaxT)) {
-        const int64_t t0w = pw.t0, nt = pw.nt, n = nt * k;
-        const uint8_t* m = mask + t0w * k;
-        const uint32_t want = pw.want;
-        const size_t mask_len = (size_t) ((n + 3) / 4 * 4);
-        buf_.clear();
-        put<uint32_t>(buf_, (uint32_t) layer); put<uint32_t>(buf_, (uint32_t) nt); put<uint32_t>(buf_, (uint32_t) k);
-        put<uint32_t>(buf_, 1u); put<uint64_t>(buf_, ++seq_);   // window-invariant: a row does not depend on its window
-        const size_t at = buf_.size();
-        buf_.resize(at + (size_t) n * 4 + mask_len + (size_t) nt * H * 4, 0);
-        std::memcpy(buf_.data() + at, ids + t0w * k, (size_t) n * 4);
-        for (int64_t i = 0; i < n; ++i) buf_[at + (size_t) n * 4 + (size_t) i] = m[i] ? 1 : 0;
-        std::memcpy(buf_.data() + at + (size_t) n * 4 + mask_len, x + (size_t) t0w * H, (size_t) nt * H * 4);
-        if (!send_frame((sock_t) r.fd, kReq, buf_.data(), buf_.size())) return fail("send failed: " + g_why);
-        r.p_bytes_out += buf_.size() + sizeof(Hdr);
-        uint32_t type = 0;
-        if (!recv_frame((sock_t) r.fd, type, resp, kMaxRespFrame)) return fail(g_why);
-        if (type == kErr) return fail("server refused the request: " + std::string(resp.begin(), resp.end()));
-        uint64_t seq = 0; double server_us = 0; uint32_t rows = 0;
-        if (type == kResp && resp.size() >= 24) {
-            std::memcpy(&seq, resp.data(), 8); std::memcpy(&server_us, resp.data() + 8, 8); std::memcpy(&rows, resp.data() + 16, 4);
-        }
-        if (type != kResp || seq != seq_ || rows != want || resp.size() != 24 + (size_t) rows * H * 4)
-            return fail("response does not match the request");
-        const float* src = (const float*) (resp.data() + 24);
-        size_t q = 0;
-        for (int64_t i = 0; i < n; ++i)
-            if (m[i]) std::memcpy(dst[(size_t) (t0w * k + i)], src + (q++) * (size_t) H, (size_t) H * 4);
-        ++r.p_calls; r.p_rows += rows; r.p_server_ms += server_us / 1000.0; r.p_bytes_in += resp.size() + sizeof(Hdr);
-    }
-    r.p_ms += now_ms() - t_start;
-    if (r.backoff_ms != 0) r.backoff_ms = 0;
-    return true;
+    if (layer_calls_ > 0)
+        std::fprintf(stderr, "strata net: decode: %llu layer calls, %llu with 2+ hosts in flight at once; mean wait for the answers after the "
+                             "local CPU work %.3f ms\n", (unsigned long long) layer_calls_, (unsigned long long) multi_calls_,
+                     wait_ms_ / (double) layer_calls_);
 }
 
 void NetExperts::mark_down(Route& r, const std::string& why) {
@@ -495,77 +460,197 @@ void NetExperts::mark_down(Route& r, const std::string& why) {
 
 void NetExperts::abandon() {
     if (cur_ < 0) return;
-    Route& r = routes_[(size_t) cur_];
     cur_ = -1;
-    mark_down(r, "the request was dropped before its answer was read");
+    for (size_t ri = 0; ri < routes_.size(); ++ri)
+        if (inflight_[ri].active) { inflight_[ri].active = false; mark_down(routes_[ri], "the request was dropped before its answer was read"); }
+}
+
+/// A route that is down is retried once its backoff has passed (a short connect timeout: a dead host must not stall decode).
+bool NetExperts::route_up(Route& r) {
+    if (r.fd >= 0) return true;
+    if (now_ms() < r.retry_at_ms) return false;
+    std::string cerr;
+    if (!connect_route(r, std::min(timeout_ms(), 2000), cerr)) { mark_down(r, cerr); return false; }
+    ++r.reconnects;
+    std::fprintf(stderr, "strata net: expert server %s:%d (layers %d-%d) is back\n", r.host.c_str(), r.port, r.lo, r.hi);
+    return true;
+}
+
+bool NetExperts::send_req(Route& r, int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, const uint8_t* mask,
+                          int arith, uint64_t& seq, std::vector<uint8_t>& buf) {
+    const int64_t n = n_tok * k;
+    const size_t mask_len = (size_t) ((n + 3) / 4 * 4);
+    buf.clear();
+    put<uint32_t>(buf, (uint32_t) layer); put<uint32_t>(buf, (uint32_t) n_tok); put<uint32_t>(buf, (uint32_t) k);
+    put<uint32_t>(buf, (uint32_t) arith); seq = ++seq_; put<uint64_t>(buf, seq);
+    const size_t at = buf.size();
+    buf.resize(at + (size_t) n * 4 + mask_len + (size_t) n_tok * H * 4, 0);
+    std::memcpy(buf.data() + at, ids, (size_t) n * 4);
+    for (int64_t i = 0; i < n; ++i) buf[at + (size_t) n * 4 + (size_t) i] = mask[i] ? 1 : 0;
+    std::memcpy(buf.data() + at + (size_t) n * 4 + mask_len, x, (size_t) n_tok * H * 4);
+    return send_frame((sock_t) r.fd, kReq, buf.data(), buf.size());
+}
+
+std::string NetExperts::recv_resp(Route& r, uint64_t seq, uint32_t want, std::vector<uint8_t>& resp, double& server_us) {
+    uint32_t type = 0;
+    server_us = 0;
+    if (!recv_frame((sock_t) r.fd, type, resp, kMaxRespFrame)) return g_why.empty() ? std::string("receive failed") : g_why;
+    if (type == kErr) return "server refused the request: " + std::string(resp.begin(), resp.end());
+    if (type != kResp || resp.size() < 24) return "bad response";
+    uint64_t rseq; uint32_t rows;
+    std::memcpy(&rseq, resp.data(), 8); std::memcpy(&server_us, resp.data() + 8, 8); std::memcpy(&rows, resp.data() + 16, 4);
+    if (rseq != seq || rows != want || resp.size() != 24 + (size_t) rows * H * 4) return "response does not match the request";
+    return std::string();
 }
 
 bool NetExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, int32_t* kind,
                        int arith, std::string& err) {
     cur_ = -1;
-    const int ri = route_of(layer);
-    if (ri < 0) return true;
-    Route& r = routes_[(size_t) ri];
-    const int64_t n = n_tok * k;
-    mask_.assign((size_t) ((n + 3) / 4 * 4), 0);
     owned_.clear();
-    for (int64_t i = 0; i < n; ++i)
-        if (kind[i] == -1 && ids[i] >= 0 && ids[i] < n_expert_) { mask_[(size_t) i] = 1; owned_.push_back((int32_t) i); }
-    if (owned_.empty()) return true;
-    if (r.top_k > 0 && k != r.top_k) { owned_.clear(); return true; }   // not the model the server was started for: local
-    if (r.fd < 0) {   // down: retry when the backoff has passed (a short connect timeout: a dead host must not stall decode)
-        if (now_ms() < r.retry_at_ms) { r.local_rows += owned_.size(); owned_.clear(); return true; }
-        std::string cerr;
-        if (!connect_route(r, std::min(timeout_ms(), 2000), cerr)) {
-            mark_down(r, cerr);
-            r.local_rows += owned_.size(); owned_.clear();
-            return true;
+    const int64_t n = n_tok * k;
+    int sent = 0;
+    for (size_t ri = 0; ri < routes_.size(); ++ri) {
+        Route& r = routes_[ri];
+        InFlight& f = inflight_[ri];
+        f.active = false;
+        if (layer < r.lo || layer > r.hi) continue;
+        f.mask.assign((size_t) n, 0);
+        f.owned.clear();
+        for (int64_t i = 0; i < n; ++i)
+            if (kind[i] == -1 && ids[i] >= r.elo && ids[i] <= r.ehi && ids[i] < n_expert_) { f.mask[(size_t) i] = 1; f.owned.push_back((int32_t) i); }
+        if (f.owned.empty()) continue;
+        if (r.top_k > 0 && k != r.top_k) continue;   // not the model the server was started for: local
+        if (!route_up(r)) { r.local_rows += f.owned.size(); continue; }
+        if (!send_req(r, layer, x, ids, n_tok, k, f.mask.data(), arith, f.seq, f.buf)) {
+            err = "send failed (layer " + std::to_string(layer) + "): " + g_why;
+            mark_down(r, err);
+            r.local_rows += f.owned.size();
+            continue;   // nothing marked: the CPU work covers those rows
         }
-        ++r.reconnects;
-        std::fprintf(stderr, "strata net: expert server %s:%d (layers %d-%d) is back\n", r.host.c_str(), r.port, r.lo, r.hi);
+        r.bytes_out += f.buf.size() + sizeof(Hdr);
+        f.t_send = now_ms();
+        f.active = true;
+        ++sent;
     }
-    buf_.clear();
-    put<uint32_t>(buf_, (uint32_t) layer); put<uint32_t>(buf_, (uint32_t) n_tok); put<uint32_t>(buf_, (uint32_t) k);
-    put<uint32_t>(buf_, (uint32_t) arith); put<uint64_t>(buf_, ++seq_);
-    const size_t at = buf_.size();
-    buf_.resize(at + (size_t) n * 4 + mask_.size() + (size_t) n_tok * H * 4);
-    std::memcpy(buf_.data() + at, ids, (size_t) n * 4);
-    std::memcpy(buf_.data() + at + (size_t) n * 4, mask_.data(), mask_.size());
-    std::memcpy(buf_.data() + at + (size_t) n * 4 + mask_.size(), x, (size_t) n_tok * H * 4);
-    t_send_ms_ = now_ms();
-    if (!send_frame((sock_t) r.fd, kReq, buf_.data(), buf_.size())) {
-        err = "send failed (layer " + std::to_string(layer) + "): " + g_why;
-        mark_down(r, err);
-        r.local_rows += owned_.size(); owned_.clear();
-        return true;   // nothing marked: the CPU work covers every row
-    }
-    r.bytes_out += buf_.size() + sizeof(Hdr);
-    for (int32_t i : owned_) kind[i] = 3;   // staged by finish() into this row
-    cur_ = ri;
-    cur_n_ = n;
+    if (sent == 0) return true;
+    for (const InFlight& f : inflight_)   // staged by finish() into these rows
+        if (f.active) for (int32_t i : f.owned) { kind[i] = 3; owned_.push_back(i); }
+    cur_ = 0;
+    ++layer_calls_;
+    if (sent > 1) ++multi_calls_;
     return true;
 }
 
 bool NetExperts::finish(float* out, std::string& err) {
     if (cur_ < 0) return true;
-    Route& r = routes_[(size_t) cur_];
     cur_ = -1;
-    auto bad = [&](const std::string& m) { err = m; mark_down(r, m); r.local_rows += owned_.size(); return false; };
-    uint32_t type = 0;
-    std::vector<uint8_t> resp;
-    if (!recv_frame((sock_t) r.fd, type, resp, kMaxRespFrame)) return bad(g_why);
-    if (type == kErr) return bad("server refused the request: " + std::string(resp.begin(), resp.end()));
-    if (type != kResp || resp.size() < 24) return bad("bad response");
-    uint64_t seq; double server_us; uint32_t rows;
-    std::memcpy(&seq, resp.data(), 8); std::memcpy(&server_us, resp.data() + 8, 8); std::memcpy(&rows, resp.data() + 16, 4);
-    if (seq != seq_ || rows != owned_.size() || resp.size() != 24 + (size_t) rows * H * 4) return bad("response does not match the request");
-    const float* src = (const float*) (resp.data() + 24);
-    for (size_t q = 0; q < owned_.size(); ++q)
-        std::memcpy(out + (size_t) owned_[q] * H, src + q * (size_t) H, (size_t) H * 4);
-    const double rtt = now_ms() - t_send_ms_;
-    r.rtt_ms += rtt; r.server_ms += server_us / 1000.0; ++r.calls; r.bytes_in += resp.size() + sizeof(Hdr);
-    if (rtt > r.rtt_max_ms) r.rtt_max_ms = rtt;
-    if (r.backoff_ms != 0) r.backoff_ms = 0;   // a healthy call ends the outage's backoff
+    owned_.clear();   // from here: the entries the caller must compute itself (those of the hosts that failed)
+    const double tw = now_ms();
+    bool ok = true;
+    for (size_t ri = 0; ri < routes_.size(); ++ri) {
+        InFlight& f = inflight_[ri];
+        if (!f.active) continue;
+        f.active = false;
+        Route& r = routes_[ri];
+        double server_us = 0;
+        const std::string why = recv_resp(r, f.seq, (uint32_t) f.owned.size(), resp_, server_us);
+        if (!why.empty()) {   // this host's rows are the caller's; the other hosts' answers are still read (their streams stay in step)
+            err = why;
+            mark_down(r, why);
+            r.local_rows += f.owned.size();
+            owned_.insert(owned_.end(), f.owned.begin(), f.owned.end());
+            ok = false;
+            continue;
+        }
+        const float* src = (const float*) (resp_.data() + 24);
+        for (size_t q = 0; q < f.owned.size(); ++q)
+            std::memcpy(out + (size_t) f.owned[q] * H, src + q * (size_t) H, (size_t) H * 4);
+        const double rtt = now_ms() - f.t_send;
+        r.rtt_ms += rtt; r.server_ms += server_us / 1000.0; ++r.calls; r.bytes_in += resp_.size() + sizeof(Hdr);
+        if (rtt > r.rtt_max_ms) r.rtt_max_ms = rtt;
+        if (r.backoff_ms != 0) r.backoff_ms = 0;   // a healthy call ends the outage's backoff
+    }
+    wait_ms_ += now_ms() - tw;
+    std::sort(owned_.begin(), owned_.end());
+    return ok;
+}
+
+bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
+                        float* const* dst, std::string& err) {
+    if (cur_ >= 0) { err = "a decode request is in flight"; return false; }
+    static const int depth = [] { const char* v = std::getenv("STRATA_NET_PIPELINE"); return v ? std::max(1, std::atoi(v)) : 4; }();
+    struct Req { int64_t t0w, nt; uint64_t seq; uint32_t want; };
+    std::vector<size_t> rts;   // the hosts of this layer
+    for (size_t ri = 0; ri < routes_.size(); ++ri) {
+        Route& r = routes_[ri];
+        if (layer < r.lo || layer > r.hi) continue;
+        if (r.top_k > 0 && k != r.top_k) { err = "the server routes " + std::to_string(r.top_k) + " experts per token, not " + std::to_string(k); return false; }
+        if (!route_up(r)) { err = "expert server " + r.host + " is down"; return false; }
+        rts.push_back(ri);
+    }
+    if (rts.empty()) { err = "no expert server serves layer " + std::to_string(layer); return false; }
+    std::vector<std::vector<Req>> q(routes_.size());   // per host, in send order (one socket each: its answers come in order)
+    std::vector<size_t> head(routes_.size(), 0);
+    std::vector<uint8_t> m;
+    bool failed = false;
+    auto drain_one = [&](size_t ri) -> bool {   // the oldest answer of host ri
+        const Req rq = q[ri][head[ri]++];
+        Route& r = routes_[ri];
+        double server_us = 0;
+        const std::string why = recv_resp(r, rq.seq, rq.want, resp_, server_us);
+        if (!why.empty()) {
+            err = "expert server " + r.host + " (prompt, layer " + std::to_string(layer) + "): " + why;
+            mark_down(r, err);
+            return false;
+        }
+        const float* src = (const float*) (resp_.data() + 24);
+        size_t qq = 0;
+        for (int64_t i = rq.t0w * k; i < (rq.t0w + rq.nt) * k; ++i)
+            if (mask[i] && ids[i] >= r.elo && ids[i] <= r.ehi) std::memcpy(dst[(size_t) i], src + (qq++) * (size_t) H, (size_t) H * 4);
+        ++r.p_calls; r.p_rows += rq.want; r.p_server_ms += server_us / 1000.0; r.p_bytes_in += resp_.size() + sizeof(Hdr);
+        return true;
+    };
+    const double t_start = now_ms();
+    // each host's share of every window (the entries asked for whose expert it owns), sent round-robin over the hosts so
+    // they all work at once, each with at most `depth` windows unanswered
+    std::vector<std::vector<uint8_t>> own(routes_.size());
+    std::vector<std::vector<np::PromptWindow>> wins(routes_.size());
+    size_t most = 0;
+    for (size_t ri : rts) {
+        const Route& r = routes_[ri];
+        own[ri].assign((size_t) (T * k), 0);
+        for (int64_t i = 0; i < T * k; ++i) own[ri][(size_t) i] = mask[i] && ids[i] >= r.elo && ids[i] <= r.ehi ? 1 : 0;
+        wins[ri] = np::prompt_windows(T, k, own[ri].data(), strata::kernels::kWindowMaxT);
+        most = std::max(most, wins[ri].size());
+    }
+    for (size_t w = 0; w < most && !failed; ++w)
+        for (size_t ri : rts) {
+            if (w >= wins[ri].size()) continue;
+            Route& r = routes_[ri];
+            const np::PromptWindow& pw = wins[ri][w];
+            while (q[ri].size() - head[ri] >= (size_t) depth)   // bounded: neither side's socket buffers fill up
+                if (!drain_one(ri)) { failed = true; break; }
+            if (failed) break;
+            uint64_t seq = 0;
+            // arith 1, window-invariant: a row does not depend on its window (the local reference / fallback uses it too)
+            if (!send_req(r, layer, x + (size_t) pw.t0 * H, ids + pw.t0 * k, pw.nt, k, own[ri].data() + pw.t0 * k, 1, seq, buf_)) {
+                err = "expert server " + r.host + " (prompt, layer " + std::to_string(layer) + "): send failed: " + g_why;
+                mark_down(r, err);
+                failed = true;
+                break;
+            }
+            r.p_bytes_out += buf_.size() + sizeof(Hdr);
+            q[ri].push_back(Req{pw.t0, pw.nt, seq, pw.want});
+        }
+    for (size_t ri : rts)   // every answer still owed is read (or its host dropped), so no stream is left behind
+        while (!failed && head[ri] < q[ri].size())
+            if (!drain_one(ri)) failed = true;
+    if (failed) {
+        for (size_t ri : rts) if (head[ri] < q[ri].size() && routes_[ri].fd >= 0) mark_down(routes_[ri], "a prompt request failed on another host");
+        return false;
+    }
+    const double ms = now_ms() - t_start;
+    for (size_t ri : rts) { routes_[ri].p_ms += ms; if (routes_[ri].backoff_ms != 0) routes_[ri].backoff_ms = 0; }
     return true;
 }
 
@@ -739,6 +824,7 @@ int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
     C.tmo_ms = timeout_ms();
     C.lim.layer_lo = lo; C.lim.layer_hi = hi; C.lim.n_embd = H; C.lim.n_expert = cfg.n_expert; C.lim.top_k = cfg.top_k;
     C.lim.max_tok = strata::kernels::kWindowMaxT; C.lim.max_entries = strata::kernels::kWindowMaxEntries;
+    C.lim.expert_lo = cfg.expert_lo; C.lim.expert_hi = cfg.expert_hi;   // B5: a request for an expert another host owns is refused
     ExpertServeCfg cfg2 = cfg;
     cfg2.layer_hi = hi;
     C.cfg = &cfg2;
@@ -777,8 +863,9 @@ int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
         std::fprintf(stderr, "strata net: cannot listen on %s:%d (errno %d)\n", cfg.host.c_str(), cfg.port, bind_errno);
         return 1;
     }
-    std::fprintf(stderr, "strata net: expert server listening on %s:%d, layers %d-%d, %lld experts per layer, auth %s, timeout %d ms\n", bound, cfg.port,
-                 lo, hi, (long long) cfg.n_expert, C.token.empty() ? "off" : "token", C.tmo_ms);
+    std::fprintf(stderr, "strata net: expert server listening on %s:%d, layers %d-%d, experts %d-%d of %lld, auth %s, timeout %d ms\n", bound, cfg.port,
+                 lo, hi, cfg.expert_lo, cfg.expert_hi < 0 ? (int) cfg.n_expert - 1 : cfg.expert_hi, (long long) cfg.n_expert,
+                 C.token.empty() ? "off" : "token", C.tmo_ms);
     if (!loopback)
         std::fprintf(stderr, "strata net: WARNING: %s is not a loopback address: any host that can reach port %d may connect%s. Trusted LAN only: "
                              "set STRATA_EXPERT_TOKEN and firewall the port to the conductor's address\n", bound, cfg.port,

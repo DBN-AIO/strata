@@ -189,6 +189,7 @@ inline bool parse_hostport(const std::string& spec, const std::string& def_host,
 //              f32 x[n_tok*n_embd]
 struct ReqLimits {
     int layer_lo = 0, layer_hi = -1;       ///< served layers (inclusive)
+    int expert_lo = 0, expert_hi = -1;     ///< served experts (inclusive, --serve-experts); hi < 0: every expert
     int64_t n_embd = 0, n_expert = 0, top_k = 0;
     int64_t max_tok = 0, max_entries = 0;  ///< the engine's window: rows, and rows x k
 };
@@ -226,6 +227,9 @@ inline std::string parse_req(const ReqLimits& L, const uint8_t* p, size_t len, R
         std::memcpy(&id, p + kReqHead + i * 4, 4);
         if (id < 0 || id >= L.n_expert) return "expert id " + std::to_string(id) + " outside 0.." + std::to_string(L.n_expert - 1) + " (entry " + std::to_string(i) + ")";
         if (v.mask[i] > 1) return "mask byte " + std::to_string(v.mask[i]) + " is not 0 or 1 (entry " + std::to_string(i) + ")";
+        if (v.mask[i] && L.expert_hi >= 0 && (id < L.expert_lo || id > L.expert_hi))
+            return "expert " + std::to_string(id) + " is not served here (experts " + std::to_string(L.expert_lo) + "-" +
+                   std::to_string(L.expert_hi) + ", entry " + std::to_string(i) + ")";
         v.rows += v.mask[i];
     }
     return std::string();
@@ -254,22 +258,56 @@ inline std::vector<PromptWindow> prompt_windows(int64_t T, int64_t k, const uint
 /// served layers lo..hi in their order, each once, then every served pair the ranking does not name, expert-major (so a
 /// fill that runs out of room spreads its misses across the layers).  Pairs outside lo..hi or 0..n_expert-1 are dropped:
 /// a server computes only its own layers, and a helper slot spent on another layer is a served expert left on the CPU.
+/// B5: `elo`..`ehi` (default every expert) limits it to the experts this server owns (--serve-experts).
 inline std::vector<std::pair<int32_t, int32_t>> served_pairs(const std::vector<std::pair<int32_t, int32_t>>& ranked,
-                                                             int64_t n_layers, int64_t n_expert, int lo, int hi) {
+                                                             int64_t n_layers, int64_t n_expert, int lo, int hi,
+                                                             int elo = 0, int ehi = -1) {
     std::vector<std::pair<int32_t, int32_t>> out;
-    if (n_layers <= 0 || n_expert <= 0 || lo < 0 || hi < lo || hi >= n_layers) return out;
+    if (ehi < 0) ehi = (int) n_expert - 1;
+    if (n_layers <= 0 || n_expert <= 0 || lo < 0 || hi < lo || hi >= n_layers || elo < 0 || ehi < elo || ehi >= n_expert) return out;
     std::vector<uint8_t> seen((size_t) n_layers * (size_t) n_expert, 0);
     for (const auto& pr : ranked) {
-        if (pr.first < lo || pr.first > hi || pr.second < 0 || pr.second >= n_expert) continue;
+        if (pr.first < lo || pr.first > hi || pr.second < elo || pr.second > ehi) continue;
         uint8_t& s = seen[(size_t) pr.first * (size_t) n_expert + (size_t) pr.second];
         if (s) continue;
         s = 1;
         out.push_back(pr);
     }
-    for (int64_t e = 0; e < n_expert; ++e)
+    for (int64_t e = elo; e <= ehi; ++e)
         for (int64_t l = lo; l <= hi; ++l)
             if (!seen[(size_t) l * (size_t) n_expert + (size_t) e]) out.emplace_back((int32_t) l, (int32_t) e);
     return out;
+}
+
+// ---------------------------------------------------------------- B5: several hosts per layer, by expert range
+/// One --remote-experts item: host:port=lo-hi[/e0-e1] (layers lo..hi; experts e0..e1, default every expert).
+struct RouteSpec { std::string host; int port = 7840; int lo = 0, hi = 0, elo = 0, ehi = 0; };
+inline bool parse_route_item(const std::string& item, int64_t n_layers, int64_t n_expert, RouteSpec& r, std::string& why) {
+    const size_t eq = item.rfind('=');
+    if (eq == std::string::npos) { why = "item needs host:port=lo-hi[/e0-e1]: " + item; return false; }
+    std::string lh = item.substr(eq + 1), er;
+    const size_t sl = lh.find('/');
+    if (sl != std::string::npos) { er = lh.substr(sl + 1); lh = lh.substr(0, sl); }
+    if (!parse_hostport(item.substr(0, eq), "", 7840, false, r.host, r.port, why)) return false;
+    if (!parse_range(lh, 0, (long) n_layers - 1, r.lo, r.hi)) { why = "layer range out of range: " + item; return false; }
+    r.elo = 0;
+    r.ehi = (int) n_expert - 1;
+    if (sl != std::string::npos && !parse_range(er, 0, (long) n_expert - 1, r.elo, r.ehi)) { why = "expert range out of range: " + item; return false; }
+    return true;
+}
+/// Two routes conflict when they share a layer AND an expert (each (layer, expert) has one owner).
+inline bool routes_conflict(const RouteSpec& a, const RouteSpec& b) {
+    return !(a.hi < b.lo || a.lo > b.hi) && !(a.ehi < b.elo || a.elo > b.ehi);
+}
+/// The routes of `layer` together own every one of its n_expert experts.
+inline bool layer_covered(const std::vector<RouteSpec>& rs, int64_t layer, int64_t n_expert) {
+    if (n_expert <= 0) return false;
+    std::vector<uint8_t> own((size_t) n_expert, 0);
+    for (const RouteSpec& r : rs)
+        if (layer >= r.lo && layer <= r.hi)
+            for (int e = r.elo < 0 ? 0 : r.elo; e <= r.ehi && e < n_expert; ++e) own[(size_t) e] = 1;
+    for (uint8_t o : own) if (!o) return false;
+    return true;
 }
 
 }  // namespace strata::core::netproto

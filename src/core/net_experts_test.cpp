@@ -145,6 +145,29 @@ int main() {
         check(w.size() == 2 && w[1].t0 == 8 && w[1].nt == 8 && w[0].want == 80, "prompt_windows: exact multiple of the window");
     }
 
+    {   // ---- B5: routes with expert ranges, the owner rule, coverage, the server's expert range
+        RouteSpec a, b, c;
+        std::string w;
+        check(parse_route_item("127.0.0.1:7841=38-47/0-255", 48, 512, a, w) && a.host == "127.0.0.1" && a.port == 7841 && a.lo == 38 &&
+              a.hi == 47 && a.elo == 0 && a.ehi == 255, "route item with an expert range");
+        check(parse_route_item("rig=38-47", 48, 512, b, w) && b.port == 7840 && b.elo == 0 && b.ehi == 511, "route item without: every expert");
+        check(!parse_route_item("rig=38-47/0-512", 48, 512, c, w), "expert range past n_expert refused");
+        check(!parse_route_item("rig=38-47/x", 48, 512, c, w) && !parse_route_item("rig=38-48", 48, 512, c, w), "bad ranges refused");
+        check(routes_conflict(a, b), "same layers, overlapping experts conflict");
+        check(parse_route_item("[::1]:7850=38-47/256-511", 48, 512, c, w) && c.host == "::1" && !routes_conflict(a, c),
+              "same layers, disjoint experts do not conflict");
+        check(layer_covered({a, c}, 40, 512) && !layer_covered({a}, 40, 512) && !layer_covered({a, c}, 37, 512), "coverage per layer");
+        ReqLimits L3; L3.layer_lo = 24; L3.layer_hi = 47; L3.n_embd = 4; L3.n_expert = 512; L3.top_k = 3; L3.max_tok = 8;
+        L3.max_entries = 128; L3.expert_lo = 256; L3.expert_hi = 511;
+        ReqView v3;
+        auto p_in = make_req(30, 2, 3, 0, {256, 300, 511, 256, 1, 2}, {1, 1, 1, 1, 0, 0}, 4);
+        check(parse_req(L3, p_in.data(), p_in.size(), v3).empty(), "server expert range: owned experts asked for, others unmasked");
+        auto p_out = make_req(30, 2, 3, 0, {256, 300, 511, 256, 1, 2}, {1, 1, 1, 1, 1, 0}, 4);
+        check(!parse_req(L3, p_out.data(), p_out.size(), v3).empty(), "server expert range: a masked expert outside it refused");
+        const auto sp = served_pairs({{38, 300}, {38, 5}, {39, 256}}, 48, 512, 38, 39, 256, 511);
+        check(sp.size() == 512 && sp[0] == std::make_pair(38, 300) && sp[1] == std::make_pair(39, 256), "served_pairs with an expert range");
+    }
+
     if (g_fail == 0) std::printf("net_experts_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }
