@@ -15,6 +15,7 @@ what is DeepSeek-specific is written down in docs/REMOTE_EXPERTS.md, "DeepSeek-V
 | synthetic DeepSeek-shaped model, local vs split, 64 tokens | passes (CI step, 15 checks) |
 | real weights, real split | **not run**: `/mnt/bulk/strata/models/deepseek41/RESULTS.md` did not exist when this was written (the 2.00 bpw set is on disk, 4 shards, sha256 ok). Tools are ready: `slice_stream.py`, `plan_split.py`, the server flags below |
 | GPU expert server for dsv41 (rig 72 GB VRAM, stream 5070 Ti) | not done; needs the engine's VRAM expert slots behind `serve_experts` (see "Next") |
+| parallel remote calls, conductor work overlapped with the servers (BBXL S4) | done, measured on synthetic packs (T340 + rig): "Parallel remote calls (BBXL S4)"; the real engine has not run it |
 | prompt path through the servers | not done: the chunked prompt path streams experts from the conductor's own files, so the conductor needs the whole model on its disk |
 
 ## Commands
@@ -216,6 +217,63 @@ prompts of the order need the real engine: not run.) Commands: `~/max2work/s3_to
 its `--expert-profile`; pass the same counts there. (3) The CUDA `strata-dsv41` binary was not built here (no CUDA on the T340): the conductor change is in `ds4_net.cpp`, which
 the CPU build compiles and `ds4_net_test` exercises, and the engine reaches it unchanged through `net::Remote::run`. (4) A GPU expert server that places the hottest RANKS in VRAM
 (not whole layers) would make the remote GPU tier worth more than this estimate says.
+
+## Parallel remote calls (BBXL S4)
+
+Captain 1's order (2026-11-03, #22829): split each layer's experts across hosts and call them at the same time (doc ceiling about 12 tok/s against 7.4
+asked one after the other); pipeline the next layer's routing.
+
+**What was already there, and what was added.** The Qwen engine's request pipelining (B5, `NetExperts::begin`) is in `core` and dsv41's `net::Remote` already
+called it: `begin` writes the layer's request to EVERY host that owns one of its entries before any answer is read, `finish` reads them in route order, so a
+layer waits for the slowest host. Rows are written to fixed positions, so the result is bit-identical to a one-host run. What dsv41 did NOT do: `Remote::run`
+was ask-and-wait, so the conductor's own experts (the ranks no route owns) only started once every server had answered.
+
+| Piece | Change |
+| --- | --- |
+| `net::Remote::begin` / `finish` (`ds4_net.cpp`) | `run` split in two. `begin` sends every route's request and says which items are on their way (`pending[q]`); the caller computes the others NOW; `finish` reads the answers. `run` = `begin` + `finish`, unchanged for every other caller. A host that fails in `finish` leaves its items to the caller, as before. |
+| `cpu_experts` (`ds4_model.cu`) | begin, the conductor's own experts (`cpu_experts_local`), finish, then the items of a failed host. Same rows, bit for bit: every entry is computed independently of the others. |
+| `STRATA_NET_SERIAL=1` (`net_experts.cpp`) | measurement hook, off by default: the answer is read right after each send, so the hosts of a layer are asked one after the other (the "before" arm). |
+| test hooks | `STRATA_DS4_SERVER_DELAY_MS` (a server answers N ms late), `ds4_net_test --overlap`, `--local-delay-ms N` (the conductor's lane costs N ms a layer), `--prompt-salt N` (another prompt: a unique prefix for every timing run). |
+
+**Why the next layer's routing cannot be pipelined.** Layer l+1's input is layer l's output: the weighted sum of the picked experts plus the shared expert and the
+residual, then the next layer's attention and norm. Its routing, and so its request, needs that row; nothing of it exists before layer l's answers are in. The
+only work that does not depend on the answers is inside the layer: the conductor's own experts (now overlapped) and the shared expert and GPU experts (already
+concurrent with the CPU lane). A speculative next-layer request (guessing the experts from the profile, as `ahead_ask` does for the SSD) would only prefetch weights,
+and a server's experts are resident already. So the overlap is "as far as the data allows", as for Qwen B5. (With several tokens in a window, as the drafter's verify
+windows are, all of a layer's tokens already go in one request.)
+
+**Tests (CI: `tools/dsv41/synthetic_split_test.py`, steps 3c-3e; failing first).** Run against the base binaries the new checks fail (`unknown option --overlap`, no server delay
+hook: 7 failures); on this branch all pass (0 failures, whole script). The timing checks inject the delay (30 ms a server, 25 ms for the conductor's lane) so they hold on a loaded host.
+
+| Check | Expected | Measured |
+| --- | --- | --- |
+| two servers (experts 0-15 / 16-31), 30 ms each, 8 layers, tokens and row hash vs the local run | identical; a token about 8 x 30 ms, not 8 x 60 | identical, 243 ms |
+| the same with `STRATA_NET_SERIAL=1` (before) | the sum, 480 ms | 473 ms |
+| the conductor's own experts 25 ms a layer, one server 30 ms: asked, then computed | 8 x 55 = 440 ms | 432 ms |
+| the same with `--overlap` | the longer of the two, 8 x 30 = 240 ms | 240 ms |
+| `--overlap` and the server dies after 40 requests | identical tokens and rows through the local fallback | identical, remote and local rows both used |
+
+**Measured on real shapes (T340 conductor, the T340's server on loopback and the rig's over an ssh tunnel; CPU kernels).** Pack: 4 layers x 32 experts, hidden 5120, ffn 2304,
+the 2.00 mix of types (`make_synthetic_pack.py --fast`), 64 greedy tokens, one warm-up run not counted, then five runs each with its own prompt (`--prompt-salt` 1-5, so no
+two runs share a prefix). Expert rows are the local run's in every run (row hash equal for all five prompts). `ms/token` is the decode time; the T340's server and conductor
+share its cores, so only the two-host arms show a gain that is not an artifact of one box.
+
+| Arm | ms/token, 5 runs | median |
+| --- | --- | ---: |
+| two remote hosts (T340 0-15, rig 16-31), one after the other (`STRATA_NET_SERIAL=1`, before) | 54.2 / 58.1 / 64.6 / 66.0 / 73.0 | 64.6 |
+| the same, asked at the same time (S4 / B5) | 24.3 / 24.9 / 31.0 / 31.9 / 32.6 | 31.0 |
+| rig 16-31 + the conductor's own 0-15, ask then compute (before) | 65.5 / 73.4 / 74.5 / 76.4 / 82.7 | 74.5 |
+| the same, the conductor computes while the rig answers (`--overlap`, S4) | 29.6 / 29.7 / 30.6 / 34.2 / 34.5 | 30.6 |
+| the conductor alone, all 32 experts (reference) | 44.2-46.8 | 44.4 |
+
+Concurrent asking halves the two-host layer (64.6 to 31.0 ms, 2.1x), overlapping the conductor's own work takes 74.5 to 30.6 ms (2.4x). The doc's estimate above says 136 ms to
+84 ms (1.6x) for the whole four-host fleet; this toy has two hosts and no dense work, so the ratio is not comparable and nothing here predicts the real tokens a second. The
+real number needs the real engine: not run.
+
+**Real weights (Captain 1's go).** Nothing new to configure: the route list is the S3 plan's (`--remote-experts a:7840=0-39/0-127,b:7840=0-39/128-255,...`) and the engine now
+overlaps by itself. To get the before-arm on the same setup, start the conductor once with `STRATA_NET_SERIAL=1` in its environment (one process, same flags); the
+`strata net: decode: N layer calls, M with 2+ hosts in flight` line and `mean wait for the answers after the local CPU work` in the exit log are the per-layer numbers.
+The CUDA `strata-dsv41` was compiled (object only) on the rig; it was not run: no real weights.
 
 ## Faults, security
 

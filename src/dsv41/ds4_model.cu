@@ -8402,13 +8402,26 @@ struct Model::Impl {
                 items[q].slot0 = ents[q].slot0;
                 for (int i = 0; i < ents[q].n; ++i) items[q].tok[i] = ents[q].tok[i];
             }
-            std::vector<char> done;
-            remote->run(l.il, x, ldx, items.data(), (int) items.size(), c_yd.data(), done);
-            std::vector<Ent> rest;
-            for (size_t q = 0; q < ents.size(); ++q)
-                if (!done[q]) rest.push_back(ents[q]);
-            if (rest.empty()) return;
-            if (rest.size() < ents.size()) return cpu_experts_local(l, x, rest, ldx, nullptr);
+            // BBXL S4: every route's request goes out first (all hosts of the layer at once); the entries no route owns - the conductor's
+            // own experts - compute while the servers answer, then the answers come in.  Rows are independent, so the bits are the same
+            // as the old run() (ask, wait, compute the rest).  An entry whose host failed is computed after, as before.
+            std::vector<char> pend, done;
+            remote->begin(l.il, x, ldx, items.data(), (int) items.size(), pend);
+            std::vector<Ent> mine;
+            size_t n_pend = 0;
+            for (size_t q = 0; q < ents.size(); ++q) {
+                if (pend[q]) ++n_pend;
+                else mine.push_back(ents[q]);
+            }
+            if (n_pend > 0) {
+                if (!mine.empty()) cpu_experts_local(l, x, mine, ldx, nullptr);
+                remote->finish(c_yd.data(), done);
+                std::vector<Ent> rest;
+                for (size_t q = 0; q < ents.size(); ++q)
+                    if (pend[q] && !done[q]) rest.push_back(ents[q]);
+                if (!rest.empty()) cpu_experts_local(l, x, rest, ldx, nullptr);
+                return;
+            }
         }
 #endif
         cpu_experts_local(l, x, ents, ldx, ord);

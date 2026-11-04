@@ -93,6 +93,14 @@ public:
     /// (not owned by a route, the route down, an error) are the caller's to compute.  Always true unless the request itself
     /// cannot be built (then nothing is sent and every item stays local).
     bool run(int layer, const float* x, size_t ldx, const Item* items, int n_items, float* y, std::vector<char>& remote);
+    /// BBXL S4: run() in two halves, so the conductor's own experts compute while the servers answer.  begin() writes every route's
+    /// request for the layer (all routes at once, before any answer is read) and returns: pending[q] = 1 means item q's rows are on
+    /// their way; items at 0 are the caller's (no route owns them) - compute them NOW, then call finish().  finish() reads every
+    /// answer and writes the rows of the pending items to y[(slot0 + i) * dim]; remote[q] = 1 means they are there, a pending item
+    /// left at 0 lost its host and is the caller's too.  Same rows, bit for bit, as run().  At most one layer in flight.
+    bool begin(int layer, const float* x, size_t ldx, const Item* items, int n_items, std::vector<char>& pending);
+    bool finish(float* y, std::vector<char>& remote);
+    bool in_flight() const;
     uint64_t rows_remote() const;
     uint64_t rows_local() const;
     std::string stats() const;

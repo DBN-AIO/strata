@@ -6,6 +6,9 @@ against expert servers on localhost, and compares the 64 greedy tokens and the h
   1. one server for all layers
   2. two servers splitting the layers
   3. a partial split (the conductor computes the other layers itself)
+  3c-3e. (BBXL S4) one layer's experts on two servers asked at the same time; the conductor's own experts computed while the servers
+         answer (Remote::begin / finish); both with an injected delay (server: STRATA_DS4_SERVER_DELAY_MS, conductor: --local-delay-ms)
+         so the timing assertions are deterministic on a loaded host
   4. a server that dies mid-run (STRATA_DS4_SERVER_DIE_AFTER): the conductor falls back to its own lane, same output
   4c. (BBXL S3) experts renumbered by popularity: the conductor calls ranks (STRATA_DS4_EXPERT_PERM), the slice is laid out by rank
   5. a conductor of the wrong engine family (qwen38) is refused at the handshake; so are a wrong token and another geometry
@@ -62,7 +65,7 @@ def stop(p):
 def lines(r):
     d = {}
     for ln in r.stdout.splitlines():
-        m = re.match(r"(TOKENS|ROWHASH|ROWS|STATS|OPEN_FAILED)\s*(.*)", ln)
+        m = re.match(r"(TOKENS|ROWHASH|ROWS|STATS|OPEN_FAILED|DECODE)\s*(.*)", ln)
         if m:
             d[m.group(1)] = m.group(2)
     return d
@@ -109,6 +112,53 @@ with tempfile.TemporaryDirectory() as tmp:
     L = lines(r)
     check("experts split over two hosts (0-15 / 16-31): identical, none local", r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and L.get("ROWHASH") == R.get("ROWHASH")
           and "computed locally 0," in L.get("STATS", ""), r.stderr[-300:] + L.get("STATS", ""))
+    # 3c. BBXL S4: every layer's experts on TWO servers, each answering in 30 ms (injected).  Asked one after the other a layer would cost
+    # 60 ms (480 ms a token over 8 layers); asked at the same time, 30 ms (240 ms).  Same tokens and rows as the local run.
+    DEL = 30
+    ref6 = run(["--pack", pack, "--mode", "local", "--tokens", "6"])
+    R6 = lines(ref6)
+    dl = dict(token, STRATA_DS4_SERVER_DELAY_MS=str(DEL))
+    y1 = start(pack, 17853, "0-7", dl, experts="0-15")
+    y2 = start(pack, 17854, "0-7", dl, experts="16-31")
+    r = run(["--pack", pack, "--mode", "remote", "--tokens", "6", "--time", "--remote", "127.0.0.1:17853=0-7/0-15,127.0.0.1:17854=0-7/16-31"], token)
+    rs = run(["--pack", pack, "--mode", "remote", "--tokens", "6", "--time", "--remote", "127.0.0.1:17853=0-7/0-15,127.0.0.1:17854=0-7/16-31"], dict(token, STRATA_NET_SERIAL="1"))
+    stop(y1)
+    stop(y2)
+    LSr = lines(rs)
+    msr = re.match(r"([\d.]+) ms a token", LSr.get("DECODE", ""))
+    msr = float(msr.group(1)) if msr else -1.0
+    check("the serial arm (STRATA_NET_SERIAL=1, the measurement hook): same tokens and rows", rs.returncode == 0 and LSr.get("TOKENS") == R6.get("TOKENS") and LSr.get("ROWHASH") == R6.get("ROWHASH"), rs.stderr[-300:])
+    check("the serial arm costs the sum of the servers (8 x 2 x %d ms): %.0f ms" % (DEL, msr), msr >= 0.9 * 16 * DEL, "%.1f ms" % msr)
+    L = lines(r)
+    m = re.match(r"([\d.]+) ms a token", L.get("DECODE", ""))
+    ms = float(m.group(1)) if m else -1.0
+    check("two delayed servers: tokens and rows identical", r.returncode == 0 and L.get("TOKENS") == R6.get("TOKENS") and L.get("ROWHASH") == R6.get("ROWHASH"), r.stderr[-300:] + L.get("STATS", ""))
+    check("two delayed servers: a token costs ~ one server's time (8 x %d ms), not the sum (%d ms): %.0f ms" % (DEL, 16 * DEL, ms),
+          0.9 * 8 * DEL <= ms <= 1.5 * 8 * DEL, "%.1f ms" % ms)
+    # 3d. BBXL S4: the conductor's own experts (0-15) cost 25 ms a layer (injected) while the one server (16-31) takes 30 ms.  One after the other:
+    # 55 ms a layer (440 ms a token); overlapped (Remote::begin, the local work, Remote::finish): about 30 ms (240 ms).
+    LOC = 25
+    z = start(pack, 17855, "0-7", dl, experts="16-31")
+    seqr = run(["--pack", pack, "--mode", "remote", "--tokens", "6", "--time", "--local-delay-ms", str(LOC), "--remote", "127.0.0.1:17855=0-7/16-31"], token)
+    ovr = run(["--pack", pack, "--mode", "remote", "--tokens", "6", "--time", "--overlap", "--local-delay-ms", str(LOC), "--remote", "127.0.0.1:17855=0-7/16-31"], token)
+    stop(z)
+    LS, LO = lines(seqr), lines(ovr)
+    def msof(d):
+        mm = re.match(r"([\d.]+) ms a token", d.get("DECODE", ""))
+        return float(mm.group(1)) if mm else -1.0
+    ms_s, ms_o = msof(LS), msof(LO)
+    check("conductor work, one after the other: tokens and rows identical", seqr.returncode == 0 and LS.get("TOKENS") == R6.get("TOKENS") and LS.get("ROWHASH") == R6.get("ROWHASH"), seqr.stderr[-300:])
+    check("conductor work overlapped with the server: tokens and rows identical", ovr.returncode == 0 and LO.get("TOKENS") == R6.get("TOKENS") and LO.get("ROWHASH") == R6.get("ROWHASH"), ovr.stderr[-300:] + ovr.stdout[-200:])
+    check("one after the other costs the sum (8 x 55 ms): %.0f ms" % ms_s, ms_s >= 0.9 * 8 * (DEL + LOC), "%.1f ms" % ms_s)
+    check("overlapped costs the longer of the two (8 x 30 ms), not the sum: %.0f ms" % ms_o, 0.9 * 8 * DEL <= ms_o <= 0.8 * 8 * (DEL + LOC), "%.1f ms" % ms_o)
+    # 3e. the overlapped path with a server that dies mid-run: its pending rows come back to the conductor's own lane, same output
+    z = start(pack, 17856, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="40"), experts="16-31")
+    r = run(["--pack", pack, "--mode", "remote", "--overlap", "--remote", "127.0.0.1:17856=0-7/16-31"], dict(token, STRATA_EXPERT_TIMEOUT_MS="1500"))
+    stop(z)
+    L = lines(r)
+    m = re.search(r"remote expert rows (\d+), computed locally (\d+)", L.get("STATS", ""))
+    check("overlapped, server dies after 40 requests: identical via the local fallback", r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and L.get("ROWHASH") == R.get("ROWHASH"), r.stderr[-300:] + r.stdout[-200:])
+    check("overlapped, server dies: remote and local rows both used", m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, L.get("STATS", ""))
     # 4. the server dies mid-run
     d = start(pack, 17844, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="40"))
     r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17844=0-7"], dict(token, STRATA_EXPERT_TIMEOUT_MS="1500"))

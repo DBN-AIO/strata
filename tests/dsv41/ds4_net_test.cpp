@@ -19,6 +19,7 @@
 #include <map>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace strata::ds4::net;
@@ -49,6 +50,12 @@ int main(int argc, char** argv) {
     float skew = 0.0f;
     std::string count_out;
     bool show_time = false;
+    // BBXL S4: --overlap asks the servers with Remote::begin, computes the conductor's own experts while they answer, then Remote::finish
+    // (the engine's cpu_experts); off: Remote::run, then the local ones.  --local-delay-ms N charges every layer N ms of conductor-side lane
+    // time (a sleep: deterministic on a loaded host), so the timing tests can tell "the sum" from "the longer of the two".
+    bool overlap = false;
+    int salt = 0;   // --prompt-salt N: another prompt (a unique prefix for every timing run)
+    int local_delay_ms = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto v = [&]() -> std::string { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); } return argv[++i]; };
@@ -64,6 +71,9 @@ int main(int argc, char** argv) {
         else if (a == "--skew") skew = (float) std::atof(v().c_str());
         else if (a == "--count-out") count_out = v();
         else if (a == "--time") show_time = true;
+        else if (a == "--overlap") overlap = true;
+        else if (a == "--prompt-salt") salt = std::atoi(v().c_str());
+        else if (a == "--local-delay-ms") local_delay_ms = std::atoi(v().c_str());
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     ExpertMap map;
@@ -112,7 +122,7 @@ int main(int argc, char** argv) {
     long rows_total = 0;
     std::vector<int> seq;
     std::vector<int> prompt;
-    for (int i = 0; i < n_prompt; ++i) prompt.push_back((int) ((i * 7 + 3) % vocab));
+    for (int i = 0; i < n_prompt; ++i) prompt.push_back((int) ((i * 7 + 3 + salt * 13) % vocab));
 
     // one window of nt tokens (their hidden states h: nt x D) through every layer
     auto forward = [&](int nt, std::vector<float>& h) {
@@ -153,19 +163,35 @@ int main(int argc, char** argv) {
                 }
                 std::vector<float> y(slot_entry.size() * (size_t) D);
                 std::vector<char> done;
-                remote.run(l, xn.data(), (size_t) D, items.data(), (int) items.size(), y.data(), done);
                 std::vector<uint8_t> m2((size_t) nt * K, 0);
                 bool any_local = false;
-                for (size_t q = 0; q < items.size(); ++q) {
-                    if (done[q]) {
+                auto mark_local = [&](size_t q) {
+                    for (int i = 0; i < items[q].n; ++i) m2[(size_t) slot_entry[(size_t) (items[q].slot0 + i)]] = 1;
+                    any_local = true;
+                };
+                auto run_local = [&](bool charge) {
+                    if (charge && local_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(local_delay_ms));
+                    if (any_local && !host.compute((uint32_t) l, (uint32_t) nt, (uint32_t) K, ids.data(), m2.data(), xn.data(), rows.data(), err)) { std::fprintf(stderr, "fallback: %s\n", err.c_str()); std::exit(1); }
+                    std::fill(m2.begin(), m2.end(), (uint8_t) 0);
+                    any_local = false;
+                };
+                if (overlap) {
+                    std::vector<char> pend;
+                    remote.begin(l, xn.data(), (size_t) D, items.data(), (int) items.size(), pend);
+                    for (size_t q = 0; q < items.size(); ++q) if (!pend[q]) mark_local(q);
+                    run_local(true);                       // the conductor's own work while the servers answer
+                    remote.finish(y.data(), done);
+                    for (size_t q = 0; q < items.size(); ++q) if (pend[q] && !done[q]) mark_local(q);   // a host that failed
+                    run_local(false);
+                } else {
+                    remote.run(l, xn.data(), (size_t) D, items.data(), (int) items.size(), y.data(), done);
+                    for (size_t q = 0; q < items.size(); ++q) if (!done[q]) mark_local(q);
+                    run_local(true);
+                }
+                for (size_t q = 0; q < items.size(); ++q)
+                    if (done[q])
                         for (int i = 0; i < items[q].n; ++i)
                             std::memcpy(&rows[(size_t) slot_entry[(size_t) (items[q].slot0 + i)] * D], &y[(size_t) (items[q].slot0 + i) * D], (size_t) D * 4);
-                    } else {
-                        for (int i = 0; i < items[q].n; ++i) m2[(size_t) slot_entry[(size_t) (items[q].slot0 + i)]] = 1;
-                        any_local = true;
-                    }
-                }
-                if (any_local && !host.compute((uint32_t) l, (uint32_t) nt, (uint32_t) K, ids.data(), m2.data(), xn.data(), rows.data(), err)) { std::fprintf(stderr, "fallback: %s\n", err.c_str()); std::exit(1); }
             }
             rows_total += nt * K;
             row_hash = fnv(row_hash, rows.data(), rows.size() * 4);

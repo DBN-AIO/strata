@@ -110,7 +110,10 @@ private:
                   int arith, uint64_t& seq, std::vector<uint8_t>& buf);
     std::string recv_resp(Route& r, uint64_t seq, uint32_t want, std::vector<uint8_t>& resp, double& server_us);
     /// B5: per route, the decode request in flight (several hosts may hold parts of one layer)
-    struct InFlight { bool active = false; uint64_t seq = 0; double t_send = 0; std::vector<uint8_t> mask, buf; std::vector<int32_t> owned; };
+    struct InFlight { bool active = false; uint64_t seq = 0; double t_send = 0; std::vector<uint8_t> mask, buf; std::vector<int32_t> owned;
+                      // BBXL S4 measurement hook (STRATA_NET_SERIAL=1): the answer is read right after the send, so the hosts of a layer are asked one after the other
+                      bool pre_done = false; std::string pre_why; double pre_us = 0, pre_rtt = 0; std::vector<uint8_t> pre; };
+    bool serial_ = false;
     std::vector<InFlight> inflight_;
     std::vector<uint8_t> resp_;
     uint64_t layer_calls_ = 0, multi_calls_ = 0;
