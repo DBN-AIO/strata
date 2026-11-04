@@ -16,7 +16,7 @@ what is DeepSeek-specific is written down in docs/REMOTE_EXPERTS.md, "DeepSeek-V
 | real weights, real split | **not run**: `/mnt/bulk/strata/models/deepseek41/RESULTS.md` did not exist when this was written (the 2.00 bpw set is on disk, 4 shards, sha256 ok). Tools are ready: `slice_stream.py`, `plan_split.py`, the server flags below |
 | GPU expert server for dsv41 (rig 72 GB VRAM, stream 5070 Ti) | not done; needs the engine's VRAM expert slots behind `serve_experts` (see "Next") |
 | parallel remote calls, conductor work overlapped with the servers (BBXL S4) | done, measured on synthetic packs (T340 + rig): "Parallel remote calls (BBXL S4)"; the real engine has not run it |
-| prompt path through the servers | not done: the chunked prompt path streams experts from the conductor's own files, so the conductor needs the whole model on its disk |
+| prompt path through the servers (BBXL S5) | host side done and tested (`Remote::prompt`, 32-token windows, a conductor pack without the served layers passes the synthetic test); engine: opt-in `STRATA_DS4_NET_PREFILL=1` sends the prompt down the window path (compiled, not run). **Not done:** the chunked flow itself does not call `Remote::prompt` (needs a running engine). "The prompt through the servers (BBXL S5)" |
 
 ## Commands
 
@@ -275,6 +275,71 @@ overlaps by itself. To get the before-arm on the same setup, start the conductor
 `strata net: decode: N layer calls, M with 2+ hosts in flight` line and `mean wait for the answers after the local CPU work` in the exit log are the per-layer numbers.
 The CUDA `strata-dsv41` was compiled (object only) on the rig; it was not run: no real weights.
 
+## The prompt through the servers (BBXL S5)
+
+Captain 1's order (2026-11-03, #22829): send the prompt (prefill) through the expert servers too, so the conductor does not stream every expert from its own SSD.
+
+**Two prompt paths exist in the engine, and only one of them reached the servers.** The WINDOW path (`feed_windows`, kWin = 16 tokens a window) already runs every served layer's
+CPU lane through `cpu_experts` -> `net::Remote` (decode and short prompts). The CHUNKED flow (`forward_chunks`, long prompts: chunks of up to 16384 tokens, layer-major, experts
+picked by the chunk streamed from the conductor's own files into VRAM slots) never asks `Remote`, which is why the status table said "the conductor needs the whole model on its
+disk". `pick_path` chooses the flow from the prompt's length alone (`pick_flow_min`).
+
+| Piece | Change |
+| --- | --- |
+| window size on the wire | the server accepts prompt windows of up to **32 tokens** (`kMaxPromptTok`; was 16 = `kMaxTok`, the engine's decode window, which is unchanged). 32 tokens at hidden 5120 / top-6 are a 655 KB request and a 3.9 MB answer, inside the wire's frame limits (1 MiB / 4 MiB); `Remote` lowers its window for a bigger hidden size. Raised because an expert picked by several tokens of a window is read once for all of them (the server computes up to 8 tokens of one expert per kernel call). An older server (limit 16) refuses a 32-token window with ERR: both ends of the prompt path need this build; `STRATA_DS4_PROMPT_WIN=16` on the conductor keeps the old size. |
+| `net::Remote::prompt` (`ds4_net.cpp`) | T tokens of one layer (any T: the caller slices a long chunk into slabs), the S3 renumbering applied, windows of up to `prompt_window()` tokens with up to `STRATA_NET_PIPELINE` (default 4) in flight on every host (the Qwen B3/B5 `NetExperts::prompt`, now with a window parameter). Returns the expert rows and `got[i]`: entries no route owns (the conductor's own experts) and every entry after a failed request stay for the caller, who computes them from its own copy; the failed route is dropped and retried as in decode. A conductor missing a served layer entirely never needs the fallback unless a server dies. |
+| `NetExperts::owns`, `prompt(..., max_tok)` | two small additions to `core` (the Qwen path passes nothing and is unchanged). |
+| engine, opt-in `STRATA_DS4_NET_PREFILL=1` (only with `--remote-experts`) | `feed`, `feed_mark`, `feed_marks` take the window path instead of the flow, so no expert of a served layer is read from the conductor's disk. **Off by default**: a 16-token window pays a round trip a layer (no pipelining across windows: window n+1's layers need window n's attention state), so a long prompt is slower than the flow whenever the conductor does have the experts locally. Measure before turning it on (commands below). |
+
+**Not done: the chunked flow itself does not call `Remote::prompt`.** That is the fast version (C tokens a layer, 32-token windows pipelined 4 deep on every host, no per-window
+round trip). The hook is where the flow turns a chunk's picks for a SERVED layer into stream items (`flow_spec` / `flow_pump`, `run_dev_layers`): copy the chunk's FFN input and the
+routed ids to the host, `Remote::prompt` in slabs, weight and sum the rows exactly as the local path's combine does, copy the partial sums back in stream order, and skip the layer's
+streams and expert kernels. It is a change inside the async multi-stream GPU pipeline of `ds4_model.cu`; it needs a running engine with weights (the synthetic packs have no dense
+part, the T340 has no CUDA), so it was not attempted blind. `Remote::prompt` is the whole host side of it and is tested.
+
+**Tests (CI: `tools/dsv41/synthetic_split_test.py`, steps 3f-3j; failing first).** Against the base binaries every one fails (`unknown option --prompt-path`, `--slab`: 9 of the 17
+failures that run reports; the other 8 are S4's checks); on this branch the whole script passes. `ds4_net_test --prompt-path` drives a prompt of any length through the layers in slabs
+(`--slab`) with `Remote::prompt`, as the engine's chunk path would; the local reference computes the same rows on `ExpertHost` in windows. A 100-token prompt, 4 tokens, row hash
+over every expert row:
+
+| Check | Result |
+| --- | --- |
+| conductor pack = a slice holding layers 0-1 ONLY (`slice_stream.py emit pack 0-1`), layers 2-7 on one server | tokens and every row identical to the local run; 103 tokens x 6 x 6 = 3708 rows from the server, 0 computed here |
+| control: that slice run alone, no server | does NOT reproduce the reference rows (the bytes really are missing) |
+| server owns experts 16-31 only, the conductor its 0-15 | identical, some rows remote and some here |
+| experts split over two servers, windows of 32 and of 16 (`STRATA_DS4_PROMPT_WIN`) | identical in both: a row does not depend on its window |
+| a server dies in the middle of the prompt (`STRATA_DS4_SERVER_DIE_AFTER=12`) | identical through the local fallback |
+
+**Measured: prefill tok/s at 2k and 16k tokens (synthetic, CPU kernels).** T340 conductor; the servers are the T340's own (loopback, experts 0-15, 4 threads) and the rig's (ssh tunnel,
+experts 16-31, 5 threads). Pack: 2 layers x 32 experts, hidden 5120, ffn 512 (the real wire shape with cheap compute, so 16k tokens finish in a minute; the real ffn is 2304). Prompts in slabs
+of 512 tokens, a 512-token warm-up (its own prefix) before each arm, then every timed run with its own prompt (`--prompt-salt`: unique prefix). The row hash of the 2k prompt is
+`f7e72e76f25e1b50` for both the local arm and the servers (hash off in the timed runs). "Local" is this box's CPU doing the experts (the stand-in for the conductor's own copy; the
+real local path is the flow streaming from an SSD into VRAM, which a synthetic pack cannot reproduce: the packs are 0.1 GB and sit in the page cache, so SATA against NVMe (S6) does not show here).
+
+| Arm | 2048 tokens (tok/s, 3 runs) | 16384 tokens (tok/s, 2 runs) |
+| --- | --- | --- |
+| local, the conductor's CPU, 8 threads, windows of 32 | 459.9 / 461.2 / 495.3 | 461.7 / 494.4 |
+| through the servers, windows of 32, 4 in flight (default) | 453.4 / 443.7 / 452.3 | 463.4 / 461.8 |
+| through the servers, windows of 16 (the old limit) | 430.2 / 425.6 / 441.1 | 432.1 / 433.2 |
+| through the servers, windows of 32, one at a time (`STRATA_NET_PIPELINE=1`) | 334.5 / 331.9 / 333.6 | 336.2 / 334.6 |
+
+Read it for what it is: everything here is CPU-bound and the two servers' 9 threads about equal the local arm's 8, so "servers = local" says the wire (over a tunnel to the rig) costs
+nothing once windows are pipelined, not that remote is faster. The levers show clearly: pipelining 4 windows deep is +36 % over one at a time, and the 32-token window +5 % over 16. At
+16384 tokens the rate does not fall: the path is a steady stream, not a latency chain.
+
+**Real weights (Captain 1's go; nothing was loaded).** Conductor with only its own layers on disk (`slice_stream.py emit PACK 0-K` for the conductor's layers), the same server routes as
+S3/S4:
+
+```sh
+# A/B 1: the window path through the servers (needs both ends of this build; the conductor has no copy of the served layers)
+STRATA_DS4_NET_PREFILL=1 strata-dsv41 --pack CONDUCTOR_PACK ... --remote-experts <the plan's line> --profile-run prompt-2k.ids   # then prompt-16k.ids, unique prefixes
+# A/B 2: the flow from the conductor's own SSD (the full pack, no STRATA_DS4_NET_PREFILL): compare the "prompt N tok/s" lines of the two runs
+# window size: STRATA_DS4_PROMPT_WIN=16 (the old limit); depth: STRATA_NET_PIPELINE=1..8
+```
+
+The exit log prints, per server, `prompt path: N windows, N rows, ... ms (server compute ... ms)` once `Remote::prompt` is used (the flow hook above), and
+`decode: N layer calls, M with 2+ hosts in flight` for the window path.
+
 ## Faults, security
 
 As for Qwen (docs/REMOTE_EXPERTS.md): shared token, the server binds loopback unless told otherwise, a route that fails is computed locally and retried
@@ -288,5 +353,5 @@ would still agree except on near-ties) - the synthetic test and `ROWHASH` are ho
 1. The real-weights split (RESULTS.md gate): conductor `strata-dsv41` on the gaming PC, T340 + stream PC (CPU servers) with slices of their layers, 64 tokens against the single-process
    reference, tok/s and round trip. Until then the synthetic test and the row-hash runs above are the evidence.
 2. A dsv41 GPU expert server (the engine's VRAM expert slots behind `serve_experts`, as `--expert-server-gpu` does for Qwen) for the rig and the stream PC's 5070 Ti.
-3. The prompt path through the servers (as B3 did for Qwen), so the conductor needs no local copy of served layers.
+3. The chunked flow's hook for `Remote::prompt` (BBXL S5 "Not done"): the host side is done; the engine side needs a run with real weights.
 4. Disk: the 3 bit set needs about 60 GB more on the rig and 25 GB on the T340, or a NAS mount.

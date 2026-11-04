@@ -89,7 +89,12 @@ public:
     /// to dst[i].  Synchronous, on the prompt thread (never while a decode request is in flight).  False with `err` when the
     /// route is down or fails (it is then dropped and retried later, as in decode): the caller computes those rows itself.
     bool prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
-                float* const* dst, std::string& err);
+                float* const* dst, std::string& err, int64_t max_tok = 0);   ///< max_tok 0: kWindowMaxT; BBXL S5: dsv41 servers take more (ds4_net.hpp kMaxPromptTok)
+    /// BBXL S5: a host of `layer` owns `expert` (a prompt entry no host owns is the caller's to compute).
+    bool owns(int64_t layer, int32_t expert) const {
+        for (const Route& r : routes_) if (layer >= r.lo && layer <= r.hi && expert >= r.elo && expert <= r.ehi) return true;
+        return false;
+    }
 
 private:
     struct Route { std::string host; int port = 7840; int lo = 0, hi = 0; int elo = 0, ehi = 0; intptr_t fd = -1; int top_k = 0;   // top_k: the server's, from its HELLO_ACK; elo..ehi: the experts it owns

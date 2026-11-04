@@ -9,6 +9,8 @@ against expert servers on localhost, and compares the 64 greedy tokens and the h
   3c-3e. (BBXL S4) one layer's experts on two servers asked at the same time; the conductor's own experts computed while the servers
          answer (Remote::begin / finish); both with an injected delay (server: STRATA_DS4_SERVER_DELAY_MS, conductor: --local-delay-ms)
          so the timing assertions are deterministic on a loaded host
+  3f-3k. (BBXL S5) the prompt through the servers: a 100-token prompt in slabs through every layer (Remote::prompt, windows of 32 tokens), a
+         conductor pack WITHOUT the served layers' bytes, experts split over hosts, a server that dies mid-prompt
   4. a server that dies mid-run (STRATA_DS4_SERVER_DIE_AFTER): the conductor falls back to its own lane, same output
   4c. (BBXL S3) experts renumbered by popularity: the conductor calls ranks (STRATA_DS4_EXPERT_PERM), the slice is laid out by rank
   5. a conductor of the wrong engine family (qwen38) is refused at the handshake; so are a wrong token and another geometry
@@ -65,7 +67,7 @@ def stop(p):
 def lines(r):
     d = {}
     for ln in r.stdout.splitlines():
-        m = re.match(r"(TOKENS|ROWHASH|ROWS|STATS|OPEN_FAILED|DECODE)\s*(.*)", ln)
+        m = re.match(r"(TOKENS|ROWHASH|ROWS|STATS|OPEN_FAILED|DECODE|PROMPTWIN)\s*(.*)", ln)
         if m:
             d[m.group(1)] = m.group(2)
     return d
@@ -159,6 +161,55 @@ with tempfile.TemporaryDirectory() as tmp:
     m = re.search(r"remote expert rows (\d+), computed locally (\d+)", L.get("STATS", ""))
     check("overlapped, server dies after 40 requests: identical via the local fallback", r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and L.get("ROWHASH") == R.get("ROWHASH"), r.stderr[-300:] + r.stdout[-200:])
     check("overlapped, server dies: remote and local rows both used", m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, L.get("STATS", ""))
+    # 3f. BBXL S5: the prompt path.  100 tokens in slabs of 40 through every layer, 4 tokens; the local reference computes the same rows in windows.
+    PP = ["--prompt", "100", "--slab", "40", "--tokens", "4"]
+    refp = run(["--pack", pack, "--mode", "local"] + PP)
+    RPL = lines(refp)
+    check("prompt reference run (100 tokens, local)", refp.returncode == 0 and "TOKENS" in RPL, refp.stderr[-300:])
+    # 3g. a conductor pack WITHOUT the served layers' bytes (a slice holding layers 0-1 only), layers 2-7 on one server: the prompt (and the
+    # decode) of layers 2-7 must come over the wire; a read of a missing byte would give zeros and change the rows
+    cs = os.path.join(tmp, "cslice")
+    em = subprocess.Popen([sys.executable, os.path.join(here, "slice_stream.py"), "emit", pack, "0-1"], stdout=subprocess.PIPE)
+    ap = subprocess.run([sys.executable, os.path.join(here, "slice_stream.py"), "apply", cs], stdin=em.stdout, capture_output=True, text=True)
+    em.wait()
+    check("slice_stream emit 0-1 | apply (the conductor's pack)", em.returncode == 0 and ap.returncode == 0, ap.stderr[-200:])
+    ctl = run(["--pack", cs, "--mode", "local"] + PP)
+    check("control: that conductor pack run alone (no server) does NOT give the reference rows (the bytes of layers 2-7 are really missing)",
+          ctl.returncode != 0 or lines(ctl).get("ROWHASH") != RPL.get("ROWHASH"), lines(ctl).get("ROWHASH", ""))
+    q = start(pack, 17860, "2-7", token)
+    r = run(["--pack", cs, "--mode", "remote", "--prompt-path", "--remote", "127.0.0.1:17860=2-7"] + PP, token)
+    stop(q)
+    L = lines(r)
+    m = re.search(r"remote expert rows (\d+), computed locally (\d+)", L.get("STATS", ""))
+    check("prompt path, conductor pack without layers 2-7: tokens and rows identical to the local run",
+          r.returncode == 0 and L.get("TOKENS") == RPL.get("TOKENS") and L.get("ROWHASH") == RPL.get("ROWHASH"), r.stderr[-300:] + r.stdout[-200:])
+    check("prompt path: every row of layers 2-7 came from the server (103 tokens x 6 picks x 6 layers)", m is not None and int(m.group(1)) == 103 * 6 * 6 and int(m.group(2)) == 0, L.get("STATS", ""))
+    check("prompt path: windows of 32 tokens", L.get("PROMPTWIN") == "32", L.get("PROMPTWIN", ""))
+    # 3h. the server owns experts 16-31 only: the conductor computes its own 0-15 from its copy, the rest is remote
+    q = start(pack, 17861, "0-7", token, experts="16-31")
+    r = run(["--pack", pack, "--mode", "remote", "--prompt-path", "--remote", "127.0.0.1:17861=0-7/16-31"] + PP, token)
+    stop(q)
+    L = lines(r)
+    m = re.search(r"remote expert rows (\d+), computed locally (\d+)", L.get("STATS", ""))
+    check("prompt path, server owns experts 16-31 only: identical", r.returncode == 0 and L.get("TOKENS") == RPL.get("TOKENS") and L.get("ROWHASH") == RPL.get("ROWHASH"), r.stderr[-300:])
+    check("prompt path, partial experts: some rows remote, some here", m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, L.get("STATS", ""))
+    # 3i. experts split over two servers; the window size does not change a row (32 against 16 tokens)
+    q1 = start(pack, 17862, "0-7", token, experts="0-15")
+    q2 = start(pack, 17863, "0-7", token, experts="16-31")
+    spec = "127.0.0.1:17862=0-7/0-15,127.0.0.1:17863=0-7/16-31"
+    r32 = run(["--pack", pack, "--mode", "remote", "--prompt-path", "--remote", spec] + PP, token)
+    r16 = run(["--pack", pack, "--mode", "remote", "--prompt-path", "--remote", spec] + PP, dict(token, STRATA_DS4_PROMPT_WIN="16"))
+    stop(q1)
+    stop(q2)
+    L32, L16 = lines(r32), lines(r16)
+    check("prompt path, experts over two servers, windows of 32: identical", r32.returncode == 0 and L32.get("TOKENS") == RPL.get("TOKENS") and L32.get("ROWHASH") == RPL.get("ROWHASH"), r32.stderr[-300:])
+    check("prompt path, windows of 16 (STRATA_DS4_PROMPT_WIN): the same rows", r16.returncode == 0 and L16.get("PROMPTWIN") == "16" and L16.get("ROWHASH") == RPL.get("ROWHASH"), r16.stderr[-300:] + L16.get("PROMPTWIN", ""))
+    # 3j. a server that dies in the middle of the prompt: the conductor (which has the whole pack) computes the rest; the output is the same
+    q = start(pack, 17864, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="12"))
+    r = run(["--pack", pack, "--mode", "remote", "--prompt-path", "--remote", "127.0.0.1:17864=0-7"] + PP, dict(token, STRATA_EXPERT_TIMEOUT_MS="1500"))
+    stop(q)
+    L = lines(r)
+    check("prompt path, server dies mid-prompt: identical through the local fallback", r.returncode == 0 and L.get("TOKENS") == RPL.get("TOKENS") and L.get("ROWHASH") == RPL.get("ROWHASH"), r.stderr[-300:])
     # 4. the server dies mid-run
     d = start(pack, 17844, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="40"))
     r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17844=0-7"], dict(token, STRATA_EXPERT_TIMEOUT_MS="1500"))
