@@ -11,6 +11,8 @@ against expert servers on localhost, and compares the 64 greedy tokens and the h
          so the timing assertions are deterministic on a loaded host
   3f-3k. (BBXL S5) the prompt through the servers: a 100-token prompt in slabs through every layer (Remote::prompt, windows of 32 tokens), a
          conductor pack WITHOUT the served layers' bytes, experts split over hosts, a server that dies mid-prompt
+  3l-3n. (BBXL S7) the chunked flow's hook (ds4_net_chunk.hpp, --chunk-flow): only owned picks sent, partial sums bit-identical, a conductor pack without
+         the served layers, a dying server stops the run
   4. a server that dies mid-run (STRATA_DS4_SERVER_DIE_AFTER): the conductor falls back to its own lane, same output
   4c. (BBXL S3) experts renumbered by popularity: the conductor calls ranks (STRATA_DS4_EXPERT_PERM), the slice is laid out by rank
   5. a conductor of the wrong engine family (qwen38) is refused at the handshake; so are a wrong token and another geometry
@@ -210,6 +212,34 @@ with tempfile.TemporaryDirectory() as tmp:
     stop(q)
     L = lines(r)
     check("prompt path, server dies mid-prompt: identical through the local fallback", r.returncode == 0 and L.get("TOKENS") == RPL.get("TOKENS") and L.get("ROWHASH") == RPL.get("ROWHASH"), r.stderr[-300:])
+    # 3l-3n. BBXL S7: the chunked flow's hook (ds4_net_chunk.hpp: the code the engine runs for a served layer; --chunk-flow).  Only the picks a server owns
+    # are sent, every one must come back, and the rows are summed with moe_combine's arithmetic (CHUNKSUM = a hash of those partial sums).  The
+    # reference is the same run in one process, --chunk-own naming the experts a server would hold.
+    CF = PP + ["--chunk-flow"]
+    refc = run(["--pack", pack, "--mode", "local", "--chunk-own", "16-31"] + CF)
+    RC = lines(refc)
+    check("chunk flow reference run (experts 16-31 stand for the server)", refc.returncode == 0 and "CHUNKSUM" in refc.stdout and RC.get("ROWHASH") == RPL.get("ROWHASH"), refc.stderr[-300:] + refc.stdout[-200:])
+    q = start(pack, 17865, "0-7", token, experts="16-31")
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17865=0-7/16-31"] + CF, token)
+    stop(q)
+    L = lines(r)
+    mc, mr = re.search(r"CHUNKSUM (\w+) SENT (\d+)", r.stdout), re.search(r"CHUNKSUM (\w+) SENT (\d+)", refc.stdout)
+    check("chunk flow, server owns experts 16-31: tokens, every row and every partial sum identical", r.returncode == 0 and L.get("TOKENS") == RPL.get("TOKENS") and L.get("ROWHASH") == RPL.get("ROWHASH")
+          and mc is not None and mr is not None and mc.groups() == mr.groups() and int(mc.group(2)) > 0, r.stderr[-300:] + r.stdout[-300:])
+    q = start(pack, 17866, "2-7", token)
+    refa = run(["--pack", pack, "--mode", "local", "--chunk-own", "0-31:2-7"] + CF)
+    r = run(["--pack", cs, "--mode", "remote", "--remote", "127.0.0.1:17866=2-7"] + CF, token)
+    stop(q)
+    L = lines(r)
+    mc, mr = re.search(r"CHUNKSUM (\w+) SENT (\d+)", r.stdout), re.search(r"CHUNKSUM (\w+) SENT (\d+)", refa.stdout)
+    m = re.search(r"remote expert rows (\d+), computed locally (\d+)", L.get("STATS", ""))
+    check("chunk flow, conductor pack WITHOUT layers 2-7: identical, nothing read from the conductor's files for them", r.returncode == 0 and L.get("TOKENS") == RPL.get("TOKENS") and L.get("ROWHASH") == RPL.get("ROWHASH")
+          and mc is not None and mr is not None and mc.groups() == mr.groups(), r.stderr[-300:] + r.stdout[-300:])
+    check("chunk flow: every row of layers 2-7 came from the server (103 x 6 x 6), none computed here for them", m is not None and int(m.group(1)) == 103 * 6 * 6 and int(m.group(2)) == 0, L.get("STATS", ""))
+    q = start(pack, 17867, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="12"))
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17867=0-7"] + CF, dict(token, STRATA_EXPERT_TIMEOUT_MS="1500"))
+    stop(q)
+    check("chunk flow, server dies mid-prompt: the run stops with an error (no silent zeros; a conductor without the bytes cannot fall back)", r.returncode != 0 and "chunk flow" in r.stderr, r.stderr[-300:])
     # 4. the server dies mid-run
     d = start(pack, 17844, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="40"))
     r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17844=0-7"], dict(token, STRATA_EXPERT_TIMEOUT_MS="1500"))
