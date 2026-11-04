@@ -12,7 +12,7 @@ param(
   [string]$Log    = "C:\AIO-strata-model\dsv41-expert-server.log",
   [string]$TokenFile = "C:\AIO-strata-model\expert.token",
   [int]$Threads = 0,
-  [string]$ExtraArgs = ""   # e.g. "--expert-server-gpu --gpu-vram-gb 4 --gpu-cpu-rest" for the CUDA build (tools\dsv41uild_gpu_server_windows.ps1)
+  [string]$ExtraArgs = ""   # e.g. "--expert-server-gpu --gpu-vram-gb 4 --gpu-cpu-rest" for the CUDA build (tools/dsv41/build_gpu_server_windows.ps1)
 )
 $ErrorActionPreference = "Stop"
 $launcher = Join-Path $PSScriptRoot "launch_expert_server.py"
