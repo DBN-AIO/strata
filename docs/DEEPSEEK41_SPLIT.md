@@ -15,7 +15,7 @@ what is DeepSeek-specific is written down in docs/REMOTE_EXPERTS.md, "DeepSeek-V
 | synthetic DeepSeek-shaped model, local vs split, 64 tokens | passes (CI step, 15 checks) |
 | DSpark drafter with `--remote-experts` | **fixed in code, not run on real weights**: `--dspark auto` dropped the drafter in every split (the rule counted the whole pack's 132 GB of experts against the conductor's 35 GB of VRAM, `ds4_model.cu`, now `ds4_dspark_rule.hpp`); with remote experts auto now keeps it. A verify window of k + 1 tokens already went to the servers as one call per layer (`cpu_experts` -> `Remote::run`, up to `kMaxTok` = 16 tokens, one request per route); the synthetic split test proves that (wire calls == layer calls). Mechanism numbers below; the real-weights before / after is one command (below), waiting for free GPUs |
 | real weights, real split | **not run**: `/mnt/bulk/strata/models/deepseek41/RESULTS.md` did not exist when this was written (the 2.00 bpw set is on disk, 4 shards, sha256 ok). Tools are ready: `slice_stream.py`, `plan_split.py`, the server flags below |
-| GPU expert server for dsv41 (rig 72 GB VRAM, stream 5070 Ti) | not done; needs the engine's VRAM expert slots behind `serve_experts` (see "Next") |
+| GPU expert server for dsv41 (`--expert-server-gpu`, BBXL) | built and measured on the rig RTX 3090 (synthetic pack only): rows within 1.1e-3 of the CPU server's, 8-13x faster a call; **not run on the stream PC 5070 Ti** (no CUDA toolkit there yet, TODO-1276) and not run on real weights; see "GPU expert server" |
 | prompt path through the servers | not done: the chunked prompt path streams experts from the conductor's own files, so the conductor needs the whole model on its disk |
 
 ## Commands
@@ -183,6 +183,83 @@ These are CPU-only upper bounds on the remote work. The conductor's VRAM-residen
 the GPU and never leave the conductor, so the real remote share per token is smaller; the DSpark drafter's verify windows share expert reads between
 tokens. Neither is measured here. The wire is not the limit (0.75-0.9 ms a layer, 1.2 estimated for the rig); the per-layer compute of the slow hosts is.
 
+## GPU expert server (`--expert-server-gpu`, BBXL)
+
+`strata-dsv41 --expert-server-gpu` (or the engine-less `strata-dsv41-expert-server-gpu`) keeps the served layers' routed experts in VRAM and
+answers a window with the engine's own kernels: the window's (token, expert) pairs become a plan of blob addresses, `moe_win_group` groups them
+by expert (each expert read once for all the tokens that picked it), `gguf::win_rows` (`win_experts` without the combine) runs gate / up, the
+clamped swiglu and down on the card, and the un-weighted rows go back over the same SXP1 wire. Code: `ds4_net_gpu.cu` (upload, compute),
+`ds4_gpu_place.hpp` (fit rules, no CUDA, unit-tested by `ds4_gpu_place_test`, which CI's ctest runs). Flags (beside `--pack --listen --serve-layers --serve-experts`):
+
+| Flag | Meaning |
+| --- | --- |
+| `--expert-server-gpu` | experts in VRAM; implies `--expert-server` |
+| `--gpu-vram-gb G` | most VRAM the experts may take (default: free VRAM minus the reserve) |
+| `--gpu-reserve-mib N` | kept free after the experts and the work buffers (default 256) |
+| `--gpu-device N` | CUDA ordinal (default 0; pin a rig card with `CUDA_VISIBLE_DEVICES=<uuid>`, never by index) |
+| `--gpu-cpu-rest` | layers that do not fit, or whose expert type has no device kernel, are served by the CPU lane |
+
+Without `--gpu-cpu-rest` a server that cannot hold everything refuses to start and prints the shortfall (1.58 GiB of experts, 0.5 GiB cap:
+"short by 1.08 GiB"). The CPU-only binary answers `--expert-server-gpu` with "this build has no CUDA". The server sets `DS4_IQ_Q8K=1` unless the
+environment says otherwise: the device rounds a low-bit expert's activations per 32 values by default, the CPU lane per 256 (ggml's Q8_K);
+without it the rows differ by 10-30 % of their RMS on random weights, with it by about 1e-6 (MXFP4 and most layers) to 1e-3.
+
+**Rows are not bit-identical to the CPU server's** (as for Qwen's `--expert-server-gpu`): the two sum a block's products in another order, and an
+activation on an int8 rounding boundary can flip one quantum. `ds4_gpu_rows_test` (CUDA, built by name) compares both hosts on windows of 1-16
+tokens with shared experts and masked entries: unasked rows untouched, every row finite and within 5e-2 of its RMS, at most 1 % of rows beyond 2e-3. A
+conductor that falls back to its own CPU lane mixes the two kinds of row; greedy tokens agree except near ties (the random toy below diverges at
+token 5, deterministically: the same GPU server twice gives the same hash).
+
+### Measured (2026-11-03, synthetic pack of the real shape, no real weights)
+
+Rig, RTX 3090 (sm_86, CUDA 12.4, gcc 13) pinned by UUID, TabbyAPI's 1.9 GB on it idle; CPU server = the T340 binary on the rig's i5-9400, 6 threads.
+Pack: hidden 5120, FFN 2304, top-6, 4 layers x 48 experts (IQ1_M, IQ2_XXS / IQ1_M, IQ2_XS / IQ1_M, IQ2_XXS / IQ2_XS), 1.58 GiB in VRAM
+(upload 2.2 s warm, 19 s cold). A layer call, 200 calls a window size after 20 warm-up, fresh random picks and layer every call (`ds4_gpu_rows_test --bench 200`):
+
+| window | CPU server ms | GPU server ms | GPU speed-up | CPU vs 1 token | GPU vs 1 token |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4.114 | 0.327 | 12.6x | 1.00 | 1.00 |
+| 2 | 8.429 | 0.635 | 13.3x | 2.05 | 1.94 |
+| 4 (a K=4 verify window) | 12.450 | 1.140 | 10.9x | 3.03 | 3.48 |
+| 8 | 21.170 | 2.153 | 9.8x | 5.15 | 6.58 |
+| 16 | 34.932 | 4.276 | 8.2x | 8.49 | 13.07 |
+
+**The K=4 verify window costs 3.5x one token on the GPU server and 3.0x on this rig's CPU (S1 measured 4.8x on the T340): the GPU is not flat in the window.**
+Distinct experts are read once, but a window of 4 touches about 20 experts against 6 for one token, and a 3090 reading 8.6 MB experts is
+memory bound, so compute grows with the distinct experts. What changes is its size next to the round trip: the server's own mean compute a call over the 64-token run was
+0.416 ms (GPU) against 4.516 ms (CPU). With a fixed 1 ms of wire and protocol a call (an estimate from the decode below, loopback), a K=4 window costs about 1.7x one token on the
+GPU server and 2.6x on the CPU one: DSpark pays better through the GPU server, but a window is never nearly free. Not measured: a K=4 window through the wire.
+
+Conductor's split test (`ds4_net_test --mode remote`, 64 greedy tokens: 63 single-token steps x 4 layers = 252 calls, the toy's dense part included):
+
+| Server | Conductor | ms a token | tok/s |
+| --- | --- | ---: | ---: |
+| CPU (rig) | on the rig, loopback | 20.5 | 48.9 |
+| GPU (rig 3090) | on the rig, loopback | 4.8 | 207 |
+| CPU (rig) | T340 through an ssh tunnel (the rig's ufw does not admit the T340 on 7841-7842 directly; left as it is) | 27.4 | 36.6 |
+| GPU (rig 3090) | T340 through an ssh tunnel | 14.0 | 71.5 |
+
+CPU-server rows hash `e7f2d1b3164e44c1` as in the table above; the GPU server's is `145113bd71350179` every run. The tunnel adds about 2.2 ms a call, and the T340 runs the toy's dense part slower than the rig.
+Not done: the 2k / 16k prompts with unique prefixes. An expert server's cost does not depend on the context length (attention is the conductor's), and the prompt path
+through the servers (Next, item 3) and the real weights are not there, so no such run exists; the numbers above are per layer call and per toy token.
+
+### Commands
+
+```sh
+# rig (Ubuntu, CUDA 12.4: nvcc wants gcc 13 as host compiler; sm_86 for the 3090 / 3060s; the rig's 5070 is sm_120 and needs CUDA 12.8+)
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_DSV41=ON -DCMAKE_CUDA_ARCHITECTURES=86-real \
+      -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13 -DCMAKE_CUDA_HOST_COMPILER=g++-13
+cmake --build build --target strata-dsv41-expert-server-gpu ds4_gpu_rows_test -j3     # 37 steps once the libraries are built
+CUDA_VISIBLE_DEVICES=<card uuid> STRATA_EXPERT_TOKEN=... build/strata-dsv41-expert-server-gpu --pack PACK --listen 0.0.0.0:7841 \
+      --expert-server-gpu --serve-layers 27-29 [--gpu-vram-gb 20] [--gpu-cpu-rest]
+CUDA_VISIBLE_DEVICES=<card uuid> build/ds4_gpu_rows_test --pack SYNTHETIC_PACK [--bench 200]     # rows vs the CPU server; needs a free card
+```
+
+The rig has six cards, pinned by UUID (`add_a_3060.md`): the 3090 (24 GB) holds seven 3.3 GB layers, each 3060 (12 GB) about three. The three 3060s and the 5070 hold
+TabbyAPI models today, so a real run needs them unloaded, as the Placement table says. **Stream PC (RTX 5070 Ti, sm_120):** the same two targets with
+`-DCMAKE_CUDA_ARCHITECTURES=120-real` and CUDA 13.x (the build section above, TODO-1276); `strata-dsv41-expert-server-gpu.exe` takes the same flags, and
+`--gpu-vram-gb 5` fits what the Placement table says is free beside TabbyAPI. Not built or run there (no toolkit; the stream PC is not touched from this work).
+
 ## Faults, security
 
 As for Qwen (docs/REMOTE_EXPERTS.md): shared token, the server binds loopback unless told otherwise, a route that fails is computed locally and retried
@@ -195,6 +272,6 @@ would still agree except on near-ties) - the synthetic test and `ROWHASH` are ho
 
 1. The real-weights split (RESULTS.md gate): conductor `strata-dsv41` on the gaming PC, T340 + stream PC (CPU servers) with slices of their layers, 64 tokens against the single-process
    reference, tok/s and round trip. Until then the synthetic test and the row-hash runs above are the evidence.
-2. A dsv41 GPU expert server (the engine's VRAM expert slots behind `serve_experts`, as `--expert-server-gpu` does for Qwen) for the rig and the stream PC's 5070 Ti.
+2. The GPU expert server on the stream PC's 5070 Ti and on real weights (done on the rig's 3090 with a synthetic pack: "GPU expert server" above).
 3. The prompt path through the servers (as B3 did for Qwen), so the conductor needs no local copy of served layers.
 4. Disk: the 3 bit set needs about 60 GB more on the rig and 25 GB on the T340, or a NAS mount.

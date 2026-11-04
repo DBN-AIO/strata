@@ -3,6 +3,9 @@
 #include "ds4_net.hpp"
 
 #include "ds4_gguf_cpu.hpp"
+#if defined(STRATA_DS4_NET_GPU)
+#include "ds4_net_gpu.hpp"
+#endif
 #include "ds4_os.hpp"
 #include "strata/core/net_proto.hpp"
 
@@ -514,6 +517,9 @@ int server_main(int argc, char** argv) {
     std::string pack, host = "127.0.0.1", layers, experts;
     int port = 7840, threads = 0;
     bool warm = true, once = false;
+    bool gpu = false, gpu_cpu_rest = false;   // --expert-server-gpu: the served experts in VRAM (needs a CUDA build)
+    double gpu_gb = 0.0;
+    long gpu_reserve_mib = 256, gpu_device = 0;
     static const char* const with_value[] = {"--gpus", "--max-context", "--reserve-mib", "--vram-experts", "--expert-profile", "--ssd-cache",
                                              "--ssd-policy", "--dspark", "--dspark-conf", "--experts", "--native", "--spec", "--prefill",
                                              "--expert-cache", "--pcie-frac", "--gpu"};
@@ -533,9 +539,17 @@ int server_main(int argc, char** argv) {
         else if (a == "--serve-experts") experts = val("--serve-experts");
         else if (a == "--cpu-threads") threads = std::atoi(val("--cpu-threads").c_str());
         else if (a == "--no-warm") warm = false;
+        else if (a == "--expert-server-gpu") gpu = true;
+        else if (a == "--gpu-vram-gb") gpu_gb = std::atof(val("--gpu-vram-gb").c_str());
+        else if (a == "--gpu-reserve-mib") gpu_reserve_mib = std::atol(val("--gpu-reserve-mib").c_str());
+        else if (a == "--gpu-device") gpu_device = std::atol(val("--gpu-device").c_str());
+        else if (a == "--gpu-cpu-rest") gpu_cpu_rest = true;
         else if (a == "--once") once = true;
         else if (a == "--help" || a == "-h") {
             std::printf("strata-dsv41 --expert-server --pack DIR --listen [HOST:]PORT [--serve-layers A-B] [--serve-experts E0-E1] [--cpu-threads N] [--no-warm]\n"
+                        "  strata-dsv41 --expert-server-gpu ... [--gpu-vram-gb G] [--gpu-reserve-mib N] [--gpu-device N] [--gpu-cpu-rest]\n"
+                        "  keeps the served experts in VRAM (CUDA build only): refuses, printing the shortfall, when they do not fit the card;\n"
+                        "  --gpu-cpu-rest serves the layers that do not fit from the CPU lane instead.\n"
                         "  serves the pack's routed experts of layers A-B (default: all) to a conductor started with\n"
                         "  --remote-experts HOST:PORT=A-B.  CPU only: CUDA is never touched.  STRATA_EXPERT_TOKEN sets the shared secret.\n");
             return 0;
@@ -561,9 +575,30 @@ int server_main(int argc, char** argv) {
     }
     ExpertHost host_;
     if (!host_.open(map, lo, hi, threads, err)) { std::fprintf(stderr, "strata-dsv41 --expert-server: %s\n", err.c_str()); return 1; }
+#if defined(STRATA_DS4_NET_GPU)
+    std::unique_ptr<GpuExpertHost> gpuh;
+    if (gpu) {
+        GpuOpts go;
+        go.device = (int) gpu_device;
+        go.cap_bytes = gpu_gb > 0.0 ? (uint64_t) (gpu_gb * 1073741824.0) : 0;
+        go.reserve_bytes = (uint64_t) std::max(0L, gpu_reserve_mib) << 20;
+        go.cpu_rest = gpu_cpu_rest;
+        gpuh.reset(new GpuExpertHost());
+        if (!gpuh->open(map, lo, hi, elo, ehi, go, err)) { std::fprintf(stderr, "strata-dsv41 --expert-server-gpu: %s\n", err.c_str()); return 1; }
+    }
+#else
+    if (gpu) { std::fprintf(stderr, "--expert-server-gpu: this build has no CUDA; use strata-dsv41 (the CUDA build)\n"); return 2; }
+    (void) gpu_gb; (void) gpu_reserve_mib; (void) gpu_device; (void) gpu_cpu_rest;
+#endif
     if (warm) {
         const double t0 = now_ms();
-        const uint64_t b = host_.warm(lo, hi, elo, ehi);
+        uint64_t b = 0;
+        for (int l = lo; l <= hi; ++l) {   // (a layer in VRAM is not read into the page cache: the card holds it)
+#if defined(STRATA_DS4_NET_GPU)
+            if (gpuh && gpuh->holds(l)) continue;
+#endif
+            b += host_.warm(l, l, elo, ehi);
+        }
         std::fprintf(stderr, "strata net: dsv41 served layers %d-%d resident %.2f GiB (touched in %.1f s)\n", lo, hi, (double) b / (1024.0 * 1024 * 1024), (now_ms() - t0) / 1000.0);
     }
     core::ExpertServeCfg cfg;
@@ -571,6 +606,9 @@ int server_main(int argc, char** argv) {
     cfg.n_layers = map.n_layers; cfg.n_expert = map.n_exp; cfg.top_k = map.top_k;
     cfg.identity = map.identity();
     cfg.max_tok = kMaxTok; cfg.max_entries = kMaxEntries; cfg.once = once; cfg.expert_lo = elo; cfg.expert_hi = ehi;
+#if defined(STRATA_DS4_NET_GPU)
+    if (gpuh) { cfg.gpu = true; cfg.gpu_user = gpuh.get(); cfg.gpu_rows = [](void* u) -> uint64_t { return ((GpuExpertHost*) u)->rows(); }; }
+#endif
     long die_after = 0;   // test hook: the server exits after N requests, as if the host had gone (STRATA_DS4_SERVER_DIE_AFTER)
     if (const char* v = std::getenv("STRATA_DS4_SERVER_DIE_AFTER")) die_after = std::atol(v);
     std::atomic<long> served{0};
@@ -579,6 +617,9 @@ int server_main(int argc, char** argv) {
                  np::hex(cfg.identity.fingerprint, 8).c_str());
     return core::serve_experts(cfg, [&](uint32_t layer, uint32_t n_tok, uint32_t k, int, const int32_t* ids, const uint8_t* mask, const float* x, float* out, std::string& e2) {
         if (die_after > 0 && ++served > die_after) { std::fprintf(stderr, "strata net: STRATA_DS4_SERVER_DIE_AFTER reached, exiting\n"); std::fflush(stderr); std::_Exit(3); }
+#if defined(STRATA_DS4_NET_GPU)
+        if (gpuh && gpuh->holds((int) layer)) return gpuh->compute(layer, n_tok, k, ids, mask, x, out, e2);
+#endif
         return host_.compute(layer, n_tok, k, ids, mask, x, out, e2);
     });
 }
