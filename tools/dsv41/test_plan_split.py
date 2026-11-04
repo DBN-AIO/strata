@@ -157,5 +157,134 @@ class PlanSplit(unittest.TestCase):
         self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
 
 
+# ---------------------------------------------------------------------------------------------------- BBXL S6: storage tiers
+
+def mount(name, kind, free, reserve=0.0, path=None):
+    return {"name": name, "kind": kind, "free_gb": free, "reserve_gb": reserve, "path": path or "/mnt/" + name.strip("/")}
+
+
+# 8 layers of 1 GB.  disk_gb (the old single number) counts the SATA disks too: it is what plan_split used before the storage tiers.
+def sfleet(rig_nvme=2.0, t340_tmpfs=3.0, rig_sata=50.0, stream=None):
+    f = [
+        {"name": "cond", "addr": None, "mem_gb": 3.0, "disk_gb": 1e9, "compute_ms": 2.5, "wire_ms": 0.0,
+         "storage": [mount("nvmeA", "nvme", 2.0), mount("nvmeB", "nvme", 1.5), mount("bulk", "sata", 400.0)]},
+        {"name": "rig", "addr": "10.0.0.2:7840", "mem_gb": 10.0, "disk_gb": rig_nvme + rig_sata, "compute_ms": 4.5, "wire_ms": 1.2,
+         "storage": [mount("models", "nvme", rig_nvme), mount("root", "sata", rig_sata)]},
+        {"name": "t340", "addr": "10.0.0.3:7840", "mem_gb": 10.0, "disk_gb": 53.0, "compute_ms": 6.4, "wire_ms": 0.75,
+         "storage": [mount("shm", "tmpfs", t340_tmpfs), mount("root", "sata", 50.0)]},
+    ]
+    if stream is not None:
+        f.append(stream)
+    return f
+
+
+class Storage(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.d = self.td.name
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def plan(self, fleet, *args):
+        fp = os.path.join(self.d, "fleet.json")
+        with open(fp, "w") as f:
+            json.dump(fleet, f)
+        return subprocess.run([sys.executable, PLAN, "--uniform-gb", "1.0", "--layers", str(NL), "--experts", str(NE), "--hosts", fp, "--json"]
+                              + list(args), capture_output=True, text=True)
+
+    def popfile(self):
+        p = os.path.join(self.d, "pop.bin")
+        write_profile(p, zipf_rows())
+        return p
+
+    def targets(self, res):
+        return [t for t in res["storage"]["targets"]]
+
+    def test_sata_is_never_chosen_while_nvme_has_room(self):
+        r = self.plan(sfleet())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = json.loads(r.stdout)
+        by = {p["host"]: p for p in res["plan"]}
+        self.assertLessEqual(by["rig"]["gb"], 2.0 + 1e-9, "the rig's 50 GB of SATA is not an expert disk")
+        self.assertEqual(res["storage"]["sata_used_gb"], 0)
+        for t in self.targets(res):
+            self.assertIn(t["kind"], ("nvme", "tmpfs"), t)
+
+    def test_sata_refused_without_the_flag_and_labelled_with_it(self):
+        f = sfleet(rig_nvme=1.0)                 # NVMe room 3 (the conductor's memory) + 1 + 3 = 7 < 8: SATA would be the only room
+        r = self.plan(f)
+        self.assertEqual(r.returncode, 3, r.stdout)
+        self.assertIn("SATA", r.stderr)
+        r = self.plan(f, "--allow-sata")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = json.loads(r.stdout)
+        sata = [t for t in self.targets(res) if t["kind"] == "sata"]
+        self.assertTrue(sata, "the last GB went to SATA")
+        self.assertAlmostEqual(res["storage"]["sata_used_gb"], 1.0, places=3)   # whole layers: the 8th
+        self.assertTrue(all(t["last_resort"] for t in sata))
+
+    def test_allow_sata_does_not_use_sata_when_nvme_room_exists(self):
+        r = self.plan(sfleet(), "--allow-sata")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["storage"]["sata_used_gb"], 0)
+
+    def test_an_excluded_disk_is_never_used_even_with_allow_sata(self):
+        stream = {"name": "stream", "addr": "10.0.0.4:7840", "mem_gb": 30.0, "disk_gb": 500.0, "compute_ms": 2.9, "wire_ms": 0.9,
+                  "storage": [mount("C:", "nvme", 16.0, reserve=15.0), mount("D:", "excluded", 500.0)]}
+        f = sfleet(rig_nvme=1.0, stream=stream)   # 1 GB usable on C:, 500 on the failing D:
+        r = self.plan(f, "--allow-sata")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = json.loads(r.stdout)
+        by = {p["host"]: p for p in res["plan"]}
+        self.assertLessEqual(by["stream"]["gb"], 1.0 + 1e-9)
+        for t in self.targets(res):
+            self.assertNotEqual(t["mount"], "D:")
+
+    def test_every_slice_names_its_mount_and_path(self):
+        res = json.loads(self.plan(sfleet()).stdout)
+        names = {(t["host"], t["mount"]) for t in self.targets(res)}
+        self.assertIn(("rig", "models"), names)
+        self.assertIn(("t340", "shm"), names)
+        for t in self.targets(res):
+            self.assertTrue(t["path"] and t["layers"] and t["gb"] > 0, t)
+        # a host with two NVMe mounts splits by whole layers
+        cond = [t for t in self.targets(res) if t["host"] == "cond"]
+        self.assertEqual(sum(t["gb"] for t in cond), 3.0)
+        self.assertEqual({t["mount"] for t in cond}, {"nvmeA", "nvmeB"})
+
+    def test_popularity_plan_follows_the_same_rule(self):
+        r = self.plan(sfleet(), "--popularity", self.popfile())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = json.loads(r.stdout)
+        self.assertEqual(res["storage"]["sata_used_gb"], 0)
+        for t in self.targets(res):
+            self.assertIn(t["kind"], ("nvme", "tmpfs"), t)
+        by = {h["host"]: h for h in res["popularity"]["hosts"]}
+        self.assertLessEqual(by["rig"]["gb"], 2.0 + 1e-9)
+        r = self.plan(sfleet(rig_nvme=1.0), "--popularity", self.popfile())
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("SATA", r.stderr)
+
+    def test_the_storage_report_says_what_to_free(self):
+        # no disk limit would put 3 / 3 / 2 GB; the rig has 1 GB of NVMe, the t340 has 2 GB of tmpfs
+        f = sfleet(rig_nvme=1.0, t340_tmpfs=2.0)
+        r = self.plan(f, "--storage-report")
+        res = json.loads(r.stdout) if r.stdout.strip() else {}
+        self.assertIn("storage_report", res, r.stderr)
+        rep = {h["host"]: h for h in res["storage_report"]["hosts"]}
+        self.assertGreater(rep["rig"]["free_needed_gb"], 0)
+        self.assertEqual(rep["cond"]["free_needed_gb"], 0)
+        self.assertGreater(res["storage_report"]["fleet_free_needed_gb"], 0)
+
+    def test_bad_storage_entries_are_refused(self):
+        for bad in ({"name": "x", "kind": "floppy", "free_gb": 1}, {"name": "x", "kind": "nvme", "free_gb": -1}, {"kind": "nvme", "free_gb": 1}):
+            f = sfleet()
+            f[1]["storage"] = [bad]
+            r = self.plan(f)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("storage", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
