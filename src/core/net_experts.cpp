@@ -608,7 +608,7 @@ bool NetExperts::finish(float* out, std::string& err) {
 }
 
 bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
-                        float* const* dst, std::string& err) {
+                        float* const* dst, std::string& err, int64_t max_tok) {
     if (cur_ >= 0) { err = "a decode request is in flight"; return false; }
     static const int depth = [] { const char* v = std::getenv("STRATA_NET_PIPELINE"); return v ? std::max(1, std::atoi(v)) : 4; }();
     struct Req { int64_t t0w, nt; uint64_t seq; uint32_t want; };
@@ -652,7 +652,7 @@ bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64
         const Route& r = routes_[ri];
         own[ri].assign((size_t) (T * k), 0);
         for (int64_t i = 0; i < T * k; ++i) own[ri][(size_t) i] = mask[i] && ids[i] >= r.elo && ids[i] <= r.ehi ? 1 : 0;
-        wins[ri] = np::prompt_windows(T, k, own[ri].data(), strata::kernels::kWindowMaxT);
+        wins[ri] = np::prompt_windows(T, k, own[ri].data(), max_tok > 0 ? max_tok : (int64_t) strata::kernels::kWindowMaxT);
         most = std::max(most, wins[ri].size());
     }
     for (size_t w = 0; w < most && !failed; ++w)

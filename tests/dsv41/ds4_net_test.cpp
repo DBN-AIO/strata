@@ -54,6 +54,11 @@ int main(int argc, char** argv) {
     // (the engine's cpu_experts); off: Remote::run, then the local ones.  --local-delay-ms N charges every layer N ms of conductor-side lane
     // time (a sleep: deterministic on a loaded host), so the timing tests can tell "the sum" from "the longer of the two".
     bool overlap = false;
+    // BBXL S5: --prompt-path sends the prompt through Remote::prompt (T tokens of a layer at once, in --slab token slabs: the engine's chunk path)
+    // instead of 16-token windows; --prompt may then be long (any size, slabs of --slab tokens each through every layer); --local-win N: the window
+    // the local arm computes in; --no-hash skips the row hash (timing runs); --time also prints PREFILL ms / tok/s.
+    bool prompt_path = false, no_hash = false;
+    int slab = 256, local_win = kMaxPromptTok;
     int salt = 0;   // --prompt-salt N: another prompt (a unique prefix for every timing run)
     int local_delay_ms = 0;
     for (int i = 1; i < argc; ++i) {
@@ -72,6 +77,10 @@ int main(int argc, char** argv) {
         else if (a == "--count-out") count_out = v();
         else if (a == "--time") show_time = true;
         else if (a == "--overlap") overlap = true;
+        else if (a == "--prompt-path") prompt_path = true;
+        else if (a == "--slab") slab = std::max(1, std::atoi(v().c_str()));
+        else if (a == "--local-win") local_win = std::max(1, std::min(kMaxPromptTok, std::atoi(v().c_str())));
+        else if (a == "--no-hash") no_hash = true;
         else if (a == "--prompt-salt") salt = std::atoi(v().c_str());
         else if (a == "--local-delay-ms") local_delay_ms = std::atoi(v().c_str());
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
@@ -80,7 +89,7 @@ int main(int argc, char** argv) {
     std::string err;
     if (pack.empty() || !map.load(pack, err)) { std::fprintf(stderr, "pack: %s\n", err.c_str()); return 2; }
     const int D = map.dim, L = map.n_layers, K = map.top_k, NE = map.n_exp;
-    if (n_prompt < 1 || n_prompt > kMaxTok) { std::fprintf(stderr, "--prompt 1..%d\n", kMaxTok); return 2; }
+    if (n_prompt < 1 || (n_prompt > kMaxTok && mode != "local" && !prompt_path)) { std::fprintf(stderr, "--prompt 1..%d (longer: --prompt-path or --mode local)\n", kMaxTok); return 2; }
 
     ExpertHost host;
     if (!host.open(map, 0, L - 1, threads, err)) { std::fprintf(stderr, "host: %s\n", err.c_str()); return 1; }
@@ -122,10 +131,10 @@ int main(int argc, char** argv) {
     long rows_total = 0;
     std::vector<int> seq;
     std::vector<int> prompt;
-    for (int i = 0; i < n_prompt; ++i) prompt.push_back((int) ((i * 7 + 3 + salt * 13) % vocab));
+    for (int i = 0; i < n_prompt; ++i) prompt.push_back((int) (((i * 7 + 3 + salt * 13) + (i / vocab) * (1 + salt % 5) * 11) % vocab));
 
     // one window of nt tokens (their hidden states h: nt x D) through every layer
-    auto forward = [&](int nt, std::vector<float>& h) {
+    auto forward = [&](int nt, std::vector<float>& h, bool is_prompt) {
         std::vector<float> xn((size_t) nt * D), moe((size_t) nt * D), rows((size_t) nt * K * D), sc((size_t) NE);
         std::vector<int32_t> ids((size_t) nt * K);
         std::vector<float> wts((size_t) nt * K);
@@ -149,7 +158,24 @@ int main(int argc, char** argv) {
             }
             // the routed experts: the unit under test
             if (mode == "local") {
-                if (!host.compute((uint32_t) l, (uint32_t) nt, (uint32_t) K, ids.data(), mask.data(), xn.data(), rows.data(), err)) { std::fprintf(stderr, "local: %s\n", err.c_str()); std::exit(1); }
+                for (int t0 = 0; t0 < nt; t0 += local_win) {
+                    const int w = std::min(local_win, nt - t0);
+                    if (!host.compute((uint32_t) l, (uint32_t) w, (uint32_t) K, ids.data() + (size_t) t0 * K, mask.data() + (size_t) t0 * K, xn.data() + (size_t) t0 * D,
+                                      rows.data() + (size_t) t0 * K * D, err)) { std::fprintf(stderr, "local: %s\n", err.c_str()); std::exit(1); }
+                }
+            } else if (prompt_path && is_prompt) {
+                // BBXL S5: the whole slab of this layer through the servers; what no route owns, and what failed, is computed here
+                std::vector<uint8_t> got;
+                if (!remote.prompt(l, xn.data(), (size_t) D, nt, ids.data(), rows.data(), got, err)) std::fprintf(stderr, "prompt path layer %d: %s (computing it here)\n", l, err.c_str());
+                std::vector<uint8_t> m2((size_t) nt * K, 0);
+                bool any = false;
+                for (size_t i = 0; i < m2.size(); ++i) if (!got[i]) { m2[i] = 1; any = true; }
+                if (local_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(local_delay_ms));
+                for (int t0 = 0; any && t0 < nt; t0 += local_win) {
+                    const int w = std::min(local_win, nt - t0);
+                    if (!host.compute((uint32_t) l, (uint32_t) w, (uint32_t) K, ids.data() + (size_t) t0 * K, m2.data() + (size_t) t0 * K, xn.data() + (size_t) t0 * D,
+                                      rows.data() + (size_t) t0 * K * D, err)) { std::fprintf(stderr, "prompt fallback: %s\n", err.c_str()); std::exit(1); }
+                }
             } else {
                 // as the engine's Ents: one item per expert (<= 16 tokens), slots in order; then what did not come back runs here
                 std::map<int, std::vector<int>> by;
@@ -194,7 +220,7 @@ int main(int argc, char** argv) {
                             std::memcpy(&rows[(size_t) slot_entry[(size_t) (items[q].slot0 + i)] * D], &y[(size_t) (items[q].slot0 + i) * D], (size_t) D * 4);
             }
             rows_total += nt * K;
-            row_hash = fnv(row_hash, rows.data(), rows.size() * 4);
+            if (!no_hash) row_hash = fnv(row_hash, rows.data(), rows.size() * 4);
             for (int t = 0; t < nt; ++t) {
                 float* mo = &moe[(size_t) t * D];
                 for (int d = 0; d < D; ++d) mo[d] = 0.0f;
@@ -234,19 +260,36 @@ int main(int argc, char** argv) {
         }
         return best;
     };
-    // the prompt as one window, then one token a step
-    std::vector<float> h((size_t) n_prompt * D);
-    for (int t = 0; t < n_prompt; ++t) std::memcpy(&h[(size_t) t * D], &emb[(size_t) prompt[(size_t) t] * D], (size_t) D * 4);
-    forward(n_prompt, h);
-    int tok = next_token(&h[(size_t) (n_prompt - 1) * D]);
+    // the prompt: one window (<= 16 tokens), or - long prompts - slabs of --slab tokens, each through every layer (the toy has no attention, so a
+    // slab does not depend on the one before it: the same rows whatever the slab size); then one token a step
+    auto prompt_row = [&](int t, float* dstrow) {
+        std::memcpy(dstrow, &emb[(size_t) prompt[(size_t) t] * D], (size_t) D * 4);
+        if (n_prompt > kMaxTok)   // a long prompt: a per-position part, so the rows (and the routing) differ from token to token
+            for (int d = 0; d < D; ++d) {
+                const uint32_t hv = (uint32_t) t * 2654435761u + (uint32_t) d * 40503u + (uint32_t) salt * 977u;
+                dstrow[d] += 0.5f * ((float) (((hv ^ (hv >> 15)) * 2246822519u) >> 8) / 8388608.0f - 1.0f);
+            }
+    };
+    std::vector<float> h_last((size_t) D);
+    const auto t_pre = std::chrono::steady_clock::now();
+    const int slab_n = n_prompt <= kMaxTok ? n_prompt : slab;
+    for (int t0 = 0; t0 < n_prompt; t0 += slab_n) {
+        const int w = std::min(slab_n, n_prompt - t0);
+        std::vector<float> h((size_t) w * D);
+        for (int t = 0; t < w; ++t) prompt_row(t0 + t, &h[(size_t) t * D]);
+        forward(w, h, true);
+        if (t0 + w >= n_prompt) std::memcpy(h_last.data(), &h[(size_t) (w - 1) * D], (size_t) D * 4);
+    }
+    const double pre_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pre).count();
+    int tok = next_token(h_last.data());
     seq.push_back(tok);
     // (a recurrent carry stands in for attention's memory, so the toy does not fall into a one-token cycle)
-    std::vector<float> carry(&h[(size_t) (n_prompt - 1) * D], &h[(size_t) (n_prompt - 1) * D] + D);
+    std::vector<float> carry(h_last);
     const auto t_dec = std::chrono::steady_clock::now();
     for (int s = 1; s < n_new; ++s) {
         std::vector<float> h1(&emb[(size_t) tok * D], &emb[(size_t) tok * D] + D);
         for (int d = 0; d < D; ++d) h1[(size_t) d] += 0.8f * carry[(size_t) d];
-        forward(1, h1);
+        forward(1, h1, false);
         carry = h1;
         tok = next_token(h1.data());
         seq.push_back(tok);
@@ -257,11 +300,13 @@ int main(int argc, char** argv) {
         if (cf == nullptr || std::fwrite(counts.data(), 4, counts.size(), cf) != counts.size()) { std::fprintf(stderr, "--count-out: cannot write %s\n", count_out.c_str()); return 1; }
         std::fclose(cf);
     }
+    if (show_time) std::printf("PREFILL %.1f ms over %d tokens, %.1f tok/s\n", pre_ms, n_prompt, pre_ms > 0 ? n_prompt * 1000.0 / pre_ms : 0.0);
     if (show_time) std::printf("DECODE %.3f ms a token over %d tokens\n", n_new > 1 ? dec_ms / (double) (n_new - 1) : 0.0, n_new - 1);
     std::printf("TOKENS");
     for (int t : seq) std::printf(" %d", t);
     std::printf("\nROWHASH %016llx\nROWS %ld FINITE %d\n", (unsigned long long) row_hash, rows_total, (int) !(flag & 1));
     if (mode == "remote") std::printf("STATS %s\n", remote.stats().c_str());
+    if (mode == "remote") std::printf("PROMPTWIN %d\n", remote.prompt_window());
     if (host.calls() > 0)
         std::fprintf(stderr, "HOST %llu calls, %.3f ms a call (this process's own lane)\n", (unsigned long long) host.calls(), host.compute_ms() / (double) host.calls());
     return 0;

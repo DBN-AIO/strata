@@ -343,7 +343,7 @@ bool ExpertHost::compute(uint32_t layer, uint32_t n_tok, uint32_t k, const int32
     std::lock_guard<std::mutex> lk(I.mu);
     const ExpertMap& m = *I.m;
     if ((int) layer < I.lo || (int) layer > I.hi) { err = "layer " + std::to_string(layer) + " is not served here"; return false; }
-    if (n_tok < 1 || (int) n_tok > kMaxTok || (int) k != m.top_k) { err = "window outside the limits"; return false; }
+    if (n_tok < 1 || (int) n_tok > kMaxPromptTok || (int) k != m.top_k) { err = "window outside the limits"; return false; }
     const double t0 = now_ms();
     const ExpertLayer& L = m.layers[(size_t) layer];
     const int E = m.dim, FF = m.ff;
@@ -369,7 +369,7 @@ bool ExpertHost::compute(uint32_t layer, uint32_t n_tok, uint32_t k, const int32
     I.xa.resize(xs * (size_t) n_tok);
     I.ha.resize(hs * (size_t) n_ent);
     I.hf.assign((size_t) n_ent * (size_t) FF, 0.0f);
-    bool need[kMaxTok] = {};
+    bool need[kMaxPromptTok] = {};
     for (const Job& j : jobs) for (int q = 0; q < j.n; ++q) need[j.tok[q]] = true;
     for (uint32_t t = 0; t < n_tok; ++t)
         if (need[t]) {
@@ -476,6 +476,7 @@ struct Remote::Impl {
     // BBXL S4: the layer between begin() and finish()
     bool pending = false;
     int layer_ = 0, n_items_ = 0;
+    int pwin = kMaxPromptTok;                  // BBXL S5: tokens a prompt window holds
     std::vector<Remote::Item> items_;
     std::vector<int> pos;
     std::vector<char> sent;                    // item q's rows are on their way
@@ -494,6 +495,15 @@ bool Remote::open(const ExpertMap& m, const std::string& spec, std::string& err,
     p_->perm.clear();
     if (const char* pf = std::getenv("STRATA_DS4_EXPERT_PERM")) {
         if (*pf && !load_expert_perm(pf, m.n_layers, m.n_exp, p_->perm, err)) return false;
+    }
+    // BBXL S5: the prompt window, inside the frame limits of the wire (request 1 MiB, answer 4 MiB) for this hidden size
+    {
+        int w = kMaxPromptTok;
+        if (const char* v = std::getenv("STRATA_DS4_PROMPT_WIN")) w = std::max(1, std::min(w, std::atoi(v)));
+        const long long req_row = (long long) m.dim * 4 + (long long) m.top_k * 5, rsp_row = (long long) m.top_k * m.dim * 4;
+        if (req_row > 0) w = (int) std::min<long long>(w, ((1ll << 20) - 4096) / req_row);
+        if (rsp_row > 0) w = (int) std::min<long long>(w, ((4ll << 20) - 64) / rsp_row);
+        p_->pwin = std::max(1, w);
     }
     core::NetIdentity id = m.identity();
     if (arch_override != 0xffffffffu) id.arch = arch_override;
@@ -555,6 +565,41 @@ bool Remote::begin(int layer, const float* x, size_t ldx, const Item* items, int
     return true;
 }
 bool Remote::in_flight() const { return p_->pending; }
+int Remote::prompt_window() const { return p_->pwin; }
+bool Remote::prompt(int layer, const float* x, size_t ldx, int T, const int32_t* ids, float* rows, std::vector<uint8_t>& got, std::string& err) {
+    Impl& I = *p_;
+    const int k = I.top_k, dim = I.dim;
+    got.assign((size_t) std::max(T, 0) * (size_t) k, 0);
+    if (T <= 0 || !I.net.serves(layer)) return true;
+    std::vector<int32_t> rid((size_t) T * (size_t) k, 0);
+    std::vector<uint8_t> mask((size_t) T * (size_t) k, 0);
+    size_t n = 0;
+    for (size_t i = 0; i < mask.size(); ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= I.n_exp) continue;   // not an expert of this pack: the caller's
+        rid[i] = I.perm.empty() ? e : (int32_t) I.perm[(size_t) layer * (size_t) I.n_exp + (size_t) e];
+        if (I.net.owns(layer, rid[i])) { mask[i] = 1; ++n; }
+    }
+    if (n == 0) { I.n_local += mask.size(); return true; }
+    const float* xs = x;
+    std::vector<float> xc;
+    if (ldx != (size_t) dim) {   // the wire wants the rows packed
+        xc.resize((size_t) T * (size_t) dim);
+        for (int t = 0; t < T; ++t) std::memcpy(xc.data() + (size_t) t * (size_t) dim, x + (size_t) t * ldx, (size_t) dim * 4);
+        xs = xc.data();
+    }
+    std::vector<float*> dst(mask.size(), nullptr);
+    for (size_t i = 0; i < mask.size(); ++i) if (mask[i]) dst[i] = rows + i * (size_t) dim;
+    if (!I.net.prompt(layer, xs, rid.data(), T, k, mask.data(), dst.data(), err, I.pwin)) {
+        ++I.n_fail;
+        I.n_local += mask.size();
+        return false;
+    }
+    got = mask;
+    I.n_remote += n;
+    I.n_local += mask.size() - n;
+    return true;
+}
 bool Remote::finish(float* y, std::vector<char>& remote) {
     Impl& I = *p_;
     remote.assign((size_t) I.n_items_, 0);
@@ -647,7 +692,7 @@ int server_main(int argc, char** argv) {
     cfg.host = host; cfg.port = port; cfg.layer_lo = lo; cfg.layer_hi = hi;
     cfg.n_layers = map.n_layers; cfg.n_expert = map.n_exp; cfg.top_k = map.top_k;
     cfg.identity = map.identity();
-    cfg.max_tok = kMaxTok; cfg.max_entries = kMaxEntries; cfg.once = once; cfg.expert_lo = elo; cfg.expert_hi = ehi;
+    cfg.max_tok = kMaxPromptTok; cfg.max_entries = kMaxPromptEntries; cfg.once = once; cfg.expert_lo = elo; cfg.expert_hi = ehi;
     long die_after = 0;   // test hook: the server exits after N requests, as if the host had gone (STRATA_DS4_SERVER_DIE_AFTER)
     if (const char* v = std::getenv("STRATA_DS4_SERVER_DIE_AFTER")) die_after = std::atol(v);
     std::atomic<long> served{0};
