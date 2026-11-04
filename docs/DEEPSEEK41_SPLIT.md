@@ -217,6 +217,69 @@ its `--expert-profile`; pass the same counts there. (3) The CUDA `strata-dsv41` 
 the CPU build compiles and `ds4_net_test` exercises, and the engine reaches it unchanged through `net::Remote::run`. (4) A GPU expert server that places the hottest RANKS in VRAM
 (not whole layers) would make the remote GPU tier worth more than this estimate says.
 
+## Storage tiers: experts on NVMe, never SATA (BBXL S6)
+
+Captain 1's order (2026-11-03): every expert slice and conductor spill goes on NVMe, never SATA; `plan_split.py` takes a per-host storage tier (VRAM > RAM > NVMe > SATA)
+and refuses SATA for experts when NVMe room exists; prefill reads from NVMe too. Survey of 2026-11-03 (gaming PC and stream PC from the order, the rig and the T340 read
+only by this session with `lsblk` / `df` / `findmnt`; nothing was changed or deleted):
+
+| Host | NVMe / RAM for experts | SATA (never for experts) | Note |
+| --- | --- | --- | --- |
+| gaming PC | 3 NVMe mounts: `Games` 30 GB free (after Flash-Next), `/mnt/ai` 38, `/mnt/ai_models` 36 = **104 GB** | `/mnt/bulk` (860 EVO, 550 MB/s; where the 2.00 set sits today) | RAM floor 12 GB free: 35 GB VRAM + 52 GB page cache of 64 leaves 12 |
+| rig | WD Green SN3000 1 TB `/mnt/models`: **41 GB free** (96 % used) | `/` and `/home` are LVM on a PNY 500 GB **SATA** SSD: **`/var/tmp` is on that SATA disk, so today's slice there is on SATA**; 17 GB free | RAM floor 10 GB free (15 free with the fleet loaded). A stale NFS mount to the gaming PC (`/mnt/gaming_bulk_models`) makes a bare `df -h` hang: ask for the paths |
+| T340 | none: RAM (tmpfs `/dev/shm`) only. 29 GB available, floor 16 GB free, so **13 GB** | `/` WD spinning disk behind the PERC, 11 GB free (98 %) | no NVMe, loads no AI models |
+| stream PC | `C:` 500 GB NVMe, 16 GB free, floor 15 GB free: **1 GB usable** (a new SSD is coming) | `D:` SATA and failing: **excluded, never used** | RAM 64 GB, about 16 used by the stream |
+
+**The schema.** A host in the `--hosts` JSON gets `"storage": [{"name", "kind": "tmpfs" | "nvme" | "sata" | "hdd" | "excluded", "free_gb", "reserve_gb", "path"}, ...]`;
+`tools/dsv41/fleet.json` is the survey above in this form (hop order, the same memory, VRAM and per-call numbers as the built-in fleet, which is unchanged: a host without
+`"storage"` keeps its single `disk_gb`, taken as NVMe, so every earlier plan prints exactly as before). A host's room for experts is
+`min(its memory budget, its tmpfs + NVMe room)`; SATA adds nothing. Optional `"extra_gb"` is the conductor's spill (dense 6.2 GB + Engram 111 GB), reported beside the experts.
+
+**The rule** (tests: `tools/dsv41/test_plan_split.py`, class `Storage`; each failed before the change):
+
+- Experts go to tmpfs, then NVMe (the largest mount first), whole layers at a time: a layer's experts never straddle two disks, so the plan names the mount of every slice.
+- SATA (and hdd) holds experts only with `--allow-sata`, and only when the tmpfs / NVMe of ALL hosts together cannot hold the set; then only the tail that did not fit (layer-major:
+  the SATA disk of the host that holds the layers before it; popularity: after every NVMe tier, remote hosts only) and every such slice is printed `LAST RESORT: SATA`. If NVMe room
+  exists but whole layers or expert ranges do not fit it, the run is refused and says so (use `--popularity` or more `--groups`), not rescued with SATA.
+- An `excluded` mount (the stream PC's `D:`) is never used, with or without the flag.
+- A refused run says how much SATA is on the hosts and that it was not used. A bad storage entry (unknown kind, negative size, no name) is refused with exit 2.
+- Output (`--json`: `storage.targets`, `storage.sata_used_gb`): `slice rig -> /mnt/models (nvme) /mnt/models/strata/dsv41  layers 0-39/E254-290  12.7 GB`. That path is the
+  `slice_stream.py apply` target. A host with two mounts gets one `apply` and one server per mount (`--serve-layers` of that line).
+
+**Prefill and the conductor's spill.** The conductor needs its own experts on disk (the layers it computes, and the cold tail with `--allow-ssd`) and the dense and Engram files. They
+must be on NVMe as well: Engram rows are random reads, where SATA is 5x slower on throughput and far worse on latency. `--conductor-copy all` plans for the whole set on the conductor
+(what it needs until the prompt path runs through the servers, see Next). The planner does not move files; it prints the target paths for the existing tools.
+
+**How much of the 2.00 bpw set (132.07 GB experts, 40 layers; the planner takes 3.30 GB a layer, the real layers are 2.97-3.93) fits on NVMe, and what to free**
+(`plan_split.py --uniform-gb 3.30175 --hosts tools/dsv41/fleet.json --storage-report`; "experts" = what the host holds when disk is not the limit and its memory budget is, in the
+hop order of the layer-major plan; a host with no NVMe keeps its tmpfs as the limit):
+
+| Host | experts it holds | NVMe / tmpfs room | fits | free to hold its share | + conductor spill (dense 6.2 + Engram 111) |
+| --- | ---: | ---: | --- | ---: | ---: |
+| gaming PC | 85.8 GB | 104.0 | yes, 18 GB spare | 0 | 99.0 GB more, or 145.3 GB more with `--conductor-copy all` (the whole 132.07 GB set on the conductor) |
+| rig | 9.9 | 41.0 | yes | 0 | - |
+| T340 | 9.9 | 13.0 (tmpfs) | yes | 0 | - |
+| stream PC | 26.4 | 1.0 | **no** | **25.4 GB on `C:`** (or the new SSD) | - |
+| fleet | 132.1 | 159.0 | 106.7 GB of the set fits on NVMe / tmpfs as the disks are; **132.1 once 25.4 GB are freed on the stream PC** | 25.4 | 99.0 (gaming PC) |
+
+Read off the table: today's plan with the survey's disks **refuses** (8 layers, 26.4 GB, have no host: `plan_split.py --uniform-gb 3.30175 --hosts tools/dsv41/fleet.json`, exit 3), and the
+conductor's spill (dense + Engram = 117.2 GB) is the larger problem: it does not fit the gaming PC's 104 GB of NVMe beside 85.8 GB of experts. With the popularity plan (`--popularity`) the stream
+PC's fast CPU draws 45.4 GB instead of 26.4 (free 44.4 GB there) and the rig and T340 draw nothing; give the stream PC a `reserve`/cap if it should not be the big host. The conductor's NVMe
+needs `max(0, 85.8 + 117.2 - 104.0) = 99.0 GB` for experts plus spill. The rig needs nothing freed and should serve from `/mnt/models`, not `/var/tmp`.
+RAM floors (gaming 12, T340 16, rig 10 GB free): the planner's memory numbers are page cache, which the kernel gives back; the rig's 13 GB leaves only 2 of the 15 free GB if those pages were
+pinned, so do not `mlock` them.
+
+**Cleanup candidates (text only, proposals for the cleanup list; nothing was posted or deleted).** I could read only the rig and the T340:
+
+| Host / path | Size | Why a candidate | Verdict |
+| --- | ---: | --- | --- |
+| stream PC `C:` | need 25.4 GB | the slice's room | not surveyed (I did not touch that PC); a `C:` survey or the new SSD |
+| gaming PC `/mnt/ai`, `/mnt/ai_models`, `Games` | need 99.0 GB for the spill (or 145.3 with the whole set) | the conductor's NVMe | not surveyed; or leave the Engram off the NVMe and say so |
+| rig `/mnt/models/comfyui` | 499 GB (unet 188, diffusion_models 107, clip 62, text_encoders 58, checkpoints 44) | the rig does not need room for this set; only if the rig is to hold more than 13 GB | needs the owner's call |
+| rig `/mnt/models/tabbyapi` | 161 GB (`gpt-oss-120b-4.0bpw-exl3` 36, two `Qwen3.8-27B` 4.0 / 5.0 bpw builds with DFlash variants 19 + 16 + 16, `qwen14b_5bpw` 10) | duplicates of one model at several bit widths | needs the owner's call |
+| rig `/mnt/models/{bb_models 61, hf_train 23, muse-glimmer 19, qwen38-uncensored 24}` | 127 GB | BigBrain's Devstral-2-123B (the engine's own models: keep), a training merge, a 30B GGUF | needs the owner's call |
+| rig `/mnt/models/swapfile-ai` | 30 GB | active swap (21.9 GB in use): not a candidate | keep |
+
 ## Faults, security
 
 As for Qwen (docs/REMOTE_EXPERTS.md): shared token, the server binds loopback unless told otherwise, a route that fails is computed locally and retried
