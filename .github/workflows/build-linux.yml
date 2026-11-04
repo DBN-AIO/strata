@@ -115,8 +115,9 @@ jobs:
       # DeepSeek-V4.1-Flash experts over the LAN (docs/DEEPSEEK41_SPLIT.md): a tiny DeepSeek-shaped model with random weights in the
       # real sets' quant types, 64 greedy tokens in one process vs. through expert servers on localhost, bit-identical expert rows;
       # also two servers, a server that dies mid-run (local fallback), and the refusals (engine family, token, geometry).  ~10 s.
+      # Scratch packs go to a disk dir under the build tree (--tmp), never the runner's quota-limited tmpfs /tmp; servers are waited for by port.
       - name: DeepSeek split test (synthetic)
-        run: python3 tools/dsv41/synthetic_split_test.py build-cpu
+        run: python3 tools/dsv41/synthetic_split_test.py build-cpu --tmp build-cpu/synthetic-tmp
 
   # DEFERRED: a Windows compile check of the same target (the server's socket shim has a Winsock branch, never compiled in CI).
   # There is no Windows runner for this repository yet; when one is registered, enable this job.
