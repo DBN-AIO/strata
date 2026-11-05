@@ -16,14 +16,12 @@ int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
     // asked-for ones (only_mask), and write into the same rows.
     if (d.peer != nullptr || (d.remote_count != 0 && !cfg.gpu) || d.net != nullptr || d.plan != nullptr || d.host_res != nullptr) {
         std::fprintf(stderr, "strata net: the expert server needs a CPU-only dispatch (no peer GPU, helper GPUs, resident plan or net route); "
-                             "helper GPUs only with --expert-server-gpu
-");
+                             "helper GPUs only with --expert-server-gpu\n");
         return 1;
     }
     if (cfg.gpu && d.remote_count > 0)
         std::fprintf(stderr, "strata net: GPU expert server: %d helper GPU(s) compute the served experts they hold; their rows are the GPU "
-                             "kernels' (within kernel tolerance of the conductor's CPU rows, not bit-identical)
-", d.remote_count);
+                             "kernels' (within kernel tolerance of the conductor's CPU rows, not bit-identical)\n", d.remote_count);
     ExpertServeCfg c2 = cfg;
     c2.identity.arch = kArchQwen38;
     c2.identity.n_embd = (uint32_t) strata::kernels::cpu::H;
