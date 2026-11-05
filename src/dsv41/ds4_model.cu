@@ -18,11 +18,16 @@
 #include "ds4_model.hpp"
 #include "ds4_pick_rule.hpp"
 #include "ds4_experts_rule.hpp"
+#include "ds4_dspark_rule.hpp"
 #include "ds4_engram_io.hpp"
 
 #include "ds4_gguf.cuh"
 #include "ds4_iq.cuh"
 #include "ds4_gguf_cpu.hpp"
+#if defined(STRATA_DS4_NET)
+#include "ds4_net.hpp"
+#include "ds4_net_chunk.hpp"
+#endif
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
 #include "ds4_pcie.cuh"
@@ -708,6 +713,11 @@ struct Chunk {
     size_t w16_elems = 0;
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *bounds = nullptr, *row_tok = nullptr, *pos = nullptr;
     uint8_t* eg_rows = nullptr;
+    // BBXL S7 (STRATA_DS4_NET_PREFILL=2): a served layer's expert rows from the servers, the slab's combine inputs (net_chunk_layer); allocated at the first
+    // use, kept for the process like the busy experts' scratch above
+    float *nf_y = nullptr, *nf_w = nullptr;
+    int* nf_pos = nullptr;
+    int nf_cap = 0;
     int* bounds_pin = nullptr;   // pinned: the sort's bounds, read back
     // the CPU lane's experts streamed in: ring_n VRAM slots of ring_stride bytes in kParts parts, a batch a part,
     // kParts batches in flight on the copy stream (filled / freed: each part's last copy, its last use)
@@ -1253,6 +1263,11 @@ struct Model::Impl {
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
+#if defined(STRATA_DS4_NET)
+    std::unique_ptr<net::Remote> remote;   // --remote-experts: the CPU lane of the served layers runs on other PCs
+    std::mutex net_mu;                     // BBXL S7: the devices' threads take turns on the one Remote (net_chunk_layer)
+    std::atomic<uint64_t> net_rows{0};     // BBXL S7: expert rows the chunked flow got from the servers
+#endif
     // the state
     int64_t pos = 0;
     std::vector<int32_t> toks, ctoks;
@@ -2662,6 +2677,30 @@ struct Model::Impl {
                   std::to_string(g.ix_hd) + ", experts per token " + std::to_string(g.k_exp) + ")";
             return false;
         }
+#if defined(STRATA_DS4_NET)
+        if (!o.remote_experts.empty()) {   // before any device work: an unreachable or mismatched server is an error now, not mid-answer
+            net::ExpertMap nm;
+            if (!nm.load(o.pack, err)) {
+                err = "--remote-experts: " + err;
+                return false;
+            }
+            if (nm.dim != g.dim || nm.ff != g.ff || nm.n_layers != g.nl || nm.n_exp != g.n_exp || nm.top_k != g.k_exp) {
+                err = "--remote-experts: the pack's expert geometry differs from the engine's";
+                return false;
+            }
+            remote.reset(new net::Remote);
+            if (!remote->open(nm, o.remote_experts, err)) {
+                err = "--remote-experts: " + err;
+                remote.reset();
+                return false;
+            }
+        }
+#else
+        if (!o.remote_experts.empty()) {
+            err = "--remote-experts: this build of strata-dsv41 has no network experts";
+            return false;
+        }
+#endif
         freqs_win = rope_freqs(g.rd, 0, g.rope_theta, g.factor, g.beta_fast, g.beta_slow);
         freqs_comp = rope_freqs(g.rd, g.orig_ctx, g.comp_theta, g.factor, g.beta_fast, g.beta_slow);
 
@@ -2840,7 +2879,14 @@ struct Model::Impl {
             for (const auto& kt : pk.t)
                 if (kt.first.rfind("layers.", 0) == 0 && kt.first.find(".ffn.experts.") != std::string::npos) exp_b += (double) kt.second.bytes;
             for (const Dev& d : devs) room_b += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20));
-            if (exp_b > 1.5 * room_b) {
+#if defined(STRATA_DS4_NET)
+            const bool remote_on = remote != nullptr;
+#else
+            const bool remote_on = false;
+#endif
+            if (remote_on)
+                std::fprintf(stderr, "ds4: DSpark drafter kept with --remote-experts: a verify window is one batched call per served layer\n");
+            if (!dspark_auto_keeps(exp_b, room_b, remote_on)) {
                 o.dspark = false;
                 std::fprintf(stderr, "ds4: DSpark not loaded: the routed experts (%.0f GB) are far more than the GPU holds (%.0f GB), where its verify "
                                      "rounds read 3.3x a token's bytes and gain nothing (--dspark on loads it anyway)\n", exp_b / 1e9, room_b / 1e9);
@@ -4676,6 +4722,7 @@ struct Model::Impl {
         const bool early = c.it_spec < 2u * (uint64_t) c.ring_n || (double) c.it_spec_unused <= waste * (double) c.it_spec;
         for (int e : l.host_list) {
             if (!early) break;
+            if (fl_owned(l, e)) continue;   // (a server's: asked over the wire, never streamed)
             const double p = sum > 0 ? pr[e] / sum : 0.0;
             const double q = p >= 1.0 ? 1.0 : 1.0 - std::exp(picks * std::log1p(-p));
             if (q >= spec_q && spec_q <= 1.0) cand.push_back({q, e});
@@ -4691,7 +4738,9 @@ struct Model::Impl {
             is[(size_t) x.second] = 1;
         }
         for (int e : l.host_list)
-            if (!is[(size_t) e]) vs[e] = l.pv_n + j++;
+            if (!is[(size_t) e] && !fl_owned(l, e)) vs[e] = l.pv_n + j++;
+        for (int e : l.host_list)   // (BBXL S7: the servers' experts last, so the streamed ones stay one run of virtual slots; they never become items)
+            if (!is[(size_t) e] && fl_owned(l, e)) vs[e] = l.pv_n + j++;
         for (const auto& x : cand) flow_push(c, l, mi, k, x.second, vs[x.second]);
         c.n_spec = (int) cand.size();
         c.it_spec += cand.size();
@@ -4707,6 +4756,7 @@ struct Model::Impl {
         }
         for (int e : l.host_list) {   // (index order: their virtual slots ascending)
             const int v = vs[e];
+            if (fl_owned(l, e)) continue;
             if (v >= l.pv_n + c.n_spec && b[(size_t) v + 1] > b[(size_t) v]) flow_push(c, l, mi, k, e, v);
         }
     }
@@ -4891,6 +4941,68 @@ struct Model::Impl {
         }
         return true;
     }
+    // BBXL S7: layer L0 of the chunk routed (c.ridx / c.rw on the device, c.x the FFN input): the picks a route owns go to the servers in slabs of
+    // STRATA_DS4_NET_SLAB (512) tokens (Remote::prompt: windows of 32 tokens, 4 in flight per host), and the un-weighted rows that come back are
+    // summed into c.acc by the engine's own moe_combine (ds4_net_chunk.hpp builds the inputs and holds a CPU copy of the kernel for the
+    // synthetic test).  Every owned pick must come back: this PC may not hold the bytes, so there is no fallback; a failed request ends the run with
+    // the error.  Called under the device's thread, one Remote for all of them (net_mu).
+    bool net_chunk_layer(Dev& d, Chunk& c, const Layer& l, int T, std::string& err) {
+#if defined(STRATA_DS4_NET) && !defined(STRATA_METAL)
+        cudaStream_t s = d.st;
+        const int D = g.dim, K = l.k_exp;
+        static const int slab_n = std::max(1, std::getenv("STRATA_DS4_NET_SLAB") ? std::atoi(std::getenv("STRATA_DS4_NET_SLAB")) : 512);
+        std::vector<int> ridx((size_t) T * kPicks);
+        std::vector<float> rw((size_t) T * kPicks);
+        CK(cudaMemcpy(ridx.data(), c.ridx, ridx.size() * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(rw.data(), c.rw, rw.size() * 4, cudaMemcpyDeviceToHost));
+        net::ChunkSlab slab;
+        std::vector<float> hx, rows;
+        std::vector<uint8_t> got;
+        for (int t0 = 0; t0 < T; t0 += slab_n) {
+            const int n = std::min(slab_n, T - t0);
+            net::chunk_slab_build(slab, ridx.data(), rw.data(), kPicks, K, t0, n, [&](int e) { return fl_owned(l, e); });
+            if (slab.sent == 0) continue;
+            hx.resize((size_t) n * D);
+            rows.resize((size_t) n * K * D);
+            CK(cudaMemcpy(hx.data(), c.x + (size_t) t0 * D, hx.size() * 4, cudaMemcpyDeviceToHost));
+            {
+                std::lock_guard<std::mutex> lk(net_mu);
+                std::string e2;
+                if (!remote->prompt(l.il, hx.data(), (size_t) D, n, slab.ids.data(), rows.data(), got, e2)) {
+                    err = "layer " + std::to_string(l.il) + ": the expert servers failed on a prompt slab (" + e2 + "); this PC has no copy to fall back on";
+                    return false;
+                }
+            }
+            for (size_t i = 0; i < slab.ids.size(); ++i)
+                if (slab.ids[i] >= 0 && !got[i]) {
+                    err = "layer " + std::to_string(l.il) + ": an expert a route owns was not answered";
+                    return false;
+                }
+            if (c.nf_cap < n) {
+                if (cudaSetDevice(d.id) != cudaSuccess) { err = "cudaSetDevice failed"; return false; }
+                if (c.nf_y != nullptr) { cudaFree(c.nf_y); cudaFree(c.nf_pos); cudaFree(c.nf_w); c.nf_y = nullptr; c.nf_pos = nullptr; c.nf_w = nullptr; c.nf_cap = 0; }
+                const int cap = std::max(n, std::min(slab_n, T));
+                if (cudaMalloc(&c.nf_y, (size_t) cap * K * D * 4) != cudaSuccess || cudaMalloc(&c.nf_pos, (size_t) cap * kPicks * 4) != cudaSuccess ||
+                    cudaMalloc(&c.nf_w, (size_t) cap * kPicks * 4) != cudaSuccess) {
+                    cudaGetLastError();
+                    err = "no VRAM for the prompt slab's rows (" + std::to_string((double) cap * K * D * 4 / 1e6) + " MB): lower STRATA_DS4_NET_SLAB";
+                    return false;
+                }
+                c.nf_cap = cap;
+            }
+            CK(cudaMemcpyAsync(c.nf_y, rows.data(), rows.size() * 4, cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(c.nf_pos, slab.pos.data(), slab.pos.size() * 4, cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(c.nf_w, slab.w.data(), slab.w.size() * 4, cudaMemcpyHostToDevice, s));
+            moe_combine(c.acc + (size_t) t0 * D, c.nf_y, c.nf_pos, c.nf_w, n, K, 0, n * K, D, s);
+            net_rows.fetch_add((uint64_t) slab.sent);
+        }
+        return true;
+#else
+        (void) d, (void) c, (void) l, (void) T;
+        err = "STRATA_DS4_NET_PREFILL=2 needs a build with the expert-server hook";
+        return false;
+#endif
+    }
     // layer L0 of chunk k routed (bounds b, the device's copy d_bounds): its streamed experts as they land, the VRAM
     // ones in shares between them (the device works while the reads run)
     bool flow_layer(Dev& d, Chunk& c, Layer& L0, int mi, int k, int T, const std::vector<int>& b, std::string& err) {
@@ -4904,6 +5016,7 @@ struct Model::Impl {
         const size_t lb = c.spec_begin, le = c.base + c.items.size(), n_lay = le - lb;
         int k2 = 0, il2 = 0;
         if (flow_next(c, k, L0.il, k2, il2)) flow_spec(c, k2, il2, fl_rows(c, k2, il2));
+        if (fl_served(L0) && !net_chunk_layer(d, c, L0, T, err)) return false;   // BBXL S7: the servers' experts, while the local items are read
         const size_t R = (size_t) c.ring_n, bmax = std::max<size_t>(1, R / 2);
         int v_done = 0;
         while (c.n_comp < le) {
@@ -6913,7 +7026,7 @@ struct Model::Impl {
         std::thread th([&] {
             if (svc >= 0) pin_self(svc);
             size_t set = 0;
-            auto call = [&] { cpu_experts(l, x.data(), sets[set++ % sets.size()], (size_t) g.dim); };
+            auto call = [&] { cpu_experts_local(l, x.data(), sets[set++ % sets.size()], (size_t) g.dim); };
             auto busy = [&](double ms) {
                 for (const double t0 = now_ms(); now_ms() - t0 < ms;) call();
             };
@@ -8355,10 +8468,51 @@ struct Model::Impl {
             if (m) m->store->release(layer, es.data(), (int) es.size(), ok);
         }
     };
+    // The cut point of --remote-experts (docs/REMOTE_EXPERTS.md "DeepSeek-V4.1-Flash"): every caller of the CPU lane comes through
+    // here.  In: the layer's FFN input rows (x, ldx apart) and the (token, expert) pairs the GPU does not hold (ents).  Out: each
+    // pair's un-weighted expert row in c_yd[(slot0 + i) * dim], whoever computed it.  Entries on a served layer go to the expert
+    // servers; the ones that did not come back (route down, a refused or failed call, an expert no route owns) run on the
+    // local lane below, which is the whole of this function when no server is configured.
+    void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0, const int* ord = nullptr) {
+#if defined(STRATA_DS4_NET)
+        static_assert(kEntMax <= net::kMaxTok && kWin == net::kMaxTok && kPicks == net::kMaxPicks, "ds4_net.hpp's window limits follow the engine's");
+        if (remote && !l.mtp && !ents.empty() && remote->serves(l.il)) {
+            if (ldx == 0) ldx = (size_t) g.dim;
+            std::vector<net::Remote::Item> items(ents.size());
+            for (size_t q = 0; q < ents.size(); ++q) {
+                items[q].e = ents[q].e;
+                items[q].n = ents[q].n;
+                items[q].slot0 = ents[q].slot0;
+                for (int i = 0; i < ents[q].n; ++i) items[q].tok[i] = ents[q].tok[i];
+            }
+            // BBXL S4: every route's request goes out first (all hosts of the layer at once); the entries no route owns - the conductor's
+            // own experts - compute while the servers answer, then the answers come in.  Rows are independent, so the bits are the same
+            // as the old run() (ask, wait, compute the rest).  An entry whose host failed is computed after, as before.
+            std::vector<char> pend, done;
+            remote->begin(l.il, x, ldx, items.data(), (int) items.size(), pend);
+            std::vector<Ent> mine;
+            size_t n_pend = 0;
+            for (size_t q = 0; q < ents.size(); ++q) {
+                if (pend[q]) ++n_pend;
+                else mine.push_back(ents[q]);
+            }
+            if (n_pend > 0) {
+                if (!mine.empty()) cpu_experts_local(l, x, mine, ldx, nullptr);
+                remote->finish(c_yd.data(), done);
+                std::vector<Ent> rest;
+                for (size_t q = 0; q < ents.size(); ++q)
+                    if (pend[q] && !done[q]) rest.push_back(ents[q]);
+                if (!rest.empty()) cpu_experts_local(l, x, rest, ldx, nullptr);
+                return;
+            }
+        }
+#endif
+        cpu_experts_local(l, x, ents, ldx, ord);
+    }
     // DS4_MISS_SPLIT=0: the old order (wait for every read, then compute); default: the entries whose reads are done
     // computed first, the others each as its read lands (the same bits: every entry's rows are independent)
-    void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
-                     const int* ord = nullptr) {
+    void cpu_experts_local(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
+                           const int* ord = nullptr) {
         if (ldx == 0) ldx = (size_t) g.dim;
         if (l.lay.fmt == gg::kFmtMXFP4) {
             StoreHold hold(this, l, ents);
@@ -10282,7 +10436,7 @@ struct Model::Impl {
                 ents.push_back(en);
             }
             const double a = now_ms();
-            cpu_experts(l, x.data(), ents, (size_t) g.dim);
+            cpu_experts_local(l, x.data(), ents, (size_t) g.dim);
             t.push_back(now_ms() - a);
         }
         std::sort(t.begin(), t.end());
@@ -10664,7 +10818,7 @@ struct Model::Impl {
             ents[0].e = e;
             ents[0].n = 1;
             ents[0].tok[0] = 0;
-            cpu_experts(l, x.data(), ents, (size_t) E);
+            cpu_experts_local(l, x.data(), ents, (size_t) E);
             const std::vector<float> yc(c_yd.begin(), c_yd.begin() + E);
             if (!lane_pull_cal(l, C.dev, 1, &e, b.plan, b.plan2)) {
                 ++n_bad;
@@ -11767,7 +11921,7 @@ struct Model::Impl {
                 if (cnt > 0) {   // (the expert cache learns from a chunked prompt as from windows: heat, and the CPU lane's hits)
                     ++n_picked;
                     l.heat[(size_t) e] += (float) cnt;
-                    if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                    if (l.slot[(size_t) e] < 0 && !fl_owned(l, e)) l.cpu_hits.push_back(e);   // (BBXL S7: a server's expert is never promoted to a slot here: the bytes are not on this PC)
                 }
             }
             static const bool ustat = std::getenv("DS4_UNPICKED_STAT") != nullptr;
@@ -11779,6 +11933,10 @@ struct Model::Impl {
                 CK(cudaMemcpy(L0.last_picks.data(), c.ridx + (size_t) (T - w) * kPicks, L0.last_picks.size() * 4,
                               cudaMemcpyDeviceToHost));
             }
+        }
+        if (!c.flow && fl_served(L0)) {
+            err = "STRATA_DS4_NET_PREFILL=2 needs the expert flow (DS4_FLOW is off, or the experts are not a GGUF's in-place ones)";
+            return false;
         }
         if (c.flow) {
             if (!flow_layer(d, c, L0, mi, wp.k, T, b, err)) return false;
@@ -12375,12 +12533,12 @@ struct Model::Impl {
             for (size_t i = 0; i < x.size(); ++i) x[i] = 0.02f * std::sin(0.37f * (float) i);
             const double bytes = (double) ents.size() * (double) l.blob;
             double a = now_ms();
-            cpu_experts(l, x.data(), ents, (size_t) g.dim);
+            cpu_experts_local(l, x.data(), ents, (size_t) g.dim);
             const double t_first = now_ms() - a;
             double t_warm = 1e30;
             for (int rep = 0; rep < 2; ++rep) {
                 a = now_ms();
-                cpu_experts(l, x.data(), ents, (size_t) g.dim);
+                cpu_experts_local(l, x.data(), ents, (size_t) g.dim);
                 t_warm = std::min(t_warm, now_ms() - a);
             }
             pm.cpu = bytes / std::max(1e-3, t_warm / 1000.0);
@@ -12457,6 +12615,49 @@ struct Model::Impl {
         return pick_min_;
     }
     int pick_min_ = 0;
+    // BBXL S5 (opt-in: STRATA_DS4_NET_PREFILL=1, only with --remote-experts): the prompt goes through the WINDOW path (kWin tokens a window, every
+    // layer's CPU lane in cpu_experts -> net::Remote::begin / finish) and never through the chunked flow.  The chunked flow streams every expert a
+    // chunk picks from THIS host's own files, so the conductor needs the whole model on its disk; the window path asks the servers for the served
+    // layers' experts and reads none of them here (the conductor's own experts, if any, still read theirs).  Same rows as the decode path.  Off by
+    // default because a 16-token window pays one round trip a layer: measure it against the flow (docs/DEEPSEEK41_SPLIT.md "The prompt through the
+    // servers (BBXL S5)") before turning it on for long prompts.
+    bool net_windows() const {
+#if defined(STRATA_DS4_NET)
+        static const bool on = [] { const char* e = std::getenv("STRATA_DS4_NET_PREFILL"); return e != nullptr && *e == '1'; }();
+        return on && remote && remote->active();
+#else
+        return false;
+#endif
+    }
+    // BBXL S7 (STRATA_DS4_NET_PREFILL=2, only with --remote-experts): the chunked flow itself asks the servers.  A served layer's experts that a route owns
+    // are NOT streamed from this PC's files: no flow item, no ring slot, no expert kernel for them; the chunk's FFN input and picks go to
+    // net::Remote::prompt in slabs (net_chunk_layer) and the rows are summed with moe_combine.  The conductor's own experts of the layer (VRAM
+    // ones, ranks no route owns) go the flow's way as before.  Not for a tensor-parallel group (nm > 1) and not for the draft's layers.
+    bool net_chunks() const {
+#if defined(STRATA_DS4_NET) && !defined(STRATA_METAL)
+        static const bool on = [] { const char* e = std::getenv("STRATA_DS4_NET_PREFILL"); return e != nullptr && *e == '2'; }();
+        return on && remote && remote->active();
+#else
+        return false;
+#endif
+    }
+    bool fl_served(const Layer& l) const {
+#if defined(STRATA_DS4_NET) && !defined(STRATA_METAL)
+        return net_chunks() && !l.mtp && l.nm == 1 && remote->serves(l.il);
+#else
+        (void) l;
+        return false;
+#endif
+    }
+    // expert e of a served layer is a server's: in the CPU lane's list (not a VRAM slot) and owned by a route
+    bool fl_owned(const Layer& l, int e) const {
+#if defined(STRATA_DS4_NET) && !defined(STRATA_METAL)
+        return fl_served(l) && (l.slot[(size_t) e] < 0 || l.slot[(size_t) e] >= l.pv_n) && remote->owns(l.il, e);
+#else
+        (void) l, (void) e;
+        return false;
+#endif
+    }
     bool pick_path(int n) {
         static const bool adaptive = [] {
             const char* e = std::getenv("DS4_PICK");
@@ -14867,7 +15068,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err, in
     if (ds4_dbg("DS4_DBG_CHUNK")) std::fprintf(stderr, "feed n %d chunk %d chunk_min %d\n", n, p.chunk, p.chunk_min);
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
         const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all)
-        const bool ok = logits_rows > kWin || p.pick_path(n) ? p.forward_chunks(tokens, n, logits_rows, err, -1, after)
+        const bool ok = logits_rows > kWin || (p.pick_path(n) && !p.net_windows()) ? p.forward_chunks(tokens, n, logits_rows, err, -1, after)
                                                              : p.feed_windows(tokens, n, logits_rows, err);
         if (ok) p.path_done(now_ms() - t0);
         return ok;
@@ -14880,7 +15081,7 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     p.halted = false;
     p.fed_n = n;
     const double t0 = now_ms();
-    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n)) {   // (the last token rides along; its layers
+    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n) && !p.net_windows()) {   // (the last token rides along; its layers
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
         if (ok) p.path_done(now_ms() - t0);
         return ok;
@@ -14905,7 +15106,7 @@ bool Model::feed_marks(const int* tokens, int n, int logits_rows, int slot,
     p.halted = false;
     p.fed_n = n;
     const double t0 = now_ms();
-    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && inner.size() + 1 <= (size_t) kSnapN && p.pick_path(n)) {
+    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && inner.size() + 1 <= (size_t) kSnapN && p.pick_path(n) && !p.net_windows()) {
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot, 0, &inner);
         if (ok) p.path_done(now_ms() - t0);
         return ok;

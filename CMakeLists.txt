@@ -247,6 +247,9 @@ elseif(STRATA_ENABLE_CUDA)
                     "card pass it: -DCMAKE_CUDA_ARCHITECTURES=native (the GPUs in this PC), 75 (RTX 20), 86 (RTX 30), "
                     "89 (RTX 40), or a list like \"86;120\".")
   endif()
+  # BBXL: a Blackwell architecture on a toolkit that cannot build it fails here with the install step, not later inside nvcc
+  include(cmake/strata_cuda_arch_check.cmake)
+  strata_cuda_arch_check("${CMAKE_CUDA_ARCHITECTURES}" "${CMAKE_CUDA_COMPILER_VERSION}")
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
     # Turing port: developed and measured on sm_120 (RTX 50); the tf32 mma in the QSA scorer has a
@@ -700,13 +703,24 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+  # remote experts, the model-independent half (client, wire protocol, server loop, the qwen35moe family's CPU rows): no CUDA, no
+  # engine - the Flash-Next engine (strata_engine, net_experts_dispatch.cpp) and the qwen35moe engine (strata_qwen35) both use it
+  add_library(strata_netx STATIC src/core/net_experts.cpp src/core/native_rows.cpp)
+  target_include_directories(strata_netx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(strata_netx PUBLIC strata_kernels_cpu strata_artifact strata_warnings Threads::Threads)
+  if(WIN32)
+    target_link_libraries(strata_netx PUBLIC ws2_32)
+  endif()
+  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp src/core/net_experts_dispatch.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_netx ${_strata_gpu_runtime_target})
+  if(WIN32)
+    target_link_libraries(strata_engine PUBLIC ws2_32)
+  endif()
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
     target_include_directories(host_graph_launch_test PRIVATE include)
@@ -918,7 +932,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata_qwen35 PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   if(STRATA_NATIVE_EXPERTS)
     # the hybrid mode (experts that do not all fit in VRAM): the CPU expert pool on ggml-cpu's arithmetic
-    target_link_libraries(strata_qwen35 PRIVATE strata_kernels_cpu)
+    target_link_libraries(strata_qwen35 PRIVATE strata_kernels_cpu strata_netx)
     target_compile_definitions(strata_qwen35 PRIVATE STRATA_Q36_CPU_POOL=1)
   endif()
   add_executable(strata-q36 src/qwen35/q36_main.cpp)
@@ -942,7 +956,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(strata_dsv41_kernels PUBLIC ${_strata_gpu_runtime_target})
     add_executable(strata-dsv41 src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu src/dsv41/ds4_vision.cu
                    src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
-                   src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp src/platform/io_priority.cpp)
+                   src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp src/platform/io_priority.cpp
+                   src/dsv41/ds4_net.cpp src/dsv41/ds4_net_proto.cpp)
+    # DeepSeek experts over the LAN (--expert-server, --remote-experts; docs/DEEPSEEK41_SPLIT.md): the host-only module
+    # src/dsv41/ds4_net.cpp and the protocol (ds4_net_proto.cpp wraps src/core/net_experts.cpp without the qwen38 pool).  The Metal
+    # build lists its own sources and does not define it: there the flags answer "not in this build".
+    target_compile_definitions(strata-dsv41 PRIVATE STRATA_DS4_NET=1)
+    # --expert-server-gpu: the served experts in VRAM, answered with the engine's window kernels (ds4_net_gpu.cu; CUDA builds only)
+    if(STRATA_ENABLE_CUDA)
+      target_sources(strata-dsv41 PRIVATE src/dsv41/ds4_net_gpu.cu)
+      target_compile_definitions(strata-dsv41 PRIVATE STRATA_DS4_NET_GPU=1)
+    endif()
+    if(WIN32)
+      target_link_libraries(strata-dsv41 PRIVATE ws2_32)   # the socket shim in net_experts.cpp (Winsock)
+    endif()
     # the commit the binary was built from, readable with --version (set -DSTRATA_BUILD_ID=... for a tree without .git)
     if(NOT STRATA_BUILD_ID AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/BUILD_ID)   # (a git archive has no .git: the packer writes the commit here)
       file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/BUILD_ID STRATA_BUILD_ID LIMIT_COUNT 1)
@@ -996,6 +1023,27 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(ds4_gguf_test PRIVATE strata_kernels_cpu)
       target_compile_definitions(ds4_gguf_test PRIVATE STRATA_DSV41_TQ_CPU=1)
+    endif()
+    # the GPU expert server's rows against the CPU server's, and a layer call timed on each (docs/DEEPSEEK41_SPLIT.md "GPU expert
+    # server"); needs a GPU and a synthetic pack (tools/dsv41/make_synthetic_pack.py), built by name
+    if(STRATA_ENABLE_CUDA AND STRATA_NATIVE_EXPERTS)
+      set(_ds4_gpu_server_srcs src/dsv41/ds4_net.cpp src/dsv41/ds4_net_proto.cpp
+                     src/dsv41/ds4_net_gpu.cu src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
+                     src/dsv41/ds4_kernels.cu src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp)
+      add_executable(ds4_gpu_rows_test EXCLUDE_FROM_ALL tests/dsv41/gpu_rows_test.cpp ${_ds4_gpu_server_srcs})
+      # the GPU expert server without the engine (no ds4_model.cu: builds in minutes): strata-dsv41-expert-server's flags plus
+      # --expert-server-gpu, for a host with a card (the rig, the stream PC); built by name
+      add_executable(strata-dsv41-expert-server-gpu EXCLUDE_FROM_ALL src/dsv41/ds4_expert_server_main.cpp ${_ds4_gpu_server_srcs})
+      set(_ds4_gpu_server_targets ds4_gpu_rows_test strata-dsv41-expert-server-gpu)
+      foreach(_t ${_ds4_gpu_server_targets})
+        target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories}
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
+        target_link_libraries(${_t} PRIVATE strata_prefill strata_dsv41_kernels ${_strata_gpu_runtime_target} strata_kernels_cpu Threads::Threads)
+        target_compile_definitions(${_t} PRIVATE STRATA_DSV41_TQ_CPU=1 STRATA_DS4_NET=1 STRATA_DS4_NET_GPU=1)
+        if(WIN32)
+          target_link_libraries(${_t} PRIVATE ws2_32)
+        endif()
+      endforeach()
     endif()
     # the router on a non-finite gate input (valid, distinct picks; the same picks as the host's top-k when finite) and its
     # launch times; needs a GPU, no model; built by name
@@ -1929,6 +1977,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(window_limits_test src/core/window_limits_test.cpp)
   target_include_directories(window_limits_test PRIVATE include)
   add_test(NAME window_limits_test COMMAND window_limits_test)
+  # remote experts: SHA-256/HMAC vectors, strict address parsing, the server's request validation (header-only, CPU)
+  add_executable(net_experts_test src/core/net_experts_test.cpp)
+  target_include_directories(net_experts_test PRIVATE include)
+  add_test(NAME net_experts_test COMMAND net_experts_test)
   # #4677: the accepted rows a request commits are bounded to what it can emit (header-only, CPU; 2,736 cases against the old output loop)
   add_executable(serve_stop_bound_test tests/core/serve_stop_bound_test.cpp)
   target_include_directories(serve_stop_bound_test PRIVATE include)
@@ -2948,3 +3000,9 @@ option(STRATA_BUILD_SPLIT "Build strata-split: sFNX's split-every-layer engine, 
 if(STRATA_BUILD_SPLIT)
   add_subdirectory(src/split)
 endif()
+
+# the CPU-only remote-experts server (strata-expert-server): configured only without CUDA / HIP
+include(cmake/cpu_expert_server.cmake)
+
+# the CPU-only DeepSeek-V4.1-Flash expert server (strata-dsv41-expert-server): configured only without CUDA / HIP
+include(cmake/dsv41_expert_server.cmake)

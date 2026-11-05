@@ -53,6 +53,7 @@ namespace strata::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
+class NetExperts;   // remote experts on other PCs (net_experts.hpp)
 struct LoadStats;
 
 namespace detail {
@@ -500,6 +501,10 @@ struct ExpertDispatch {
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
+    /// Remote experts on other PCs: for the layers the NetExperts route serves, the CPU's entries are computed by an expert server.
+    NetExperts* net = nullptr;
+    /// Expert server only: per entry (n_tok * k) 1 = compute, 0 = leave (the conductor's GPU holds it or it is not asked for).
+    const uint8_t* only_mask = nullptr;
     int64_t n_expert = strata::kernels::cpu::NE;
 
     /// Counters, for the driver to report rather than for control flow.
@@ -712,6 +717,8 @@ public:
     FileExpertSource() = default;
     ~FileExpertSource() override;
     FileExpertSource(const FileExpertSource&) = delete;
+    /// Page-cache residency of one expert blob (bytes in RAM,  its size); sampled by the expert server (net_experts).
+    uint64_t resident_bytes(int64_t layer, int64_t expert, uint64_t& total) const { return cached_bytes(layer, expert, total, false); }
     FileExpertSource& operator=(const FileExpertSource&) = delete;
 
     /// Maps `<pack_dir>/experts.bin` and checks its size against the loaded expert layout.  Canonical packs use

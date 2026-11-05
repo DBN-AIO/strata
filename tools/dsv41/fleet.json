@@ -1,0 +1,37 @@
+[
+  {
+    "name": "gaming", "addr": null, "mem_gb": 87.0, "vram_gb": 35.0, "compute_ms": 2.5, "wire_ms": 0.0,
+    "extra_gb": 117.2, "extra_note": "conductor spill: dense 6.2 GB + Engram 111 GB (random row reads: NVMe, never SATA)",
+    "storage": [
+      {"name": "Games", "kind": "nvme", "free_gb": 30.0, "path": "<Games>/strata/dsv41", "note": "~30 GB free after Flash-Next"},
+      {"name": "/mnt/ai", "kind": "nvme", "free_gb": 38.0, "path": "/mnt/ai/strata/dsv41"},
+      {"name": "/mnt/ai_models", "kind": "nvme", "free_gb": 36.0, "path": "/mnt/ai_models/strata/dsv41"},
+      {"name": "/mnt/bulk", "kind": "sata", "free_gb": 400.0, "path": "/mnt/bulk/strata/dsv41", "note": "860 EVO SATA, 550 MB/s; free space not in the survey (assumed)"}
+    ],
+    "note": "conductor, survey 2026-11-03: 3 NVMe mounts + SATA bulk; 35 GB VRAM + 52 GB page cache for experts (leaves 12 GB RAM free)"
+  },
+  {
+    "name": "rig", "addr": "192.168.1.130:7840", "mem_gb": 13.0, "compute_ms": 4.5, "wire_ms": 1.2,
+    "storage": [
+      {"name": "/mnt/models", "kind": "nvme", "free_gb": 41.0, "path": "/mnt/models/strata/dsv41", "note": "WD Green SN3000 1 TB, 96 % used (measured read-only 2026-11-03)"},
+      {"name": "/ (var/tmp)", "kind": "sata", "free_gb": 17.0, "path": "/var/tmp/strata", "note": "PNY 500 GB SATA SSD: where the slice sits today"}
+    ],
+    "note": "RAM floor 10 GB free: 13 GB of page cache is reclaimable cache, not pinned memory (15 GB free with the fleet loaded)"
+  },
+  {
+    "name": "t340", "addr": "192.168.1.133:7840", "mem_gb": 30.0, "compute_ms": 6.4, "wire_ms": 0.75,
+    "storage": [
+      {"name": "/dev/shm", "kind": "tmpfs", "free_gb": 29.0, "reserve_gb": 16.0, "path": "/dev/shm/strata", "note": "RAM: 29 GB available, floor 16 GB free"},
+      {"name": "/ (WD spinning disk + PERC)", "kind": "sata", "free_gb": 11.0, "path": "/srv/strata", "note": "no NVMe on this host; / has 11 GB free"}
+    ],
+    "note": "T340 has no NVMe: RAM (tmpfs) only"
+  },
+  {
+    "name": "stream", "addr": "192.168.1.27:7840", "mem_gb": 48.0, "compute_ms": 2.9, "wire_ms": 0.9,
+    "storage": [
+      {"name": "C:", "kind": "nvme", "free_gb": 16.0, "reserve_gb": 15.0, "path": "C:\\AIO-strata-model\\dsv41-slice", "note": "500 GB NVMe, 16 GB free, floor 15 GB free; a new SSD is coming"},
+      {"name": "D:", "kind": "excluded", "free_gb": 24.0, "path": null, "note": "SATA and failing: never used"}
+    ],
+    "note": "64 GB RAM, ~16 GB used by the stream"
+  }
+]
