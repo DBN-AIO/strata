@@ -247,6 +247,9 @@ elseif(STRATA_ENABLE_CUDA)
                     "card pass it: -DCMAKE_CUDA_ARCHITECTURES=native (the GPUs in this PC), 75 (RTX 20), 86 (RTX 30), "
                     "89 (RTX 40), or a list like \"86;120\".")
   endif()
+  # BBXL: a Blackwell architecture on a toolkit that cannot build it fails here with the install step, not later inside nvcc
+  include(cmake/strata_cuda_arch_check.cmake)
+  strata_cuda_arch_check("${CMAKE_CUDA_ARCHITECTURES}" "${CMAKE_CUDA_COMPILER_VERSION}")
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
     # Turing port: developed and measured on sm_120 (RTX 50); the tf32 mma in the QSA scorer has a
