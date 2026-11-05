@@ -703,13 +703,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp src/core/net_experts.cpp
+  # remote experts, the model-independent half (client, wire protocol, server loop, the qwen35moe family's CPU rows): no CUDA, no
+  # engine - the Flash-Next engine (strata_engine, net_experts_dispatch.cpp) and the qwen35moe engine (strata_qwen35) both use it
+  add_library(strata_netx STATIC src/core/net_experts.cpp src/core/native_rows.cpp)
+  target_include_directories(strata_netx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(strata_netx PUBLIC strata_kernels_cpu strata_artifact strata_warnings Threads::Threads)
+  if(WIN32)
+    target_link_libraries(strata_netx PUBLIC ws2_32)
+  endif()
+  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp src/core/net_experts_dispatch.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_netx ${_strata_gpu_runtime_target})
   if(WIN32)
     target_link_libraries(strata_engine PUBLIC ws2_32)
   endif()
@@ -924,7 +932,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata_qwen35 PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   if(STRATA_NATIVE_EXPERTS)
     # the hybrid mode (experts that do not all fit in VRAM): the CPU expert pool on ggml-cpu's arithmetic
-    target_link_libraries(strata_qwen35 PRIVATE strata_kernels_cpu)
+    target_link_libraries(strata_qwen35 PRIVATE strata_kernels_cpu strata_netx)
     target_compile_definitions(strata_qwen35 PRIVATE STRATA_Q36_CPU_POOL=1)
   endif()
   add_executable(strata-q36 src/qwen35/q36_main.cpp)

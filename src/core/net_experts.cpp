@@ -8,7 +8,6 @@
 // STRATA_NET_NO_QWEN: the dsv41 expert server (src/dsv41/ds4_net_server.cpp) compiles this file without the qwen38 engine's
 // expert pool, layout and kernels: only the protocol, the client and the generic server loop (serve_experts with a callback).
 #ifndef STRATA_NET_NO_QWEN
-#include "strata/core/expert_source.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #endif
@@ -321,6 +320,13 @@ std::string net_isa_name(uint32_t isa) {
     return s;
 }
 
+#ifndef STRATA_NET_NO_QWEN
+uint32_t net_isa_bits() {
+    using namespace strata::kernels::cpu;
+    return (cpu_avx512_ok() ? 1u : 0u) | (cpu_avx512bw_ok() ? 2u : 0u) | (cpu_avx2_ok() ? 4u : 0u) | ((uint32_t) cpu_isa_cap() << 8);
+}
+#endif
+
 const char* net_arch_name(uint32_t arch) { return arch == kArchQwen38 ? "qwen38" : arch == kArchDsv41 ? "dsv41" : "unknown"; }
 
 #ifndef STRATA_NET_NO_QWEN
@@ -353,7 +359,7 @@ NetIdentity net_identity(const std::vector<std::string>& files) {
     u64(seen.size());
     NetIdentity id;
     h.finish(id.fingerprint);
-    id.isa = (cpu_avx512_ok() ? 1u : 0u) | (cpu_avx512bw_ok() ? 2u : 0u) | (cpu_avx2_ok() ? 4u : 0u) | ((uint32_t) cpu_isa_cap() << 8);
+    id.isa = net_isa_bits();
     id.arch = kArchQwen38;
     id.n_embd = (uint32_t) kQwenH;
     return id;
@@ -829,43 +835,6 @@ bool is_loopback(const sockaddr* a) {
     return false;
 }
 }  // namespace
-
-#ifndef STRATA_NET_NO_QWEN
-int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
-    // The server answers with the plain CPU pool.  A second GPU, helper GPUs, a resident plan or a net route would compute
-    // some rows on other arithmetic than the conductor's CPU kernels (and a net route would forward the request again).
-    // --expert-server-gpu (cfg.gpu) lets helper GPUs compute the experts they hold; they take only kind -1 entries, i.e. the
-    // asked-for ones (only_mask), and write into the same rows.
-    if (d.peer != nullptr || (d.remote_count != 0 && !cfg.gpu) || d.net != nullptr || d.plan != nullptr || d.host_res != nullptr) {
-        std::fprintf(stderr, "strata net: the expert server needs a CPU-only dispatch (no peer GPU, helper GPUs, resident plan or net route); "
-                             "helper GPUs only with --expert-server-gpu\n");
-        return 1;
-    }
-    if (cfg.gpu && d.remote_count > 0)
-        std::fprintf(stderr, "strata net: GPU expert server: %d helper GPU(s) compute the served experts they hold; their rows are the GPU "
-                             "kernels' (within kernel tolerance of the conductor's CPU rows, not bit-identical)\n", d.remote_count);
-    ExpertServeCfg c2 = cfg;
-    c2.identity.arch = kArchQwen38;
-    c2.identity.n_embd = (uint32_t) kQwenH;
-    const ExpertComputeFn compute = [&d](uint32_t layer, uint32_t n_tok, uint32_t k, int arith, const int32_t* ids, const uint8_t* mask,
-                                         const float* x, float* out, std::string& err) {
-        d.failed = false; d.fail = nullptr;   // a failure answers one request; it must not poison the next
-        d.layers = layer;
-        d.only_mask = mask;
-        strata::core::expert_pool_dispatch_multi(d, x, ids, n_tok, k, out,
-                                                  arith == 1 ? strata::kernels::cpu::NativeArithmetic::WindowInvariant
-                                                             : strata::kernels::cpu::NativeArithmetic::Default);
-        d.only_mask = nullptr;
-        if (d.failed) {
-            err = d.fail != nullptr ? d.fail : "?";
-            d.failed = false; d.fail = nullptr;
-            return false;
-        }
-        return true;
-    };
-    return serve_experts(c2, compute);
-}
-#endif
 
 int serve_experts(const ExpertServeCfg& cfg, const ExpertComputeFn& compute) {
     if (const std::string why = np::serve_cfg_problem(cfg.top_k, cfg.identity.fingerprint); !why.empty()) {

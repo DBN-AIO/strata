@@ -50,6 +50,8 @@ struct NetIdentity {
 /// `model_files`: the GGUF / experts.bin files the experts are read from (their sizes enter the fingerprint).
 NetIdentity net_identity(const std::vector<std::string>& model_files);
 std::string net_isa_name(uint32_t isa);
+/// The CPU kernel path word of NetIdentity::isa (avx512 / avx512bw / avx2 bits and the STRATA_FORCE_ISA cap).  Not in the dsv41 build (STRATA_NET_NO_QWEN).
+uint32_t net_isa_bits();
 /// Socket read/write/connect timeout in ms for both ends (default 10000; env STRATA_EXPERT_TIMEOUT_MS; --expert-timeout-ms).
 void net_set_timeout_ms(int ms);
 
