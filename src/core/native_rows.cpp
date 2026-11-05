@@ -40,6 +40,8 @@ NetIdentity native_net_identity(const strata::GgufModel& gm, const ModelGeometry
     NetIdentity id;
     h.finish(id.fingerprint);
     id.isa = net_isa_bits();
+    id.arch = kArchQwen38;
+    id.n_embd = (uint32_t) g.n_embd;   // the rows on the wire are this wide (Qwen3.8-Max: 8192)
     return id;
 }
 

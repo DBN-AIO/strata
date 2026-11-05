@@ -3,7 +3,7 @@
 //   native_rows_test MODEL.gguf     (tools/make_synthetic_max.py writes one; tests/qwen_max/run_cpu_test.py does both)
 //
 // 1. window invariance: with arith 1 a row does not depend on the window it was computed in (token alone == token among eight);
-// 2. the split: an expert server (serve_experts_fn over NativeRows) on loopback and a NetExperts client (the conductor's prompt path,
+// 2. the split: an expert server (serve_experts over NativeRows) on loopback and a NetExperts client (the conductor's prompt path,
 //    windows of kWindowMaxT tokens) return, for every masked entry, exactly the bytes NativeRows gives in process;
 // 3. an identity of another model file is refused in the handshake (the fingerprint covers the expert tensors' types and shapes).
 #include "strata/artifact/gguf_reader.hpp"
@@ -124,26 +124,25 @@ int main(int argc, char** argv) {
     sc.port = port;
     sc.n_layers = total;
     sc.n_expert = g.n_expert;
-    sc.n_embd = g.n_embd;
     sc.top_k = K;
     sc.identity = id;
     sc.layer_lo = 0;
     sc.layer_hi = total - 1;
     sc.once = true;
     NativeRows server_rows(layers, g.n_embd, g.n_expert, pool);
-    const strata::core::ServeCompute compute = [&](int layer, int nt, int kk, int arith, const int32_t* i2, const uint8_t* m2, const float* x2,
+    const strata::core::ExpertComputeFn compute = [&](uint32_t layer, uint32_t nt, uint32_t kk, int arith, const int32_t* i2, const uint8_t* m2, const float* x2,
                                                    float* out, std::string& e) {
-        return server_rows.run(layer, nt, kk, i2, m2, x2, out, arith == 1 ? C::NativeArithmetic::WindowInvariant : C::NativeArithmetic::Default, e);
+        return server_rows.run((int) layer, (int) nt, (int) kk, i2, m2, x2, out, arith == 1 ? C::NativeArithmetic::WindowInvariant : C::NativeArithmetic::Default, e);
     };
     int serve_rc = -1;
-    std::thread server([&] { serve_rc = strata::core::serve_experts_fn(sc, compute); });
+    std::thread server([&] { serve_rc = strata::core::serve_experts(sc, compute); });
     {
         // the right conductor first (the server may still be starting); then one with another model's identity is refused
         strata::core::NetExperts net;
         std::string e3;
         bool up = false;
         for (int tries = 0; tries < 50 && !up; ++tries) {
-            up = net.open("127.0.0.1:" + std::to_string(port) + "=0-" + std::to_string(total - 1), total, g.n_expert, id, e3, g.n_embd);
+            up = net.open("127.0.0.1:" + std::to_string(port) + "=0-" + std::to_string(total - 1), total, g.n_expert, id, e3);
             if (!up) std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         CHECK(up, "open: %s", e3.c_str());
@@ -151,7 +150,7 @@ int main(int argc, char** argv) {
         wrong.fingerprint[0] ^= 1;
         strata::core::NetExperts bad;
         std::string e2;
-        const bool opened = bad.open("127.0.0.1:" + std::to_string(port) + "=0-" + std::to_string(total - 1), total, g.n_expert, wrong, e2, g.n_embd);
+        const bool opened = bad.open("127.0.0.1:" + std::to_string(port) + "=0-" + std::to_string(total - 1), total, g.n_expert, wrong, e2);
         CHECK(!opened && e2.find("fingerprint") != std::string::npos, "a wrong fingerprint was not refused (%s)", e2.c_str());
         if (up) {
             for (const int l : picks) {
@@ -170,7 +169,7 @@ int main(int argc, char** argv) {
         }
     }   // the client's destructor says BYE: the one-connection server returns
     server.join();
-    CHECK(serve_rc == 0, "serve_experts_fn returned %d", serve_rc);
+    CHECK(serve_rc == 0, "serve_experts returned %d", serve_rc);
     std::printf(g_fail ? "native_rows_test: FAILED (%d)\n" : "native_rows_test: ok\n", g_fail);
     return g_fail ? 1 : 0;
 }

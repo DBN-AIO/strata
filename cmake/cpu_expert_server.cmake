@@ -14,7 +14,7 @@
 option(STRATA_BUILD_EXPERT_SERVER "Build strata-expert-server, the CPU-only remote-experts server (only without CUDA / HIP)" ON)
 
 if(STRATA_BUILD_EXPERT_SERVER AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_ENABLE_SYCL
-   AND UNIX AND STRATA_CPU_X86 AND TARGET strata_kernels_cpu AND STRATA_NATIVE_EXPERTS)
+   AND (UNIX OR WIN32) AND STRATA_CPU_X86 AND TARGET strata_kernels_cpu AND STRATA_NATIVE_EXPERTS)
   add_library(strata_expert_host STATIC
     src/core/expert_source.cpp
     src/core/net_experts.cpp
@@ -30,6 +30,9 @@ if(STRATA_BUILD_EXPERT_SERVER AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_H
   target_link_libraries(strata_expert_host PUBLIC strata_kernels_cpu strata_artifact strata_warnings Threads::Threads)
 
   add_executable(strata-expert-server src/program/expert_server_main.cpp src/program/q36_expert_server.cpp)
+  if(WIN32)
+    target_link_libraries(strata-expert-server PRIVATE ws2_32)   # the socket shim in net_experts.cpp (Winsock)
+  endif()
   target_link_libraries(strata-expert-server PRIVATE strata_expert_host)
   message(STATUS "Strata: CPU-only expert server enabled (strata-expert-server; no CUDA)")
 
@@ -39,8 +42,10 @@ if(STRATA_BUILD_EXPERT_SERVER AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_H
     add_test(NAME expert_server_needs_model COMMAND strata-expert-server --expert-server --listen 7840)
     set_tests_properties(expert_server_needs_model PROPERTIES WILL_FAIL TRUE)
     # It must not link a CUDA library (the whole point of the target): readelf lists the NEEDED entries.
-    add_test(NAME expert_server_links_no_cuda
-             COMMAND ${CMAKE_COMMAND} -DBIN=$<TARGET_FILE:strata-expert-server> -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_no_cuda_link.cmake)
+    if(UNIX)   # readelf; on Windows `dumpbin /dependents` shows the same (docs/REMOTE_EXPERTS.md, "Windows")
+      add_test(NAME expert_server_links_no_cuda
+               COMMAND ${CMAKE_COMMAND} -DBIN=$<TARGET_FILE:strata-expert-server> -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_no_cuda_link.cmake)
+    endif()
 
     # Qwen3.8-Max (qwen35moe) split: on a Max-shaped synthetic GGUF (tools/make_synthetic_max.py: 512 experts, top-10, the Max quantisation
     # types, tiny hidden size) a row from an expert server over loopback is the bytes the conductor's own CPU would compute, a row does not

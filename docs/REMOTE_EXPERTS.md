@@ -131,14 +131,58 @@ layers, top-k, kernel path), REQ (layer, n_tok, k, arithmetic, ids, mask, x), RE
 BYE. Both sides check the version; a version-1 peer is refused with a clear message. Hidden states are fp32 so the result is bit identical to the local CPU run; fp16/bf16
 on the wire would halve the traffic (about 20 KB out, 90 KB in per call at 4-token windows) and is a later option.
 
-## Windows (stream PC: RTX 5070 Ti, sm_120)
+## Windows (stream PC: Ryzen 9 5950X, RTX 5070 Ti)
 
-The server path uses no Linux-only call: sockets are behind the shim (`ws2_32` is linked by CMake on `WIN32`; `WSAStartup` is
-checked and initialised once, thread safe; `WSAPoll`, `ioctlsocket`, `SO_RCVTIMEO` in milliseconds); the warm-up `mlock` is
-`#if !defined(_WIN32)`. Build as for any Windows CUDA build of Strata (docs/SOURCE_INSTALL.md,
-"From source: Windows": Visual Studio 2022 Build Tools + CUDA 13.0-13.2), then run the same command line with
-`strata.exe`. Not built or run on the stream PC from this branch (it is the streaming machine and its D: drive is
-failing); keep it buildable.
+Built and run 2026-11-03 on the stream PC as `strata-expert-server.exe`, the CPU-only server (no CUDA toolkit is installed there
+and none is needed: it links no CUDA library). The socket shim uses Winsock (`ws2_32` is linked by `cmake/cpu_expert_server.cmake`;
+`WSAStartup` once, `WSAPoll` with `POLLRDNORM` / `POLLWRNORM`, `NOMINMAX` and `_WIN32_WINNT=0x0A00` set before `winsock2.h`); the
+warm-up `mlock` is skipped (the pages are touched, the log says `mlocked 0.00 GiB`). The CUDA engine's own `--expert-server` on the
+5070 Ti (sm_120) is not built: it needs the CUDA 13.x toolkit (Jack: NVIDIA CUDA Toolkit 13.0-13.2 installer, "Visual Studio
+integration" off), then the engine build of docs/SOURCE_INSTALL.md "From source: Windows".
+
+Toolchain used: Visual Studio Build Tools 2026 (MSVC 14.51, x64), the CMake and Ninja that ship with / beside it. All on C:.
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF
+cmake --build build-cpu --target strata-expert-server -j 6
+```
+
+Configure 55 s (it fetches the pinned llama.cpp), build about 2.5 minutes. On the stream PC run both through the capped CPU lane
+(`AIOrchestrator/tools/cpu_lane/win_job.py`, 70 % cap; it refuses in streamer mode).
+
+Model files: the server needs only a sparse slice of each GGUF shard (tools/slice_gguf.py `--experts-only`) with the real shard sizes
+and `native_experts.txt` + `index.txt` of the pack. A sparse file does not survive `scp` / `tar` to NTFS (it would be filled with
+zeros: 66 GB). Copy only the data extents and set the NTFS sparse flag first (`fsutil sparse setflag`); do not grow the file with
+Python's `truncate()` (it zero-fills on Windows): seek to size-1 and write one byte. Layers 38-43 are 3.96 GiB of data.
+
+Run (never from an agent or ssh shell: it would die with that app's job object): `tools/stream_pc/start_expert_server.ps1` registers a
+one-shot Task Scheduler task whose hidden `pythonw` launcher starts the server detached, then removes the task (the same pattern as
+TabbyAPI's `switch_local.py`). `STRATA_EXPERT_TOKEN` comes from a file, not a command line. Firewall: 7840-7843 inbound from the
+conductor only (rule `AIO BigBrain-XL expert server` on the stream PC). Stop with the PID in `<log>.pid`. See tools/stream_pc/README.md.
+
+### Measured (2026-11-03, Windows server + Linux conductor)
+
+Server: stream PC (5950X, AVX2, busy with the stream PC's usual services, TabbyAPI on the 5070 Ti), layers 38-43, 15 pool workers,
+over the house LAN (2.5 GbE). Conductor: gaming PC, Linux (nobara), RTX 3090 GPU 0 (5664 MiB), `bin-tip`, `--adapt-every 0`,
+`--pcie-frac 0`, `--spec 2`, greedy, 14 prompt tokens, 64 new tokens, shared token, `--remote-experts 192.168.1.27:7840=38-43`.
+
+| Run | decode tok/s | calls | round trip | server compute | output (md5 of the token line) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| single process, cold | 3.41 | - | - | - | `9646d49f` |
+| single process, warm | 30.02 | - | - | - | `9646d49f` |
+| Windows server, run 1 | 15.12 | 252 | 7.77 ms | 6.48 ms | `9646d49f` |
+| Windows server, run 2 | 13.52 | 252 | 7.84 ms | 6.57 ms | `9646d49f` |
+| Windows server, run 3 | 4.93 (conductor box loaded) | 270 | 8.12 ms | 6.76 ms | `9646d49f` |
+
+The 64 tokens are identical in all five runs (same CPU kernels, avx2 on both ends, same bytes). The prompt path went through the
+Windows server too (333 experts, 12 windows, 0.9 MB out / 8.2 MB in, 221-236 ms). Per decode call 23 KB out, 187 KB in; wire and
+framing are 1.2-1.4 ms of the round trip, the rest is the server's compute: 6.5 ms for 6 layers' rows is about 4x the T340's
+1.5 ms, because the stream PC is shared with the stream (TabbyAPI, ComfyUI, OBS-side services) while it computes. Resident: working
+set 2.7 GB of the 3.96 GiB mapped (Windows trims mapped pages; they stay in the standby list), private 0.26 GB, 0 MiB of VRAM (the
+5070 Ti's 10.7 GB used by TabbyAPI did not move). `probe`: `tools/net_experts_probe.py` passes all checks against the Windows server
+(wrong / missing token, oversized frame, 11 kinds of bad request, busy, idle connection). Known gap: the log line
+`page-cache resident` reads 0.00 of 0.00 GiB on Windows (`resident_bytes` has no Windows implementation).
 
 ## CPU-only host (T340)
 
@@ -175,8 +219,7 @@ The dense weights are the conductor's, not the server's. A server needs only the
 `tools/slice_gguf.py SRC DST LO HI --experts-only` (run on every shard) makes a sparse copy of just those: layers 38-43 of the
 35 GiB shard 1 are a 3.97 GiB file; shard 2 is its header only (4 KiB). `--pack` needs only `native_experts.txt` (and `index.txt`).
 
-Not covered: Windows (the Winsock branch of the socket shim and the `mlock` guard are untouched, the CMake target is UNIX-only
-today; a compile check is a commented stub in `build-linux.yml`), and the prompt path (as for any server, see "Not covered yet").
+Not covered: the prompt path (as for any server, see "Not covered yet").
 
 ### CI
 
@@ -501,6 +544,81 @@ Readings:
 
 Peak VRAM of our processes: the conductor 5674 MiB (6 GiB cap). The rig 3090 +3924 MiB. Each 3060 +2123 to +2260 MiB,
 under its free memory minus 1 GB (free was 3399-3541 MiB).
+
+## DeepSeek-V4.1-Flash (src/dsv41, `strata-dsv41`)
+
+The DeepSeek engine is a separate program (`strata-dsv41`, docs/DEEPSEEK41.md) with its own MoE dispatch, and it uses the same
+network split as the Qwen engine: same protocol, same `net_experts.cpp`, same flags. Placement, measurements and the test record are in
+docs/DEEPSEEK41_SPLIT.md. Status: CPU expert servers on Linux and Windows, the conductor hook, and a synthetic-model test are done and
+tested; the conductor hook is compiled into `strata-dsv41` (CUDA 13.2, sm_86) but was not run end to end (no GPU was free); a GPU expert
+server and the prompt path through the servers are not done.
+
+### The cut point
+
+Smallest boundary, and the same one as above: **the layer's FFN input rows and the (token, expert) pairs the GPU does not hold go
+out; one un-weighted expert output row per pair (`dim` fp32) comes back.** Everything after it stays on the conductor.
+
+| What | Where (`src/dsv41/ds4_model.cu`) |
+| --- | --- |
+| attention, router (`gate_w`, top-k, score bias), shared expert, hyper-connections, residual | GPU, unchanged |
+| GPU-resident experts (VRAM slots) | GPU, unchanged |
+| **the CPU lane of one layer: classify nothing, hand over `ents` (expert, up to 16 tokens, slot0) and the input rows `x`, get `c_yd[(slot0 + i) * dim]`** | **`Impl::cpu_experts(l, x, ents, ldx, ord)`**: since this change a wrapper; the old body is `cpu_experts_local` |
+| weighted sum `h_part += w * y` over the slots, `combine`, `hc_post` | after the lane, unchanged |
+| callers that go through the wrapper | `layer()` (decode and verify windows, up to 16 tokens) and `serve_lane()` (the chunked prompt path's small windows) |
+| callers that stay local on purpose | `tune_lane`, `lane_cpu_ms`, `lane_check`, `calibrate_paths` (they time or check the local CPU lane) |
+
+`cpu_experts` sends the entries of a served layer (`Remote::run`: tokens compacted to `n_tok x dim`, ids `n_tok x k` with `k` = the
+model's top-k, mask = the pairs) through `NetExperts::begin / finish`, copies the returned rows to `c_yd`, and runs whatever did not
+come back (route down, refused, an expert no route owns, more picks than `k`) on the local lane: **any network error is a local
+computation of the same rows**, and the route is retried with backoff as for Qwen. Nothing is sent for the drafter's `mtp.*` layers.
+The server computes with the engine's own CPU row kernels (`ds4_gguf_cpu`, `ds4_iq_cpu`, `ds4_tq_cpu`, `ds4_gg_cpu`: int8 MXFP4 rows,
+IQ1_M / IQ2_XXS / IQ2_XS / IQ3_XXS / ... through Strata's AVX2 / AVX-512 rows or ggml-cpu), in the same order of operations as
+`cpu_experts_iq` / `cpu_experts_mx` (activations quantized once per token, gate/up, swiglu with the model's clamp, quantize h, down), so
+the rows are the local lane's bits (below).
+
+### What changed in the shared code
+
+- `NetIdentity` has `arch` (`kArchQwen38 = 0`, `kArchDsv41 = 1`) and `n_embd`. The HELLO's former zero pad carries `arch`; **an older
+  qwen38 conductor still sends 0 and a qwen38 server still expects 0, so the wire is compatible**, and a server refuses a conductor of
+  the other family at the handshake ("engine family differs: server dsv41, yours qwen38"), before the geometry check.
+- The hidden size on the wire is `NetIdentity::n_embd` (5120 here, `cpu::H` for Qwen); the window limits are `ExpertServeCfg::max_tok /
+  max_entries` (16 and 128 for dsv41: `kWin`, `kWin x kPicks`).
+- `serve_experts(const ExpertServeCfg&, const ExpertComputeFn&)` is the engine-independent server loop; `serve_experts(ExpertDispatch&, cfg)`
+  is a wrapper over it (behaviour unchanged). `src/dsv41/ds4_net_proto.cpp` compiles `net_experts.cpp` with `STRATA_NET_NO_QWEN`: the
+  protocol, client and loop without the Qwen expert pool, layout and kernels.
+- The dsv41 fingerprint (`ExpertMap::identity()`): SHA-256 over the geometry (dim, ffn, layers, experts, top-k, swiglu limit), every layer's
+  expert types, file indices, offsets, strides and sizes, and the shard names and sizes. `isa` is 0: the dsv41 CPU kernels give the same bits
+  on every ISA tier (checked: AVX2 Zen 3 and Coffee Lake, MSVC and GCC, same row hash).
+
+### Use
+
+```sh
+# expert server, any host (no CUDA is touched; the same flags on either binary)
+strata-dsv41-expert-server --pack PACK --listen 0.0.0.0:7840 --serve-layers 27-29 [--serve-experts 0-191] [--cpu-threads N] [--no-warm]
+strata-dsv41 --pack PACK --expert-server --listen 0.0.0.0:7840 --serve-layers 27-29     # the engine binary, returns before any CUDA call
+
+# conductor: the normal command plus one flag (the same spec as Qwen: host:port=lo-hi[/e0-e1], comma separated)
+strata-dsv41 --pack PACK ... --remote-experts 192.168.1.130:7840=27-29,192.168.1.133:7840=30-33,192.168.1.27:7840=34-39
+```
+
+`STRATA_EXPERT_TOKEN` on both ends, as for Qwen (docs above, "Security"). `PACK` on a server needs only the pack's two text files and the
+shards' experts of its layers: `tools/dsv41/slice_stream.py emit PACK 27-29 | slice_stream.py apply SLICE` writes a sparse slice (real
+shard sizes, so the fingerprint is the conductor's; on NTFS the sparse flag is set first). `tools/dsv41/plan_split.py` gives each host a
+range of layers from the host budgets and prints the `--remote-experts` line, or refuses with the shortfall (stream mode).
+
+### Tests
+
+`tools/dsv41/synthetic_split_test.py BUILD_DIR` (CI: "DeepSeek split test (synthetic)", about 10 s): a DeepSeek-shaped model with random
+weights in the real sets' types (`tools/dsv41/make_synthetic_pack.py`: 8 layers, 32 experts, top-6, shared expert and router in the
+program, gate = up type / down type mixed as in the 2.00 bpw set: IQ1_M, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_XS, Q4_K, MXFP4), 64 greedy tokens
+from a 6-token prompt window, in one process and through servers on localhost: tokens **and a hash of every expert row** equal for one
+server, two servers (layers 0-3 / 4-7), a partial split (layers 2-5, the conductor runs the rest), every layer's experts over two hosts
+(0-15 / 16-31), a server that exits after 40 requests (fallback), a server on a sparse slice; refusals for a qwen38 conductor, a wrong
+token, another expert count. `ds4_net_test` is the program (`--mode local|remote --remote SPEC`).
+
+Scratch: `--tmp DIR` (else `$RUNNER_TEMP`, else the build dir) holds the packs in a subdirectory removed on exit, SIGTERM included; the test refuses a
+tmpfs/ramfs or a directory with under 1 GiB free (`STRATA_TEST_NEED_GIB`). Servers are waited for by polling their port (30 s), not a fixed
+sleep; `STRATA_TEST_SERVER_START_DELAY=SECONDS` delays every server start to prove it.
 
 ## NVLink
 

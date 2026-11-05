@@ -4,9 +4,13 @@
 #include "strata/core/net_experts.hpp"
 
 #include "strata/core/net_proto.hpp"
+#include "strata/kernels/window_limits.hpp"
+// STRATA_NET_NO_QWEN: the dsv41 expert server (src/dsv41/ds4_net_server.cpp) compiles this file without the qwen38 engine's
+// expert pool, layout and kernels: only the protocol, the client and the generic server loop (serve_experts with a callback).
+#ifndef STRATA_NET_NO_QWEN
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
-#include "strata/kernels/window_limits.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +30,12 @@
 #include <thread>
 
 #ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX   // windows.h's min/max macros break std::min / std::max below
+#  endif
+#  ifndef _WIN32_WINNT
+#    define _WIN32_WINNT 0x0A00   // winsock2.h declares WSAPoll and POLLRDNORMAL / POLLWRNORMAL only from Vista on
+#  endif
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
 #  endif
@@ -47,7 +57,11 @@ namespace strata::core {
 namespace {
 using Clock = std::chrono::steady_clock;
 namespace np = netproto;
-constexpr int64_t kFlashEmbd = strata::kernels::cpu::H;   // the default n_embd of a peer that does not say (Flash-Next)
+#ifndef STRATA_NET_NO_QWEN
+constexpr int64_t kQwenH = strata::kernels::cpu::H;
+#else
+constexpr int64_t kQwenH = 0;   // (no qwen38 engine in this build: NetIdentity::n_embd must be set)
+#endif
 constexpr uint32_t kMagic = 0x31505853u;   // "SXP1"
 constexpr uint32_t kProtoVersion = 2;
 enum : uint32_t { kHello = 1, kHelloAck = 2, kReq = 3, kResp = 4, kErr = 5, kBye = 6, kChallenge = 7 };
@@ -92,7 +106,7 @@ bool err_intr(int e) { return e == WSAEINTR; }
 bool err_inprogress(int e) { return e == WSAEWOULDBLOCK; }
 bool set_nonblock(sock_t s, bool nb) { u_long v = nb ? 1 : 0; return ioctlsocket(s, FIONBIO, &v) == 0; }
 int sock_poll(sock_t s, bool want_write, int ms) {
-    WSAPOLLFD p{}; p.fd = s; p.events = want_write ? POLLWRNORMAL : POLLRDNORMAL;
+    WSAPOLLFD p{}; p.fd = s; p.events = want_write ? POLLWRNORM : POLLRDNORM;
     return WSAPoll(&p, 1, ms);
 }
 void set_io_timeouts(sock_t s, int rcv_ms, int snd_ms) {
@@ -306,6 +320,16 @@ std::string net_isa_name(uint32_t isa) {
     return s;
 }
 
+#ifndef STRATA_NET_NO_QWEN
+uint32_t net_isa_bits() {
+    using namespace strata::kernels::cpu;
+    return (cpu_avx512_ok() ? 1u : 0u) | (cpu_avx512bw_ok() ? 2u : 0u) | (cpu_avx2_ok() ? 4u : 0u) | ((uint32_t) cpu_isa_cap() << 8);
+}
+#endif
+
+const char* net_arch_name(uint32_t arch) { return arch == kArchQwen38 ? "qwen38" : arch == kArchDsv41 ? "dsv41" : "unknown"; }
+
+#ifndef STRATA_NET_NO_QWEN
 NetIdentity net_identity(const std::vector<std::string>& files) {
     using namespace strata::kernels::cpu;
     const ExpertLayout& lay = expert_layout();
@@ -336,13 +360,11 @@ NetIdentity net_identity(const std::vector<std::string>& files) {
     NetIdentity id;
     h.finish(id.fingerprint);
     id.isa = net_isa_bits();
+    id.arch = kArchQwen38;
+    id.n_embd = (uint32_t) kQwenH;
     return id;
 }
-
-uint32_t net_isa_bits() {
-    using namespace strata::kernels::cpu;
-    return (cpu_avx512_ok() ? 1u : 0u) | (cpu_avx512bw_ok() ? 2u : 0u) | (cpu_avx2_ok() ? 4u : 0u) | ((uint32_t) cpu_isa_cap() << 8);
-}
+#endif
 
 // ================================================================== client
 // B5 (request pipelining across hosts): several hosts may serve one layer, each owning a range of its experts
@@ -351,7 +373,6 @@ uint32_t net_isa_bits() {
 // for the slowest one instead of one host doing all of it.  The prompt path keeps up to STRATA_NET_PIPELINE windows
 // (default 4) in flight per host instead of one round trip per window.
 bool NetExperts::connect_route(Route& r, int tmo_ms, std::string& err) {
-    const int64_t H = n_embd_;
     const sock_t s = sock_connect(r.host, r.port, tmo_ms, err);
     if (s == kBad) return false;
     auto fail = [&](const std::string& m) { err = m; sock_close(s); return false; };
@@ -367,7 +388,7 @@ bool NetExperts::connect_route(Route& r, int tmo_ms, std::string& err) {
     const bool need_token = (ch.flags & 1u) != 0;
     if (need_token && token_.empty()) return fail("expert server " + r.host + " requires a token: set STRATA_EXPERT_TOKEN");
     HelloMsg h{};
-    h.version = kProtoVersion; h.n_embd = (uint32_t) H; h.n_expert = (uint32_t) n_expert_; h.n_layers = (uint32_t) n_layers_;
+    h.version = kProtoVersion; h.n_embd = (uint32_t) H_; h.pad = id_.arch; h.n_expert = (uint32_t) n_expert_; h.n_layers = (uint32_t) n_layers_;
     h.isa = id_.isa;
     std::memcpy(h.fp, id_.fingerprint, 32);
     if (!token_.empty()) hello_mac(token_, ch.nonce, h, h.mac);
@@ -381,7 +402,7 @@ bool NetExperts::connect_route(Route& r, int tmo_ms, std::string& err) {
     if (a.ok != 1 || (int) a.lo > r.lo || (int) a.hi < r.hi)
         return fail("expert server " + r.host + " serves layers " + std::to_string(a.lo) + "-" + std::to_string(a.hi) + ", not " +
                     std::to_string(r.lo) + "-" + std::to_string(r.hi));
-    if (a.n_embd != (uint32_t) H || (int64_t) a.n_expert != n_expert_) return fail("expert server " + r.host + ": model geometry differs");
+    if (a.n_embd != (uint32_t) H_ || (int64_t) a.n_expert != n_expert_) return fail("expert server " + r.host + ": model geometry differs");
     if (a.isa != id_.isa)   // the server refuses a mismatch itself; this is the defence if it does not
         return fail("expert server " + r.host + " runs the " + net_isa_name(a.isa) + " kernels, this host the " + net_isa_name(id_.isa) + " ones");
     if (!need_token && !token_.empty())
@@ -391,12 +412,13 @@ bool NetExperts::connect_route(Route& r, int tmo_ms, std::string& err) {
     return true;
 }
 
-bool NetExperts::open(const std::string& spec, int64_t n_layers, int64_t n_expert, const NetIdentity& id, std::string& err, int64_t n_embd) {
+bool NetExperts::open(const std::string& spec, int64_t n_layers, int64_t n_expert, const NetIdentity& id, std::string& err) {
     ignore_sigpipe();
-    n_embd_ = n_embd > 0 ? n_embd : kFlashEmbd;
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     id_ = id;
+    H_ = id.n_embd != 0 ? (int64_t) id.n_embd : kQwenH;
+    if (H_ <= 0) { err = "the model identity has no hidden size (NetIdentity::n_embd)"; return false; }
     token_ = env_token();
     size_t pos = 0;
     std::vector<np::RouteSpec> specs;
@@ -484,22 +506,20 @@ bool NetExperts::route_up(Route& r) {
 
 bool NetExperts::send_req(Route& r, int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k, const uint8_t* mask,
                           int arith, uint64_t& seq, std::vector<uint8_t>& buf) {
-    const int64_t H = n_embd_;
     const int64_t n = n_tok * k;
     const size_t mask_len = (size_t) ((n + 3) / 4 * 4);
     buf.clear();
     put<uint32_t>(buf, (uint32_t) layer); put<uint32_t>(buf, (uint32_t) n_tok); put<uint32_t>(buf, (uint32_t) k);
     put<uint32_t>(buf, (uint32_t) arith); seq = ++seq_; put<uint64_t>(buf, seq);
     const size_t at = buf.size();
-    buf.resize(at + (size_t) n * 4 + mask_len + (size_t) n_tok * H * 4, 0);
+    buf.resize(at + (size_t) n * 4 + mask_len + (size_t) n_tok * H_ * 4, 0);
     std::memcpy(buf.data() + at, ids, (size_t) n * 4);
     for (int64_t i = 0; i < n; ++i) buf[at + (size_t) n * 4 + (size_t) i] = mask[i] ? 1 : 0;
-    std::memcpy(buf.data() + at + (size_t) n * 4 + mask_len, x, (size_t) n_tok * H * 4);
+    std::memcpy(buf.data() + at + (size_t) n * 4 + mask_len, x, (size_t) n_tok * H_ * 4);
     return send_frame((sock_t) r.fd, kReq, buf.data(), buf.size());
 }
 
 std::string NetExperts::recv_resp(Route& r, uint64_t seq, uint32_t want, std::vector<uint8_t>& resp, double& server_us) {
-    const int64_t H = n_embd_;
     uint32_t type = 0;
     server_us = 0;
     if (!recv_frame((sock_t) r.fd, type, resp, kMaxRespFrame)) return g_why.empty() ? std::string("receive failed") : g_why;
@@ -507,7 +527,7 @@ std::string NetExperts::recv_resp(Route& r, uint64_t seq, uint32_t want, std::ve
     if (type != kResp || resp.size() < 24) return "bad response";
     uint64_t rseq; uint32_t rows;
     std::memcpy(&rseq, resp.data(), 8); std::memcpy(&server_us, resp.data() + 8, 8); std::memcpy(&rows, resp.data() + 16, 4);
-    if (rseq != seq || rows != want || resp.size() != 24 + (size_t) rows * H * 4) return "response does not match the request";
+    if (rseq != seq || rows != want || resp.size() != 24 + (size_t) rows * H_ * 4) return "response does not match the request";
     return std::string();
 }
 
@@ -550,7 +570,6 @@ bool NetExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_
 }
 
 bool NetExperts::finish(float* out, std::string& err) {
-    const int64_t H = n_embd_;
     if (cur_ < 0) return true;
     cur_ = -1;
     owned_.clear();   // from here: the entries the caller must compute itself (those of the hosts that failed)
@@ -573,7 +592,7 @@ bool NetExperts::finish(float* out, std::string& err) {
         }
         const float* src = (const float*) (resp_.data() + 24);
         for (size_t q = 0; q < f.owned.size(); ++q)
-            std::memcpy(out + (size_t) f.owned[q] * H, src + q * (size_t) H, (size_t) H * 4);
+            std::memcpy(out + (size_t) f.owned[q] * H_, src + q * (size_t) H_, (size_t) H_ * 4);
         const double rtt = now_ms() - f.t_send;
         r.rtt_ms += rtt; r.server_ms += server_us / 1000.0; ++r.calls; r.bytes_in += resp_.size() + sizeof(Hdr);
         if (rtt > r.rtt_max_ms) r.rtt_max_ms = rtt;
@@ -586,7 +605,6 @@ bool NetExperts::finish(float* out, std::string& err) {
 
 bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
                         float* const* dst, std::string& err) {
-    const int64_t H = n_embd_;
     if (cur_ >= 0) { err = "a decode request is in flight"; return false; }
     static const int depth = [] { const char* v = std::getenv("STRATA_NET_PIPELINE"); return v ? std::max(1, std::atoi(v)) : 4; }();
     struct Req { int64_t t0w, nt; uint64_t seq; uint32_t want; };
@@ -616,7 +634,7 @@ bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64
         const float* src = (const float*) (resp_.data() + 24);
         size_t qq = 0;
         for (int64_t i = rq.t0w * k; i < (rq.t0w + rq.nt) * k; ++i)
-            if (mask[i] && ids[i] >= r.elo && ids[i] <= r.ehi) std::memcpy(dst[(size_t) i], src + (qq++) * (size_t) H, (size_t) H * 4);
+            if (mask[i] && ids[i] >= r.elo && ids[i] <= r.ehi) std::memcpy(dst[(size_t) i], src + (qq++) * (size_t) H_, (size_t) H_ * 4);
         ++r.p_calls; r.p_rows += rq.want; r.p_server_ms += server_us / 1000.0; r.p_bytes_in += resp_.size() + sizeof(Hdr);
         return true;
     };
@@ -643,7 +661,7 @@ bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64
             if (failed) break;
             uint64_t seq = 0;
             // arith 1, window-invariant: a row does not depend on its window (the local reference / fallback uses it too)
-            if (!send_req(r, layer, x + (size_t) pw.t0 * H, ids + pw.t0 * k, pw.nt, k, own[ri].data() + pw.t0 * k, 1, seq, buf_)) {
+            if (!send_req(r, layer, x + (size_t) pw.t0 * H_, ids + pw.t0 * k, pw.nt, k, own[ri].data() + pw.t0 * k, 1, seq, buf_)) {
                 err = "expert server " + r.host + " (prompt, layer " + std::to_string(layer) + "): send failed: " + g_why;
                 mark_down(r, err);
                 failed = true;
@@ -673,10 +691,10 @@ struct Conn {
 struct Ready { sock_t s = kBad; std::string peer; };
 struct ServerCtx {
     const ExpertServeCfg* cfg = nullptr;
-    int64_t H = 0;                           // n_embd of the model being served
     np::ReqLimits lim;
     std::string token;
     int tmo_ms = kDefaultTimeoutMs;
+    int64_t H = 0;                           // hidden size on the wire
     std::atomic<bool> stop{false};
     std::atomic<bool> busy{false};           // a session owns the dispatch (one conductor at a time)
     std::atomic<int> handshaking{0};
@@ -693,7 +711,6 @@ bool log_refusal(ServerCtx& C) {   // the first 20 refusals, then every 100th: a
 
 /// One connection, off the dispatch thread: challenge, authenticate, check the model, claim the single session slot.
 void handshake_thread(ServerCtx* C, sock_t s) {
-    const int64_t H = C->H;
     const std::string peer = peer_str(s);
     auto finish_fail = [&](const std::string& tell, const std::string& log) {
         if (!tell.empty()) send_err(s, tell);
@@ -720,7 +737,10 @@ void handshake_thread(ServerCtx* C, sock_t s) {
     }
     if (h.version != kProtoVersion)
         return finish_fail("protocol version " + std::to_string(h.version) + " is not supported (this server speaks " + std::to_string(kProtoVersion) + ")", "protocol version " + std::to_string(h.version));
-    if ((int64_t) h.n_embd != H || (int64_t) h.n_expert != C->cfg->n_expert || (int64_t) h.n_layers != C->cfg->n_layers)
+    if (h.pad != C->cfg->identity.arch)
+        return finish_fail("engine family differs: server " + std::string(net_arch_name(C->cfg->identity.arch)) + ", yours " + net_arch_name(h.pad),
+                           "engine family differs (" + std::string(net_arch_name(h.pad)) + ")");
+    if ((int64_t) h.n_embd != C->H || (int64_t) h.n_expert != C->cfg->n_expert || (int64_t) h.n_layers != C->cfg->n_layers)
         return finish_fail("model geometry differs (n_embd / n_expert / n_layers)", "model geometry differs");
     if (!np::ct_equal(h.fp, C->cfg->identity.fingerprint, 32))
         return finish_fail("model fingerprint differs: server " + np::hex(C->cfg->identity.fingerprint, 32) + " (isa " + std::to_string(C->cfg->identity.isa) + "), yours " + np::hex(h.fp, 32) +
@@ -732,7 +752,7 @@ void handshake_thread(ServerCtx* C, sock_t s) {
     if (!C->busy.compare_exchange_strong(expect, true)) return finish_fail("busy: another conductor is connected", "busy (a conductor is connected)");
     AckMsg a{};
     a.version = kProtoVersion; a.ok = 1; a.lo = (uint32_t) C->cfg->layer_lo; a.hi = (uint32_t) C->cfg->layer_hi;
-    a.n_embd = (uint32_t) H; a.n_expert = (uint32_t) C->cfg->n_expert; a.top_k = (uint32_t) C->cfg->top_k; a.isa = C->cfg->identity.isa;
+    a.n_embd = (uint32_t) C->H; a.n_expert = (uint32_t) C->cfg->n_expert; a.top_k = (uint32_t) C->cfg->top_k; a.isa = C->cfg->identity.isa;
     if (!send_frame(s, kHelloAck, &a, sizeof a)) {
         C->busy = false;
         return finish_fail("", "HELLO_ACK not sent (" + g_why + ")");
@@ -747,9 +767,9 @@ void handshake_thread(ServerCtx* C, sock_t s) {
 }
 
 /// The REQ loop of the one authenticated conductor, on the thread that owns the dispatch.
-void serve_session(const ServeCompute& compute, ServerCtx& C, sock_t s, const std::string& peer, std::vector<uint8_t>& payload,
+void serve_session(const ExpertComputeFn& compute, ServerCtx& C, sock_t s, const std::string& peer, std::vector<uint8_t>& payload,
                    std::vector<float>& out, std::vector<uint8_t>& resp) {
-    const int64_t H = C.H;
+    const size_t H = (size_t) C.H;
     std::fprintf(stderr, "strata net: conductor connected from %s\n", peer.c_str());
     sock_tune(s, true);
     set_io_timeouts(s, 0, C.tmo_ms);   // a conductor may sit idle between prompts (keepalive covers a dead one); a send never waits forever
@@ -770,11 +790,11 @@ void serve_session(const ServeCompute& compute, ServerCtx& C, sock_t s, const st
             if (!send_frame(s, kErr, why.data(), why.size())) break;
             continue;
         }
-        out.assign(v.n * (size_t) H, 0.0f);
+        out.assign(v.n * H, 0.0f);
         const double t0 = now_ms();
-        std::string why_failed;   // a failure answers one request; it must not poison the next (the compute callback resets its own state)
-        if (!compute((int) v.layer, (int) v.n_tok, (int) v.k, (int) v.arith, v.ids, v.mask, v.x, out.data(), why_failed)) {
-            const std::string m = std::string("expert pool failed: ") + (why_failed.empty() ? "?" : why_failed) + " (layer " + std::to_string(v.layer) + ")";
+        std::string cerr;
+        if (!compute(v.layer, v.n_tok, v.k, (int) v.arith, v.ids, v.mask, v.x, out.data(), cerr)) {
+            const std::string m = "expert pool failed: " + cerr + " (layer " + std::to_string(v.layer) + ")";
             if (!send_frame(s, kErr, m.data(), m.size())) break;
             continue;
         }
@@ -806,7 +826,7 @@ bool is_loopback(const sockaddr* a) {
 }
 }  // namespace
 
-int serve_experts_fn(const ExpertServeCfg& cfg, const ServeCompute& compute) {
+int serve_experts(const ExpertServeCfg& cfg, const ExpertComputeFn& compute) {
     if (const std::string why = np::serve_cfg_problem(cfg.top_k, cfg.identity.fingerprint); !why.empty()) {
         std::fprintf(stderr, "strata net: the expert server is misconfigured: %s\n", why.c_str());
         return 1;
@@ -820,9 +840,12 @@ int serve_experts_fn(const ExpertServeCfg& cfg, const ServeCompute& compute) {
     C.cfg = &cfg;
     C.token = env_token();
     C.tmo_ms = timeout_ms();
-    C.H = cfg.n_embd > 0 ? cfg.n_embd : kFlashEmbd;
-    C.lim.layer_lo = lo; C.lim.layer_hi = hi; C.lim.n_embd = C.H; C.lim.n_expert = cfg.n_expert; C.lim.top_k = cfg.top_k;
-    C.lim.max_tok = strata::kernels::kWindowMaxT; C.lim.max_entries = strata::kernels::kWindowMaxEntries;
+    C.H = cfg.identity.n_embd != 0 ? (int64_t) cfg.identity.n_embd : kQwenH;
+    if (C.H <= 0) { std::fprintf(stderr, "strata net: the expert server has no hidden size (identity.n_embd)\n"); return 1; }
+    const int64_t H = C.H;
+    C.lim.layer_lo = lo; C.lim.layer_hi = hi; C.lim.n_embd = H; C.lim.n_expert = cfg.n_expert; C.lim.top_k = cfg.top_k;
+    C.lim.max_tok = cfg.max_tok > 0 ? cfg.max_tok : strata::kernels::kWindowMaxT;
+    C.lim.max_entries = cfg.max_entries > 0 ? cfg.max_entries : strata::kernels::kWindowMaxEntries;
     C.lim.expert_lo = cfg.expert_lo; C.lim.expert_hi = cfg.expert_hi;   // B5: a request for an expert another host owns is refused
     ExpertServeCfg cfg2 = cfg;
     cfg2.layer_hi = hi;

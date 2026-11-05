@@ -51,7 +51,7 @@ What still assumed Flash-Next's (or Qwen3.6's) shapes on the way to Max, found b
 | `kernels/cpu/pool.hpp` `SplitBufMulti::ff[MAXT][FF]` | FF = 640 floats per token (Flash-Next); Qwen3.6's 512 fit by luck | `kNativeMaxFF` = 2560; `native_fmt` refuses a wider expert (Max: 2048) |
 | `kernels/cuda/iq_kernels.cu` `STRATA_D_FMTS` | a down projection is never IQ2_XXS / IQ1_M (Flash-Next: IQ4_NL / IQ4_XS / Q2_0; Qwen3.6: K-quants) | IQ2_XXS (16) and IQ1_M (29) take the down role, so UD-IQ2_XXS / UD-IQ1_M load with every expert tensor in one i-quant |
 | `core/net_experts.cpp` `H = cpu::H` | the wire row is 2560 floats | `n_embd` is a run-time number (`NetExperts::open(..., n_embd)`, `ExpertServeCfg::n_embd`); 0 keeps 2560, so Flash-Next is byte-for-byte unchanged |
-| `core/net_experts.cpp` `serve_experts(ExpertDispatch&)` | the server loop could only call Flash-Next's pack dispatch | `serve_experts_fn(cfg, compute)`: the loop (handshake, token, request validation) takes a callback; `net_experts_dispatch.cpp` is Flash-Next's callback, `native_rows.cpp` the qwen35moe one |
+| `core/net_experts.cpp` `serve_experts(ExpertDispatch&)` | the server loop could only call Flash-Next's pack dispatch | `serve_experts(cfg, compute)` (`ExpertComputeFn`)`: the loop (handshake, token, request validation) takes a callback; `net_experts_dispatch.cpp` is Flash-Next's callback, `native_rows.cpp` the qwen35moe one |
 | `q36_engine.cu` MTP block | loaded whenever the file has one | dropped with a note when its experts have no GPU kernel (Q2_K in the Max files) |
 
 New: `--remote-experts HOST:PORT=LO-HI[,...]` on `strata-q36` and on `strata` for a qwen35moe file (same flag, same SXP1 protocol as

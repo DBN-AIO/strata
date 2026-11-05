@@ -3929,7 +3929,7 @@ int strata::qwen35::run(int argc, char** argv) {
             const std::vector<std::string> files = strata::gguf_split_paths(model);
             const strata::core::NetIdentity id = strata::core::native_net_identity(*m.file, m.g, m.top_k, files);
             auto net = std::make_unique<strata::core::NetExperts>();
-            if (!net->open(remote_spec, m.g.n_layers + m.g.n_mtp_layers, m.g.n_expert, id, err, m.g.n_embd)) {
+            if (!net->open(remote_spec, m.g.n_layers + m.g.n_mtp_layers, m.g.n_expert, id, err)) {
                 std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
                 return 1;
             }

@@ -141,17 +141,16 @@ int serve(const Options& o, const strata::core::ModelGeometry& g, int64_t top_k)
     if (!o.listen_host.empty()) sc.host = o.listen_host;
     sc.n_layers = total;
     sc.n_expert = g.n_expert;
-    sc.n_embd = g.n_embd;
     sc.top_k = top_k;
     sc.identity = strata::core::native_net_identity(gm, g, top_k, files);
     sc.layer_lo = lo;
     sc.layer_hi = hi;
-    const strata::core::ServeCompute compute = [&rows](int layer, int n_tok, int k, int arith, const int32_t* ids, const uint8_t* mask,
+    const strata::core::ExpertComputeFn compute = [&rows](uint32_t layer, uint32_t n_tok, uint32_t k, int arith, const int32_t* ids, const uint8_t* mask,
                                                        const float* x, float* out, std::string& e) {
-        return rows.run(layer, n_tok, k, ids, mask, x, out,
+        return rows.run((int) layer, (int) n_tok, (int) k, ids, mask, x, out,
                         arith == 1 ? C::NativeArithmetic::WindowInvariant : C::NativeArithmetic::Default, e);
     };
-    return strata::core::serve_experts_fn(sc, compute);
+    return strata::core::serve_experts(sc, compute);
 }
 
 }  // namespace strata_q36

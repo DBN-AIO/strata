@@ -10,9 +10,11 @@
 // Wire protocol "SXP1", version 2 (all integers little endian, one persistent TCP connection, TCP_NODELAY):
 //   frame   = u32 magic 0x31505853 | u32 type | u64 payload_len | payload          (16 byte header)
 //   CHALLENGE(7) server->client  u32 version(2) | u32 flags(bit0: a token is required) | u8 nonce[32]
-//   HELLO(1)  client->server  u32 version(2) | u32 n_embd | u32 n_expert | u32 n_layers | u32 isa | u32 0 |
+//   HELLO(1)  client->server  u32 version(2) | u32 n_embd | u32 n_expert | u32 n_layers | u32 isa | u32 arch |
 //                             u8 model_fingerprint[32] | u8 mac[32]
 //                             mac = HMAC-SHA256(token, nonce || the 56 HELLO bytes before the mac), zeros without a token
+//                             arch (was a zero pad): the engine family, kArchQwen38 = 0 (the old pad value, so an older conductor still
+//                             matches a qwen38 server) or kArchDsv41 = 1.  A server refuses a conductor of another arch.
 //   HELLO_ACK(2) server->client u32 version(2) | u32 ok(1) | u32 layer_lo | u32 layer_hi | u32 n_embd | u32 n_expert |
 //                             u32 top_k | u32 isa
 //   REQ(3)    client->server  u32 layer | u32 n_tok | u32 k | u32 arith | u64 seq |
@@ -36,14 +38,19 @@ namespace strata::core {
 struct ExpertDispatch;
 
 /// What the two ends must agree on for "bit identical": the model's expert tensors and the CPU kernel path.
+inline constexpr uint32_t kArchQwen38 = 0;   ///< src/core + src/program: Qwen3.8-Flash-Next and the qwen35moe family
+inline constexpr uint32_t kArchDsv41 = 1;    ///< src/dsv41: DeepSeek-V4.1-Flash (docs/DEEPSEEK41_SPLIT.md)
+const char* net_arch_name(uint32_t arch);
 struct NetIdentity {
     uint8_t fingerprint[32] = {};   ///< SHA-256 over the expert layout (types, offsets, sizes) and the model files' sizes
-    uint32_t isa = 0;               ///< the CPU kernel path (net_isa_name)
+    uint32_t isa = 0;               ///< the CPU kernel path (net_isa_name); the dsv41 kernels are bit-exact on every ISA: 0
+    uint32_t arch = kArchQwen38;    ///< the engine family; carried in HELLO, a mismatch is refused by the server
+    uint32_t n_embd = 0;            ///< the hidden size on the wire; 0 = the qwen38 engine's compile-time H
 };
 /// `model_files`: the GGUF / experts.bin files the experts are read from (their sizes enter the fingerprint).
 NetIdentity net_identity(const std::vector<std::string>& model_files);
 std::string net_isa_name(uint32_t isa);
-/// The CPU kernel path word of NetIdentity::isa (avx512 / avx512bw / avx2 bits and the STRATA_FORCE_ISA cap).
+/// The CPU kernel path word of NetIdentity::isa (avx512 / avx512bw / avx2 bits and the STRATA_FORCE_ISA cap).  Not in the dsv41 build (STRATA_NET_NO_QWEN).
 uint32_t net_isa_bits();
 /// Socket read/write/connect timeout in ms for both ends (default 10000; env STRATA_EXPERT_TIMEOUT_MS; --expert-timeout-ms).
 void net_set_timeout_ms(int ms);
@@ -61,9 +68,7 @@ public:
     /// request then goes to all of its hosts before any answer is read (B5).
     /// Connects to every server once; a failure here is an error (the user asked for it).  After that a server that fails is
     /// dropped and retried with backoff while its rows are computed locally.
-    /// `n_embd`: the model's hidden width (the rows on the wire); 0 = Flash-Next's 2560.  Qwen3.8-Max's is 8192.
-    bool open(const std::string& spec, int64_t n_layers, int64_t n_expert, const NetIdentity& id, std::string& err,
-              int64_t n_embd = 0);
+    bool open(const std::string& spec, int64_t n_layers, int64_t n_expert, const NetIdentity& id, std::string& err);
     bool active() const { return !routes_.empty(); }
     bool serves(int64_t layer) const { return route_of(layer) >= 0; }
     /// The hosts of `layer` together own every expert (B5: the prompt path hands a layer to the servers only then).
@@ -113,7 +118,7 @@ private:
     uint64_t layer_calls_ = 0, multi_calls_ = 0;
     double wait_ms_ = 0;
     std::vector<Route> routes_;
-    int64_t n_layers_ = 0, n_expert_ = 0, n_embd_ = 2560;
+    int64_t n_layers_ = 0, n_expert_ = 0;
     NetIdentity id_;
     std::string token_;
     // the request in flight
@@ -123,6 +128,7 @@ private:
     std::vector<uint8_t> mask_, buf_;
     std::vector<int32_t> owned_;
     double t_send_ms_ = 0;
+    int64_t H_ = 0;   ///< hidden size on the wire (id_.n_embd, else the qwen38 engine's H)
 };
 
 struct ExpertServeCfg {
@@ -132,7 +138,6 @@ struct ExpertServeCfg {
     int expert_lo = 0, expert_hi = -1; ///< served experts of those layers (inclusive, --serve-experts); hi < 0: all
     int64_t n_layers = 0;
     int64_t n_expert = 0;
-    int64_t n_embd = 0;                ///< the model's hidden width, the rows on the wire (0: Flash-Next's 2560)
     int64_t top_k = 0;                 ///< the model's routed experts per token: a request with another k is refused
     NetIdentity identity;
     bool once = false;                 ///< serve one connection, then return
@@ -145,16 +150,17 @@ struct ExpertServeCfg {
     /// Optional: rows computed so far by GPU expert tiers of this server (helper GPUs), for the per-connection summary.
     uint64_t (*gpu_rows)(void* user) = nullptr;
     void* gpu_user = nullptr;
+    /// Window limits a request is checked against (rows, and rows x k); 0: the qwen38 engine's (window_limits.hpp).
+    int64_t max_tok = 0, max_entries = 0;
 };
 
-/// What the server loop calls for one validated request: compute the rows of the entries whose mask byte is 1 (`n_tok` tokens
-/// x `k` routed experts, ids / mask of that size, `x` = n_tok rows of n_embd floats) into `rows` (entry i at rows + i*n_embd; the
-/// others are left as they are), with the arithmetic `arith` (0 default, 1 window-invariant).  False with `err` = the request failed.
-using ServeCompute = std::function<bool(int layer, int n_tok, int k, int arith, const int32_t* ids, const uint8_t* mask,
-                                        const float* x, float* rows, std::string& err)>;
-/// The model-independent expert server loop (handshake, token, validation, framing).  `serve_experts` below is Flash-Next's
-/// compute behind it; the Qwen3.6 / Qwen3.8-Max family (strata/core/native_rows.hpp) is the other.  Returns 0 on a clean stop.
-int serve_experts_fn(const ExpertServeCfg& cfg, const ServeCompute& compute);
+/// What an expert server computes for one request: the entries i of n_tok*k whose mask[i] is 1 (expert ids[i] for the token
+/// i / k, whose hidden state is x + (i / k) * n_embd), written to out + i * n_embd (un-weighted FFN output, fp32).  `arith`
+/// is the request's arithmetic mode (0 default, 1 window invariant).  False with `err`: answered with ERR, the connection stays.
+using ExpertComputeFn = std::function<bool(uint32_t layer, uint32_t n_tok, uint32_t k, int arith, const int32_t* ids,
+                                           const uint8_t* mask, const float* x, float* out, std::string& err)>;
+/// The expert server loop for any engine family: sockets, handshake (token, arch, geometry, fingerprint), one conductor at a time.
+int serve_experts(const ExpertServeCfg& cfg, const ExpertComputeFn& compute);
 
 /// The expert server loop: answers REQ frames with `d` (an ordinary pool dispatch with every row on the CPU).  `d` must
 /// be a CPU-only dispatch (no peer GPU, no helper GPUs, no plan, no net): refused with 1 otherwise.  A request is validated

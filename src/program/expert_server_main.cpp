@@ -24,7 +24,9 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "q36_expert_server.hpp"
 
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 
 #include <chrono>
 #include <cstdint>
@@ -111,6 +113,17 @@ bool parse(int argc, char** argv, Options& o) {
 
 // Make the served layers' experts resident in RAM: touch every page of every expert blob of the GGUF mapped in place (the
 // page cache then holds them) and mlock what `ulimit -l` allows.  The same as the warm-up in generate.cpp's expert server.
+// mlock where the OS has it.  Windows: VirtualLock needs a raised minimum working set and the mapped pages stay in the standby
+// list anyway, so the pages are touched (below) and not locked; the log line then says "mlocked 0.00 GiB".
+static bool try_mlock(const void* p, uint64_t n) {
+#ifdef _WIN32
+    (void) p; (void) n;
+    return false;
+#else
+    return mlock(p, n) == 0;
+#endif
+}
+
 struct WarmCtx { strata::core::ExpertSource* src; int64_t ne; };
 
 void warm_served_layers(void* user, int lo, int hi) {
@@ -130,7 +143,7 @@ void warm_served_layers(void* user, int lo, int hi) {
             for (int i = 0; i < ns; ++i) {
                 for (uint64_t off = 0; off < bp[i].n; off += 4096) sink = sink + bp[i].p[off];
                 touched += bp[i].n;
-                if (mlock(bp[i].p, bp[i].n) == 0) locked += bp[i].n;
+                if (try_mlock(bp[i].p, bp[i].n)) locked += bp[i].n;
             }
         }
     }
