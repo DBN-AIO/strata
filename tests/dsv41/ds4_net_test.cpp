@@ -249,10 +249,8 @@ int main(int argc, char** argv) {
             seq.push_back(tok);
         }
         const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - decode_t0).count();
-        if (show_time) std::printf("DECODE %.3f ms a token over %d tokens
-", n_new > 1 ? decode_ms / (double) (n_new - 1) : 0.0, n_new - 1);
-        if (n_new > 1) std::fprintf(stderr, "DECODE %d single-token steps in %.1f ms: %.3f ms a token, %.1f tok/s (the toy's own dense part included)
-", n_new - 1, decode_ms, decode_ms / (n_new - 1), 1000.0 * (n_new - 1) / decode_ms);
+        if (show_time) std::printf("DECODE %.3f ms a token over %d tokens\n", n_new > 1 ? decode_ms / (double) (n_new - 1) : 0.0, n_new - 1);
+        if (n_new > 1) std::fprintf(stderr, "DECODE %d single-token steps in %.1f ms: %.3f ms a token, %.1f tok/s (the toy's own dense part included)\n", n_new - 1, decode_ms, decode_ms / (n_new - 1), 1000.0 * (n_new - 1) / decode_ms);
     } else {
         std::mt19937 prng(prompt_seed * 2654435761u + 17u);
         std::vector<int> pr((size_t) n_prompt);
