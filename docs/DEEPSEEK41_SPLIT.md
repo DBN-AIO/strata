@@ -478,7 +478,73 @@ CUDA_VISIBLE_DEVICES=<card uuid> build/ds4_gpu_rows_test --pack SYNTHETIC_PACK [
 The rig has six cards, pinned by UUID (`add_a_3060.md`): the 3090 (24 GB) holds seven 3.3 GB layers, each 3060 (12 GB) about three. The three 3060s and the 5070 hold
 TabbyAPI models today, so a real run needs them unloaded, as the Placement table says. **Stream PC (RTX 5070 Ti, sm_120):** the same two targets with
 `-DCMAKE_CUDA_ARCHITECTURES=120-real` and CUDA 13.x (the build section above, TODO-1276); `strata-dsv41-expert-server-gpu.exe` takes the same flags, and
-`--gpu-vram-gb 5` fits what the Placement table says is free beside TabbyAPI. Not built or run there (no toolkit; the stream PC is not touched from this work).
+`--gpu-vram-gb 5` fits what the Placement table says is free beside TabbyAPI. Not built or run there (no toolkit; the stream PC is not touched from this work). Plan, Jack-only steps and scripts: "Blackwell (sm_120) builds" below.
+
+## Blackwell (sm_120) builds: the stream PC's 5070 Ti and the rig's 5070 (BBXL)
+
+Both cards are Blackwell (sm_120, compute capability 12.0). sm_120 needs **nvcc 12.8 or newer**; CMake and the two build scripts now refuse an older
+nvcc with the install step instead of failing inside nvcc (`cmake/strata_cuda_arch_check.cmake`, `tools/dsv41/cuda_arch_check.py`; the same table, both
+tested by `tests/dsv41/test_cuda_arch_check.py` without nvcc: `python3 -m unittest tests/dsv41/test_cuda_arch_check.py`). 13.0 is the release toolkit (12.8 builds, but
+engines built with it crashed on long prompts, #220 / #224); **13.2.0 and 13.2.1 miscompiled the engine for sm_120** (13.2.2 is fixed): take 13.0.x, 13.1.x or 13.2.2+.
+The architecture is the standard `-DCMAKE_CUDA_ARCHITECTURES` (a dsv41 build with none gets `86-real;89-real;120`); the scripts default to `86-real;120-real`
+(3090 / 3060 and 5070 in one binary). Kernel code is not arch-gated beyond `__CUDA_ARCH__ >= 700` (ds4_gguf.cu, ds4_kernels.cu, ds4_pcie.cuh), so no
+source change is needed for sm_120; `ds4_iq.cu` has no arch guard.
+
+| | Rig (Ubuntu, 6 GPUs) | Stream PC (Windows, one NVIDIA card) |
+| --- | --- | --- |
+| Card | RTX 5070 12 GB, TabbyAPI :5000 holds 8.7 GB of it now | RTX 5070 Ti 16 GB, TabbyAPI `LOCAL` :5000 (9B; the doc's Placement table: 11 of 16 GB held) |
+| Driver today | 610.57.04, CUDA UMD **13.3**: new enough for any 12.8-13.3 toolkit, **no driver change** | not read from here (the PC is not touched); 13.x needs a driver that reports CUDA 13.0+ |
+| Toolkit today | Ubuntu `nvidia-cuda-toolkit` 12.4.131 at `/usr/bin/nvcc` (the S2 build used it, `CMAKE_CUDA_HOST_COMPILER=g++-13`, `86-real`); `/usr/local/cuda` is a dangling link | none (TODO-1276) |
+| Disk | `/home` 6.6 GB free (99%): never; `/mnt/models` (NVMe) 38 GB free: fits a toolkit (about 6-7 GB) and a build dir (about 3 GB) | C: 27 GB free before the install (floor 15 GB); D: is failing, never used |
+| Script | `tools/dsv41/build_gpu_server_linux.sh` | `tools\dsv41\build_gpu_server_windows.ps1` |
+
+**Jack-only steps** (nothing here installs anything):
+
+1. **Stream PC (TODO-1276).** Install the NVIDIA CUDA Toolkit **13.0 or newer** (13.0.x / 13.1.x / 13.2.2+; not 13.2.0 / 13.2.1) from NVIDIA's installer, Custom
+   install: CUDA Toolkit components (Compiler, Runtime, cuBLAS, Development), Visual Studio integration **off**, driver component **off** (keep the PC's driver),
+   installed on C:. The installer sets `CUDA_PATH`, which the scripts read. With CUDA 13.0-13.2 also install the **Visual Studio 2022 Build Tools** (C++ workload)
+   beside the 2026 ones; CUDA 13.3+ accepts the 2026 Build Tools the PC already has (the script picks the right `vcvars64.bat`; `STRATA_VCVARS` overrides).
+2. **Rig, only to serve layers from the 5070** (the 3090 and the 3060s already work with the 12.4 toolkit, `ARCH=86-real`): a toolkit that fits beside the system one, user-local,
+   so the driver and `/usr/bin/nvcc` stay as they are: download `cuda_13.0.2_*_linux.run` (about 4 GB) to `/mnt/models/cuda-dl/` and run
+   `sh cuda_13.0.2_*_linux.run --silent --toolkit --toolkitpath=/mnt/models/cuda-13.0 --no-opengl-libs --no-man-page` as the normal user (no `sudo`, no `--driver`;
+   `--toolkitpath` under a user-writable directory needs no root and writes nothing to `/usr/local`). Then delete the `.run` from `/mnt/models/cuda-dl/` through the
+   cleanup list. Nothing changes for TabbyAPI: it does not use the toolkit (it ships its own CUDA runtime in `venv164`).
+   To-do text for the board (not posted): *title* "Rig: install a user-local CUDA 13.0 toolkit for the 5070 GPU expert server (BBXL)"; *why* "Without nvcc 12.8+ the rig's 5070 (sm_120) cannot run
+   the dsv41 GPU expert server; the 3090 and 3060s are unaffected"; *steps* "1. On the rig, as dadbodnerd: `mkdir -p /mnt/models/cuda-dl && cd /mnt/models/cuda-dl`; download the CUDA 13.0.2 Linux x86_64 runfile (developer.nvidia.com/cuda-13-0-2-download-archive,
+   Linux, x86_64, Ubuntu, runfile local). 2. `sh cuda_13.0.2_*_linux.run --silent --toolkit --toolkitpath=/mnt/models/cuda-13.0 --no-opengl-libs --no-man-page` (about 6 GB; no driver, no sudo). 3. `/mnt/models/cuda-13.0/bin/nvcc --version` says release 13.0. 4. Tell Claude;
+   the runfile goes on the cleanup list." priority soon, kind action.
+
+**Rig commands** (after step 2; the 12.4 build of the S2 section above is unchanged):
+
+```sh
+CUDA=/mnt/models/cuda-13.0 B=/mnt/models/strata-build/gpu-server ARCH="86-real;120-real" JOBS=3 tools/dsv41/build_gpu_server_linux.sh
+# prints: driver CUDA 13.3 >= toolkit 13.0, host compiler g++-15, the SASS list (sm_86 sm_120), the card UUIDs, the smoke commands, then the binary
+CUDA_VISIBLE_DEVICES=GPU-d43aa31e-2a27-67f7-43b7-2acbb4c1c63f build/ds4_gpu_rows_test --pack SYNTHETIC_PACK --bench 200      # the 5070; needs it free of TabbyAPI's 8.7 GB
+```
+
+The script refuses, naming the step, when: `CUDA` or `B` is unset, no `nvcc` at `CUDA`, the toolkit cannot build `ARCH` (12.4 with 120), the driver's CUDA is older than the
+toolkit's, no host compiler fits (12.x needs g++-13; 13.x takes g++-15 / 14), `B` has under 6 GB free (`MIN_FREE_GB`), no cmake / ninja, or the binary lacks the SASS asked for.
+The UUIDs of this rig (read 2026-11-04, nvidia-smi 610.57.04): 5070 `GPU-d43aa31e-2a27-67f7-43b7-2acbb4c1c63f`, 3090 `GPU-d526893c-b378-4be2-4e99-71848237f300`; the
+5070 is index 0 today and the doc rule stands: never address by index. A binary built `86-real;120-real` runs on all of them.
+
+**Stream PC commands** (after step 1; the PC is the streaming machine: the build runs through the capped CPU lane, below normal priority):
+
+```bat
+powershell -File tools\dsv41\build_gpu_server_windows.ps1 -Check          :: reads only: prints each missing step, builds nothing
+MSYS_NO_PATHCONV=1 C:\Python314\python.exe "D:/AIStuff/AIO/AIO/AI Projects/AIOrchestrator/tools/cpu_lane/win_job.py" --cwd C:\AIO-strata -- powershell -File tools\dsv41\build_gpu_server_windows.ps1
+```
+
+It checks, in this order, and exits 2 with every missing step listed: C: free >= 15 GB; the checkout; `CUDA_PATH` and `bin\nvcc.exe`; the toolkit can build sm_120 (12.8+); the right
+Visual Studio Build Tools for that toolkit; `nvidia-smi` and a 5070 Ti among the cards (pinned by its UUID) with at least 1 GB of VRAM free after the headroom. Then it builds
+`strata-dsv41-expert-server-gpu.exe` and `ds4_gpu_rows_test.exe` into `C:\AIO-strata\build-cuda-gpu` and prints the smoke commands. **`--gpu-vram-gb` is sized live**:
+free VRAM now (16 GB minus what TabbyAPI's 9B and the desktop hold; `config.json` `LOCAL` is `vram_gb 16`) minus 1 GB headroom for the stream (NVENC, capture), rounded down to a half GB and
+capped at 5 (`-MaxVramGb`): with TabbyAPI holding 11 GB that is 4. A server that cannot hold its layers in that budget refuses to start and prints the shortfall; `--gpu-cpu-rest` serves the rest
+by the CPU lane. Start it the usual way, never from an agent shell:
+`powershell -File tools\stream_pc\start_dsv41_server.ps1 -Exe C:\AIO-strata\build-cuda-gpu\strata-dsv41-expert-server-gpu.exe -Layers 34-39 -ExtraArgs "--expert-server-gpu --gpu-vram-gb 4 --gpu-cpu-rest"`.
+Stream mode still stops this server by its PID. No GPU power or clock setting is touched anywhere in these scripts.
+
+Not done: nothing was built with CUDA 12.8+ or run on a Blackwell card (no such toolkit on any host yet); the tests cover the version gate, the script refusals (stub `nvcc`), and the
+PowerShell script's syntax only.
 
 **Prompt windows on the GPU server (S3 x S5 merge).** The server accepts prompt windows of up to 32 tokens (`kMaxPromptTok`), but the GPU lane's buffers and the engine's window kernels hold 16 (`kMaxTok`):
 a window longer than 16 tokens is computed on the card in sub-windows of 16 (token-major rows, so each piece is an offset; same rows as one window). Not compiled here (no CUDA / C++ toolchain on this PC): CI builds the CPU side; the CUDA side needs a GPU build.
