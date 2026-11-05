@@ -45,6 +45,9 @@ env:
   CMAKE_VERSION: 3.31.6
   CMAKE_SHA256: 5a1133ff103c71eb5120e2cc3de922733e7d8a26a98ae716397e8676adb367bf
   CI_CACHE: ${{ github.workspace }}/../.strata-ci-cache   # beside the checkout, on the runner's disk (never D:)
+  # gcc, cmake's compiler probe and python's tempfile write their scratch files here, not to the runner's quota-limited tmpfs /tmp
+  # ("error closing /tmp/cc*.s: Disk quota exceeded", runs on remote-experts 2026-11-04); the 'Disk and tools' step creates it
+  TMPDIR: ${{ github.workspace }}/../.strata-ci-tmp
 
 jobs:
   cpu-only:
@@ -60,6 +63,7 @@ jobs:
         run: |
           set -eu
           mkdir -p "$CI_CACHE"
+          mkdir -p "$TMPDIR"
           avail_gb=$(df -BG --output=avail "$CI_CACHE" | tail -1 | tr -dc 0-9)
           echo "free on the runner's disk: ${avail_gb} GB"
           if [ "$avail_gb" -lt 8 ]; then echo "::error::less than 8 GB free for the build (needs ~2 GB, keeps 6 GB spare)"; exit 1; fi
@@ -115,8 +119,15 @@ jobs:
       # DeepSeek-V4.1-Flash experts over the LAN (docs/DEEPSEEK41_SPLIT.md): a tiny DeepSeek-shaped model with random weights in the
       # real sets' quant types, 64 greedy tokens in one process vs. through expert servers on localhost, bit-identical expert rows;
       # also two servers, a server that dies mid-run (local fallback), and the refusals (engine family, token, geometry).  ~10 s.
+      # Scratch packs go to a disk dir under the build tree (--tmp), never the runner's quota-limited tmpfs /tmp; servers are waited for by port.
       - name: DeepSeek split test (synthetic)
-        run: python3 tools/dsv41/synthetic_split_test.py build-cpu
+        run: python3 tools/dsv41/synthetic_split_test.py build-cpu --tmp build-cpu/synthetic-tmp
+
+      # BBXL: popularity-aware placement (plan_split.py --popularity) and the rank-ordered slice (slice_stream.py emit --perm); pure python, about 2 s.
+      - name: DeepSeek split planner tests
+        run: |
+          python3 tools/dsv41/test_plan_split.py
+          python3 tools/dsv41/test_slice_perm.py
 
   # DEFERRED: a Windows compile check of the same target (the server's socket shim has a Winsock branch, never compiled in CI).
   # There is no Windows runner for this repository yet; when one is registered, enable this job.

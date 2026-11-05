@@ -616,6 +616,10 @@ server, two servers (layers 0-3 / 4-7), a partial split (layers 2-5, the conduct
 (0-15 / 16-31), a server that exits after 40 requests (fallback), a server on a sparse slice; refusals for a qwen38 conductor, a wrong
 token, another expert count. `ds4_net_test` is the program (`--mode local|remote --remote SPEC`).
 
+Scratch: `--tmp DIR` (else `$RUNNER_TEMP`, else the build dir) holds the packs in a subdirectory removed on exit, SIGTERM included; the test refuses a
+tmpfs/ramfs or a directory with under 1 GiB free (`STRATA_TEST_NEED_GIB`). Servers are waited for by polling their port (30 s), not a fixed
+sleep; `STRATA_TEST_SERVER_START_DELAY=SECONDS` delays every server start to prove it.
+
 ## NVLink
 
 The two RTX 3090 of the gaming PC are NVLink-bridged (`nvidia-smi topo -m`: NV4, four links, 14 GB/s per link shown).

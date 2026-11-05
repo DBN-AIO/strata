@@ -434,9 +434,45 @@ bool ExpertHost::compute(uint32_t layer, uint32_t n_tok, uint32_t k, const int32
 }
 
 // ================================================================== the conductor's side
+// BBXL S3: STRATA_DS4_EXPERT_PERM=FILE (plan_split.py --popularity --perm-out).  The experts were renumbered hottest first per layer and the
+// servers' slices are laid out by RANK (slice_stream.py emit --perm), so the conductor sends the rank of every remote expert.  File: "DS4PERM1",
+// u32 layers, u32 experts, then uint16 rank[layer][original expert].  Unset: ids go out as they are (the zero-cost default).
+static bool load_expert_perm(const char* path, int n_layers, int n_exp, std::vector<uint16_t>& out, std::string& err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = std::string("STRATA_DS4_EXPERT_PERM ") + path + ": cannot open"; return false; }
+    char hd[16];
+    f.read(hd, 16);
+    uint32_t nl = 0, ne = 0;
+    if (f.gcount() != 16 || std::memcmp(hd, "DS4PERM1", 8) != 0) { err = std::string("STRATA_DS4_EXPERT_PERM ") + path + ": not a DS4PERM1 file"; return false; }
+    std::memcpy(&nl, hd + 8, 4);
+    std::memcpy(&ne, hd + 12, 4);
+    if ((int) ne != n_exp || (int) nl < n_layers) {
+        err = std::string("STRATA_DS4_EXPERT_PERM ") + path + ": is for " + std::to_string(nl) + " layers x " + std::to_string(ne) + " experts, this pack has " +
+              std::to_string(n_layers) + " x " + std::to_string(n_exp);
+        return false;
+    }
+    out.assign((size_t) n_layers * (size_t) n_exp, 0);
+    std::vector<uint16_t> row((size_t) n_exp);
+    for (int il = 0; il < n_layers; ++il) {
+        f.read(reinterpret_cast<char*>(row.data()), (std::streamsize) ((size_t) n_exp * 2));
+        if ((size_t) f.gcount() != (size_t) n_exp * 2) { err = std::string("STRATA_DS4_EXPERT_PERM ") + path + ": cut off"; return false; }
+        std::vector<char> seen((size_t) n_exp, 0);
+        for (int e = 0; e < n_exp; ++e) {
+            if (row[(size_t) e] >= n_exp || seen[row[(size_t) e]]) {
+                err = std::string("STRATA_DS4_EXPERT_PERM ") + path + ": layer " + std::to_string(il) + " is not a permutation of 0-" + std::to_string(n_exp - 1);
+                return false;
+            }
+            seen[row[(size_t) e]] = 1;
+            out[(size_t) il * (size_t) n_exp + (size_t) e] = row[(size_t) e];
+        }
+    }
+    return true;
+}
+
 struct Remote::Impl {
     core::NetExperts net;
-    int dim = 0, top_k = 0;
+    int dim = 0, top_k = 0, n_exp = 0;
+    std::vector<uint16_t> perm;                // [layer][original expert] -> rank; empty = identity
     uint64_t n_remote = 0, n_local = 0, n_fail = 0, n_calls = 0;
     std::vector<float> xc, rows;
     std::vector<int32_t> ids, kind;
@@ -452,7 +488,11 @@ std::string Remote::stats() const {
     return "remote expert rows " + std::to_string(p_->n_remote) + ", computed locally " + std::to_string(p_->n_local) + ", failed calls " + std::to_string(p_->n_fail);
 }
 bool Remote::open(const ExpertMap& m, const std::string& spec, std::string& err, uint32_t arch_override) {
-    p_->dim = m.dim; p_->top_k = m.top_k;
+    p_->dim = m.dim; p_->top_k = m.top_k; p_->n_exp = m.n_exp;
+    p_->perm.clear();
+    if (const char* pf = std::getenv("STRATA_DS4_EXPERT_PERM")) {
+        if (*pf && !load_expert_perm(pf, m.n_layers, m.n_exp, p_->perm, err)) return false;
+    }
     core::NetIdentity id = m.identity();
     if (arch_override != 0xffffffffu) id.arch = arch_override;
     return p_->net.open(spec, m.n_layers, m.n_exp, id, err);
@@ -486,7 +526,7 @@ bool Remote::run(int layer, const float* x, size_t ldx, const Item* items, int n
         for (int i = 0; i < items[q].n; ++i) {
             const int ct = map_tok[items[q].tok[i]];
             const int at = ct * k + fill[ct]++;
-            I.ids[(size_t) at] = items[q].e;
+            I.ids[(size_t) at] = I.perm.empty() ? items[q].e : (int32_t) I.perm[(size_t) layer * (size_t) I.n_exp + (size_t) items[q].e];
             I.kind[(size_t) at] = -1;
             pos[(size_t) q * kMaxTok + (size_t) i] = at;
         }

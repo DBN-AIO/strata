@@ -183,6 +183,147 @@ These are CPU-only upper bounds on the remote work. The conductor's VRAM-residen
 the GPU and never leave the conductor, so the real remote share per token is smaller; the DSpark drafter's verify windows share expert reads between
 tokens. Neither is measured here. The wire is not the limit (0.75-0.9 ms a layer, 1.2 estimated for the rig); the per-layer compute of the slow hosts is.
 
+## Popularity-aware placement (BBXL S3)
+
+Captain 1's order (2026-11-03): log expert hit counts on a real prompt mix, put the hottest experts in VRAM / RAM, the cold ones on the remotes or the SSD, and let
+`plan_split.py` take the popularity file. Today's plan is layer-major (host after host, every expert of a layer on one host); this one is expert-major.
+
+**The hit log already exists.** `strata-dsv41` counts every routed pick of every layer (decode windows and chunked prompts) in the expert profile
+(`prof`, uint32 [layers + drafter rows][experts], `--expert-profile FILE`), and `--profile-run IDS` runs a prompt set through it and saves the counts. No engine change was
+needed for logging. A FILE that does not exist starts at zero, so the file then holds only that run's prompts (the default `<pack>/expert-profile.bin` is the shipped
+calibration profile and would be added to: always pass an explicit new path). It is the same file the conductor's own VRAM / RAM tiering reads (`--expert-profile`), so the
+planner and the conductor agree on which experts are hot. The shipped `data/dsv41/profile-2.00.bin` is a real (calibration-mix) count set: 43 rows x 384 experts, the top
+quarter of the experts take 54 % of the hits.
+
+```sh
+# 1. count (real weights: wait for Captain 1's go).  IDS = the token ids of the prompt mix, the format `--profile-run` reads
+strata-dsv41 --pack PACK --expert-profile /var/tmp/mix-counts.bin --profile-run mix.ids
+# 2. plan (hosts as in fleet.json or the built-in fleet; --allow-ssd lets the coldest experts stay on the conductor's SSD)
+python3 tools/dsv41/plan_split.py --gguf-dir GGUF_DIR --popularity /var/tmp/mix-counts.bin --perm-out perm.bin [--groups N] [--allow-ssd]
+# 3. one slice per server, laid out by rank: ranks e0-e1 of the layers the plan names
+python3 slice_stream.py emit PACK 0-39 e0-e1 --perm perm.bin | ssh HOST 'python3 slice_stream.py apply SLICE'
+# 4. server per route item: strata-dsv41-expert-server --pack SLICE --serve-layers 0-39 --serve-experts e0-e1 ...
+# 5. conductor: STRATA_DS4_EXPERT_PERM=perm.bin strata-dsv41 ... --expert-profile /var/tmp/mix-counts.bin --remote-experts <the plan's line>
+```
+
+**How the plan is made.** Every (layer, expert) has an expected number of picks per token (its layer's counts scaled to top-k = 6). The pairs are ranked by it, then dealt out
+in speed order until each tier's memory (and disk) budget is full: conductor VRAM (`vram_gb`), conductor RAM, remote GPU hosts, remote CPU hosts by call time (compute + wire),
+and last, with `--allow-ssd` only, the conductor's SSD. Without `--allow-ssd` a set that does not fit the hosts' memory and disk is refused (exit 3), as today. A flat file (every
+layer's counts equal) gives today's plan unchanged. A file that is not the engine's counts (wrong size for layers x experts, cut off, all zero, the Qwen engine's ranked `STRP`
+profile, a negative count) is refused with exit 2 ("a ranking is not a frequency": a rank cannot say how much hotter expert 1 is than expert 50).
+
+**What the wire needs, and what was added.** An expert server serves ONE contiguous expert range for all its layers, and a route is `HOST=lo-hi/e0-e1`. A hot set is not a
+contiguous range of expert ids. So each layer's experts are renumbered hottest first (the rank), the plan hands out RANGES OF RANKS, and the renumbering is a file
+(`--perm-out`, `DS4PERM1`: u32 layers, u32 experts, uint16 rank[layer][original expert]):
+
+| Piece | Change |
+| --- | --- |
+| conductor | `STRATA_DS4_EXPERT_PERM=FILE`: `net::Remote` sends the RANK of every remote expert (`ds4_net.cpp`; unset = ids as they are, nothing else changes; a file that is not a permutation of every layer, is cut off or is for another geometry makes `--remote-experts` fail at start). The conductor's own experts (ranks below the first route, and any rank no route owns) keep their original ids and run locally. |
+| slice | `slice_stream.py emit PACK 0-39 e0-e1 --perm FILE`: `e0-e1` are ranks, and the slice holds the bytes of the ORIGINAL expert at the slot of its rank. Same `tensors.txt`, same fingerprint. |
+| server | unchanged: it finds rank r at its usual stride. |
+| planner | `plan_split.py --popularity FILE [--perm-out FILE] [--groups N] [--allow-ssd]` (also `--experts N`, `--top-k K`; the pack's `ds4.txt` gives both). |
+
+Rows are bit-identical to the unrenumbered split (synthetic test step 4c: tokens and the hash of every expert row equal to the local run; ranks 0-15 on the conductor, 16-31 on a
+slice server). `--groups N` gives each of N layer groups its own ranges (the conductor can then follow layer-to-layer differences), at the price of one server process
+per (host, group), because a server's range is the same for all its layers; the default 1 needs one server per host.
+
+**Estimate (CPU kernels, measured per-call costs, weighted by hit share).** A layer costs the slower of the conductor's own work and its slowest remote host (the calls are in
+flight while the conductor computes its share). Per-call: the table of "Measured" above, the GPU 0.416 ms a call from the 3090 (S2), 2.9 ms an expert read from NVMe at 3 GB/s.
+The baseline is today's layer-major plan on the same hit counts (its conductor VRAM also filled hottest-first). Two things are measured, not modelled: the wire is not the limit,
+and the hosts' compute. One thing is assumed: a remote GPU server places whole served layers (first fit in layer order, `ds4_gpu_place.hpp`), not the hottest ranks of each layer.
+
+| Popularity (2.00 bpw, 132.1 GB, today's fleet) | conductor's share of the hits | experts a token, popularity plan | today's plan, same hits |
+| --- | ---: | ---: | ---: |
+| flat | 65 % | 115.2 ms (= today's plan) | 115.2 ms |
+| synthetic Zipf s=0.5 (top quarter 48 %) | 80 % | 38.9 ms | 103.4 ms |
+| the shipped profile (top quarter 54 %, real counts) | 88 % | 41.7 ms | 99.4 ms |
+| synthetic Zipf s=0.8 (top quarter 67 %) | 89 % | 32.2 ms | 95.3 ms |
+| synthetic Zipf s=1.1 (top quarter 84 %) | 95 % | 24.8 ms | 88.6 ms |
+
+Read it with care: most of the gain over layer-major is that the conductor keeps 66 % of the experts and the other hosts answer in parallel; the doc's 84 ms for a uniform
+expert split (above, not measured) is the fair "no popularity" comparison for the parallel part, and 41.7 ms is about half of it. These are estimates; the real prompt mix decides.
+
+**Toy, measured (T340, CPU only, loopback).** Real-shape synthetic pack (4 layers x 48 experts, 5120 x 2304, the 2.00 mix of types), a router with a hidden Zipf-like preference
+(`ds4_net_test --skew 0.3`: the top quarter of the experts take 51-64 % of the hits), counted with `ds4_net_test --count-out` (the engine's profile format), planned with
+`plan_split.py --popularity`, a slice laid out by rank, 128 greedy tokens, one warm-up run not counted, then five runs:
+
+| | expert rows over the wire | decode ms a token (5 runs) | tokens / row hash vs the local run |
+| --- | ---: | ---: | --- |
+| layer-major (conductor layers 0-1, server layers 2-3) | 1716 (50 %) | 26.8-27.7 (median 27.7) | identical |
+| popularity (ranks 24-47 of every layer on the server) | 720 (21 %) | 26.1-29.0 (median 26.8) | identical |
+
+The wire work drops by 58 % and the output is bit-identical; the wall time does not move because on ONE 4-core box the "remote" server competes with the conductor for the same
+cores, so there is no parallelism to win. The time gain needs separate hosts: the estimate for this toy's two-host fleet is 8.4 ms against 10.2 ms. (The unique-prefix 2k / 16k
+prompts of the order need the real engine: not run.) Commands: `~/max2work/s3_toy.sh`, `s3_toy2.sh` on the T340 (not committed: they hold local paths).
+
+**Not done / needs a go.** (1) The real prompt-mix count (needs the real weights loaded). (2) The engine's own conductor-side VRAM / RAM choice is already popularity-driven by
+its `--expert-profile`; pass the same counts there. (3) The CUDA `strata-dsv41` binary was not built here (no CUDA on the T340): the conductor change is in `ds4_net.cpp`, which
+the CPU build compiles and `ds4_net_test` exercises, and the engine reaches it unchanged through `net::Remote::run`. (4) A GPU expert server that places the hottest RANKS in VRAM
+(not whole layers) would make the remote GPU tier worth more than this estimate says.
+
+## Storage tiers: experts on NVMe, never SATA (BBXL S6)
+
+Captain 1's order (2026-11-03): every expert slice and conductor spill goes on NVMe, never SATA; `plan_split.py` takes a per-host storage tier (VRAM > RAM > NVMe > SATA)
+and refuses SATA for experts when NVMe room exists; prefill reads from NVMe too. Survey of 2026-11-03 (gaming PC and stream PC from the order, the rig and the T340 read
+only by this session with `lsblk` / `df` / `findmnt`; nothing was changed or deleted):
+
+| Host | NVMe / RAM for experts | SATA (never for experts) | Note |
+| --- | --- | --- | --- |
+| gaming PC | 3 NVMe mounts: `Games` 30 GB free (after Flash-Next), `/mnt/ai` 38, `/mnt/ai_models` 36 = **104 GB** | `/mnt/bulk` (860 EVO, 550 MB/s; where the 2.00 set sits today) | RAM floor 12 GB free: 35 GB VRAM + 52 GB page cache of 64 leaves 12 |
+| rig | WD Green SN3000 1 TB `/mnt/models`: **41 GB free** (96 % used) | `/` and `/home` are LVM on a PNY 500 GB **SATA** SSD: **`/var/tmp` is on that SATA disk, so today's slice there is on SATA**; 17 GB free | RAM floor 10 GB free (15 free with the fleet loaded). A stale NFS mount to the gaming PC (`/mnt/gaming_bulk_models`) makes a bare `df -h` hang: ask for the paths |
+| T340 | none: RAM (tmpfs `/dev/shm`) only. 29 GB available, floor 16 GB free, so **13 GB** | `/` WD spinning disk behind the PERC, 11 GB free (98 %) | no NVMe, loads no AI models |
+| stream PC | `C:` 500 GB NVMe, 16 GB free, floor 15 GB free: **1 GB usable** (a new SSD is coming) | `D:` SATA and failing: **excluded, never used** | RAM 64 GB, about 16 used by the stream |
+
+**The schema.** A host in the `--hosts` JSON gets `"storage": [{"name", "kind": "tmpfs" | "nvme" | "sata" | "hdd" | "excluded", "free_gb", "reserve_gb", "path"}, ...]`;
+`tools/dsv41/fleet.json` is the survey above in this form (hop order, the same memory, VRAM and per-call numbers as the built-in fleet, which is unchanged: a host without
+`"storage"` keeps its single `disk_gb`, taken as NVMe, so every earlier plan prints exactly as before). A host's room for experts is
+`min(its memory budget, its tmpfs + NVMe room)`; SATA adds nothing. Optional `"extra_gb"` is the conductor's spill (dense 6.2 GB + Engram 111 GB), reported beside the experts.
+
+**The rule** (tests: `tools/dsv41/test_plan_split.py`, class `Storage`; each failed before the change):
+
+- Experts go to tmpfs, then NVMe (the largest mount first), whole layers at a time: a layer's experts never straddle two disks, so the plan names the mount of every slice.
+- SATA (and hdd) holds experts only with `--allow-sata`, and only when the tmpfs / NVMe of ALL hosts together cannot hold the set; then only the tail that did not fit (layer-major:
+  the SATA disk of the host that holds the layers before it; popularity: after every NVMe tier, remote hosts only) and every such slice is printed `LAST RESORT: SATA`. If NVMe room
+  exists but whole layers or expert ranges do not fit it, the run is refused and says so (use `--popularity` or more `--groups`), not rescued with SATA.
+- An `excluded` mount (the stream PC's `D:`) is never used, with or without the flag.
+- A refused run says how much SATA is on the hosts and that it was not used. A bad storage entry (unknown kind, negative size, no name) is refused with exit 2.
+- Output (`--json`: `storage.targets`, `storage.sata_used_gb`): `slice rig -> /mnt/models (nvme) /mnt/models/strata/dsv41  layers 0-39/E254-290  12.7 GB`. That path is the
+  `slice_stream.py apply` target. A host with two mounts gets one `apply` and one server per mount (`--serve-layers` of that line).
+
+**Prefill and the conductor's spill.** The conductor needs its own experts on disk (the layers it computes, and the cold tail with `--allow-ssd`) and the dense and Engram files. They
+must be on NVMe as well: Engram rows are random reads, where SATA is 5x slower on throughput and far worse on latency. `--conductor-copy all` plans for the whole set on the conductor
+(what it needs until the prompt path runs through the servers, see Next). The planner does not move files; it prints the target paths for the existing tools.
+
+**How much of the 2.00 bpw set (132.07 GB experts, 40 layers; the planner takes 3.30 GB a layer, the real layers are 2.97-3.93) fits on NVMe, and what to free**
+(`plan_split.py --uniform-gb 3.30175 --hosts tools/dsv41/fleet.json --storage-report`; "experts" = what the host holds when disk is not the limit and its memory budget is, in the
+hop order of the layer-major plan; a host with no NVMe keeps its tmpfs as the limit):
+
+| Host | experts it holds | NVMe / tmpfs room | fits | free to hold its share | + conductor spill (dense 6.2 + Engram 111) |
+| --- | ---: | ---: | --- | ---: | ---: |
+| gaming PC | 85.8 GB | 104.0 | yes, 18 GB spare | 0 | 99.0 GB more, or 145.3 GB more with `--conductor-copy all` (the whole 132.07 GB set on the conductor) |
+| rig | 9.9 | 41.0 | yes | 0 | - |
+| T340 | 9.9 | 13.0 (tmpfs) | yes | 0 | - |
+| stream PC | 26.4 | 1.0 | **no** | **25.4 GB on `C:`** (or the new SSD) | - |
+| fleet | 132.1 | 159.0 | 106.7 GB of the set fits on NVMe / tmpfs as the disks are; **132.1 once 25.4 GB are freed on the stream PC** | 25.4 | 99.0 (gaming PC) |
+
+Read off the table: today's plan with the survey's disks **refuses** (8 layers, 26.4 GB, have no host: `plan_split.py --uniform-gb 3.30175 --hosts tools/dsv41/fleet.json`, exit 3), and the
+conductor's spill (dense + Engram = 117.2 GB) is the larger problem: it does not fit the gaming PC's 104 GB of NVMe beside 85.8 GB of experts. With the popularity plan (`--popularity`) the stream
+PC's fast CPU draws 45.4 GB instead of 26.4 (free 44.4 GB there) and the rig and T340 draw nothing; give the stream PC a `reserve`/cap if it should not be the big host. The conductor's NVMe
+needs `max(0, 85.8 + 117.2 - 104.0) = 99.0 GB` for experts plus spill. The rig needs nothing freed and should serve from `/mnt/models`, not `/var/tmp`.
+RAM floors (gaming 12, T340 16, rig 10 GB free): the planner's memory numbers are page cache, which the kernel gives back; the rig's 13 GB leaves only 2 of the 15 free GB if those pages were
+pinned, so do not `mlock` them.
+
+**Cleanup candidates (text only, proposals for the cleanup list; nothing was posted or deleted).** I could read only the rig and the T340:
+
+| Host / path | Size | Why a candidate | Verdict |
+| --- | ---: | --- | --- |
+| stream PC `C:` | need 25.4 GB | the slice's room | not surveyed (I did not touch that PC); a `C:` survey or the new SSD |
+| gaming PC `/mnt/ai`, `/mnt/ai_models`, `Games` | need 99.0 GB for the spill (or 145.3 with the whole set) | the conductor's NVMe | not surveyed; or leave the Engram off the NVMe and say so |
+| rig `/mnt/models/comfyui` | 499 GB (unet 188, diffusion_models 107, clip 62, text_encoders 58, checkpoints 44) | the rig does not need room for this set; only if the rig is to hold more than 13 GB | needs the owner's call |
+| rig `/mnt/models/tabbyapi` | 161 GB (`gpt-oss-120b-4.0bpw-exl3` 36, two `Qwen3.8-27B` 4.0 / 5.0 bpw builds with DFlash variants 19 + 16 + 16, `qwen14b_5bpw` 10) | duplicates of one model at several bit widths | needs the owner's call |
+| rig `/mnt/models/{bb_models 61, hf_train 23, muse-glimmer 19, qwen38-uncensored 24}` | 127 GB | BigBrain's Devstral-2-123B (the engine's own models: keep), a training merge, a 30B GGUF | needs the owner's call |
+| rig `/mnt/models/swapfile-ai` | 30 GB | active swap (21.9 GB in use): not a candidate | keep |
+
 ## GPU expert server (`--expert-server-gpu`, BBXL)
 
 `strata-dsv41 --expert-server-gpu` (or the engine-less `strata-dsv41-expert-server-gpu`) keeps the served layers' routed experts in VRAM and
@@ -258,7 +399,73 @@ CUDA_VISIBLE_DEVICES=<card uuid> build/ds4_gpu_rows_test --pack SYNTHETIC_PACK [
 The rig has six cards, pinned by UUID (`add_a_3060.md`): the 3090 (24 GB) holds seven 3.3 GB layers, each 3060 (12 GB) about three. The three 3060s and the 5070 hold
 TabbyAPI models today, so a real run needs them unloaded, as the Placement table says. **Stream PC (RTX 5070 Ti, sm_120):** the same two targets with
 `-DCMAKE_CUDA_ARCHITECTURES=120-real` and CUDA 13.x (the build section above, TODO-1276); `strata-dsv41-expert-server-gpu.exe` takes the same flags, and
-`--gpu-vram-gb 5` fits what the Placement table says is free beside TabbyAPI. Not built or run there (no toolkit; the stream PC is not touched from this work).
+`--gpu-vram-gb 5` fits what the Placement table says is free beside TabbyAPI. Not built or run there (no toolkit; the stream PC is not touched from this work). Plan, Jack-only steps and scripts: "Blackwell (sm_120) builds" below.
+
+## Blackwell (sm_120) builds: the stream PC's 5070 Ti and the rig's 5070 (BBXL)
+
+Both cards are Blackwell (sm_120, compute capability 12.0). sm_120 needs **nvcc 12.8 or newer**; CMake and the two build scripts now refuse an older
+nvcc with the install step instead of failing inside nvcc (`cmake/strata_cuda_arch_check.cmake`, `tools/dsv41/cuda_arch_check.py`; the same table, both
+tested by `tests/dsv41/test_cuda_arch_check.py` without nvcc: `python3 -m unittest tests/dsv41/test_cuda_arch_check.py`). 13.0 is the release toolkit (12.8 builds, but
+engines built with it crashed on long prompts, #220 / #224); **13.2.0 and 13.2.1 miscompiled the engine for sm_120** (13.2.2 is fixed): take 13.0.x, 13.1.x or 13.2.2+.
+The architecture is the standard `-DCMAKE_CUDA_ARCHITECTURES` (a dsv41 build with none gets `86-real;89-real;120`); the scripts default to `86-real;120-real`
+(3090 / 3060 and 5070 in one binary). Kernel code is not arch-gated beyond `__CUDA_ARCH__ >= 700` (ds4_gguf.cu, ds4_kernels.cu, ds4_pcie.cuh), so no
+source change is needed for sm_120; `ds4_iq.cu` has no arch guard.
+
+| | Rig (Ubuntu, 6 GPUs) | Stream PC (Windows, one NVIDIA card) |
+| --- | --- | --- |
+| Card | RTX 5070 12 GB, TabbyAPI :5000 holds 8.7 GB of it now | RTX 5070 Ti 16 GB, TabbyAPI `LOCAL` :5000 (9B; the doc's Placement table: 11 of 16 GB held) |
+| Driver today | 610.57.04, CUDA UMD **13.3**: new enough for any 12.8-13.3 toolkit, **no driver change** | not read from here (the PC is not touched); 13.x needs a driver that reports CUDA 13.0+ |
+| Toolkit today | Ubuntu `nvidia-cuda-toolkit` 12.4.131 at `/usr/bin/nvcc` (the S2 build used it, `CMAKE_CUDA_HOST_COMPILER=g++-13`, `86-real`); `/usr/local/cuda` is a dangling link | none (TODO-1276) |
+| Disk | `/home` 6.6 GB free (99%): never; `/mnt/models` (NVMe) 38 GB free: fits a toolkit (about 6-7 GB) and a build dir (about 3 GB) | C: 27 GB free before the install (floor 15 GB); D: is failing, never used |
+| Script | `tools/dsv41/build_gpu_server_linux.sh` | `tools\dsv41\build_gpu_server_windows.ps1` |
+
+**Jack-only steps** (nothing here installs anything):
+
+1. **Stream PC (TODO-1276).** Install the NVIDIA CUDA Toolkit **13.0 or newer** (13.0.x / 13.1.x / 13.2.2+; not 13.2.0 / 13.2.1) from NVIDIA's installer, Custom
+   install: CUDA Toolkit components (Compiler, Runtime, cuBLAS, Development), Visual Studio integration **off**, driver component **off** (keep the PC's driver),
+   installed on C:. The installer sets `CUDA_PATH`, which the scripts read. With CUDA 13.0-13.2 also install the **Visual Studio 2022 Build Tools** (C++ workload)
+   beside the 2026 ones; CUDA 13.3+ accepts the 2026 Build Tools the PC already has (the script picks the right `vcvars64.bat`; `STRATA_VCVARS` overrides).
+2. **Rig, only to serve layers from the 5070** (the 3090 and the 3060s already work with the 12.4 toolkit, `ARCH=86-real`): a toolkit that fits beside the system one, user-local,
+   so the driver and `/usr/bin/nvcc` stay as they are: download `cuda_13.0.2_*_linux.run` (about 4 GB) to `/mnt/models/cuda-dl/` and run
+   `sh cuda_13.0.2_*_linux.run --silent --toolkit --toolkitpath=/mnt/models/cuda-13.0 --no-opengl-libs --no-man-page` as the normal user (no `sudo`, no `--driver`;
+   `--toolkitpath` under a user-writable directory needs no root and writes nothing to `/usr/local`). Then delete the `.run` from `/mnt/models/cuda-dl/` through the
+   cleanup list. Nothing changes for TabbyAPI: it does not use the toolkit (it ships its own CUDA runtime in `venv164`).
+   To-do text for the board (not posted): *title* "Rig: install a user-local CUDA 13.0 toolkit for the 5070 GPU expert server (BBXL)"; *why* "Without nvcc 12.8+ the rig's 5070 (sm_120) cannot run
+   the dsv41 GPU expert server; the 3090 and 3060s are unaffected"; *steps* "1. On the rig, as dadbodnerd: `mkdir -p /mnt/models/cuda-dl && cd /mnt/models/cuda-dl`; download the CUDA 13.0.2 Linux x86_64 runfile (developer.nvidia.com/cuda-13-0-2-download-archive,
+   Linux, x86_64, Ubuntu, runfile local). 2. `sh cuda_13.0.2_*_linux.run --silent --toolkit --toolkitpath=/mnt/models/cuda-13.0 --no-opengl-libs --no-man-page` (about 6 GB; no driver, no sudo). 3. `/mnt/models/cuda-13.0/bin/nvcc --version` says release 13.0. 4. Tell Claude;
+   the runfile goes on the cleanup list." priority soon, kind action.
+
+**Rig commands** (after step 2; the 12.4 build of the S2 section above is unchanged):
+
+```sh
+CUDA=/mnt/models/cuda-13.0 B=/mnt/models/strata-build/gpu-server ARCH="86-real;120-real" JOBS=3 tools/dsv41/build_gpu_server_linux.sh
+# prints: driver CUDA 13.3 >= toolkit 13.0, host compiler g++-15, the SASS list (sm_86 sm_120), the card UUIDs, the smoke commands, then the binary
+CUDA_VISIBLE_DEVICES=GPU-d43aa31e-2a27-67f7-43b7-2acbb4c1c63f build/ds4_gpu_rows_test --pack SYNTHETIC_PACK --bench 200      # the 5070; needs it free of TabbyAPI's 8.7 GB
+```
+
+The script refuses, naming the step, when: `CUDA` or `B` is unset, no `nvcc` at `CUDA`, the toolkit cannot build `ARCH` (12.4 with 120), the driver's CUDA is older than the
+toolkit's, no host compiler fits (12.x needs g++-13; 13.x takes g++-15 / 14), `B` has under 6 GB free (`MIN_FREE_GB`), no cmake / ninja, or the binary lacks the SASS asked for.
+The UUIDs of this rig (read 2026-11-04, nvidia-smi 610.57.04): 5070 `GPU-d43aa31e-2a27-67f7-43b7-2acbb4c1c63f`, 3090 `GPU-d526893c-b378-4be2-4e99-71848237f300`; the
+5070 is index 0 today and the doc rule stands: never address by index. A binary built `86-real;120-real` runs on all of them.
+
+**Stream PC commands** (after step 1; the PC is the streaming machine: the build runs through the capped CPU lane, below normal priority):
+
+```bat
+powershell -File tools\dsv41\build_gpu_server_windows.ps1 -Check          :: reads only: prints each missing step, builds nothing
+MSYS_NO_PATHCONV=1 C:\Python314\python.exe "D:/AIStuff/AIO/AIO/AI Projects/AIOrchestrator/tools/cpu_lane/win_job.py" --cwd C:\AIO-strata -- powershell -File tools\dsv41\build_gpu_server_windows.ps1
+```
+
+It checks, in this order, and exits 2 with every missing step listed: C: free >= 15 GB; the checkout; `CUDA_PATH` and `bin\nvcc.exe`; the toolkit can build sm_120 (12.8+); the right
+Visual Studio Build Tools for that toolkit; `nvidia-smi` and a 5070 Ti among the cards (pinned by its UUID) with at least 1 GB of VRAM free after the headroom. Then it builds
+`strata-dsv41-expert-server-gpu.exe` and `ds4_gpu_rows_test.exe` into `C:\AIO-strata\build-cuda-gpu` and prints the smoke commands. **`--gpu-vram-gb` is sized live**:
+free VRAM now (16 GB minus what TabbyAPI's 9B and the desktop hold; `config.json` `LOCAL` is `vram_gb 16`) minus 1 GB headroom for the stream (NVENC, capture), rounded down to a half GB and
+capped at 5 (`-MaxVramGb`): with TabbyAPI holding 11 GB that is 4. A server that cannot hold its layers in that budget refuses to start and prints the shortfall; `--gpu-cpu-rest` serves the rest
+by the CPU lane. Start it the usual way, never from an agent shell:
+`powershell -File tools\stream_pc\start_dsv41_server.ps1 -Exe C:\AIO-strata\build-cuda-gpu\strata-dsv41-expert-server-gpu.exe -Layers 34-39 -ExtraArgs "--expert-server-gpu --gpu-vram-gb 4 --gpu-cpu-rest"`.
+Stream mode still stops this server by its PID. No GPU power or clock setting is touched anywhere in these scripts.
+
+Not done: nothing was built with CUDA 12.8+ or run on a Blackwell card (no such toolkit on any host yet); the tests cover the version gate, the script refusals (stub `nvcc`), and the
+PowerShell script's syntax only.
 
 ## Faults, security
 
