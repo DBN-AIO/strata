@@ -1,0 +1,47 @@
+{
+  "_comment": "BBXL combined real-weights run: site paths for tools/dsv41/bbxl_realweights_run.py. Hosts come from fleet.json (S6); this file says how to reach and run on them. Replace every <...>. The plan lines are what plan_split.py printed (docs/DEEPSEEK41_SPLIT.md 'Placement' / 'Popularity-aware placement'); 'before' = no popularity, 'after' = --popularity with the real prompt-mix count. Run it ON the conductor (the gaming PC).",
+  "engine": {
+    "host": "gaming",
+    "bin": "<path>\\strata-dsv41.exe",
+    "pack": "<conductor pack: layers it keeps, or the whole pack>",
+    "token_file": "<conductor path of the expert token file>",
+    "extra_flags": ["--max-context", "20000"]
+  },
+  "hosts": {
+    "gaming": {"os": "windows", "gpu": {"uuid": "<GPU-uuid of the conductor's card>", "min_free_mib": 30000}},
+    "t340": {"ssh": "dadbodnerd@192.168.1.133", "os": "linux", "remote_log_dir": "/var/tmp"},
+    "rig": {"ssh": "dadbodnerd@192.168.1.130", "os": "linux", "remote_log_dir": "/var/tmp",
+            "gpu": {"uuid": "GPU-d526893c-b378-4be2-4e99-71848237f300", "min_free_mib": 3000}}
+  },
+  "plans": {
+    "before": {
+      "remote_experts": "<the plan_split.py line without --popularity, e.g. 192.168.1.130:7840=0-39/0-127,192.168.1.133:7840=0-39/128-255>",
+      "servers": [
+        {"host": "rig", "bin": "/home/dadbodnerd/strata/build/strata-dsv41-expert-server", "gpu_bin": "/home/dadbodnerd/strata/build/strata-dsv41-expert-server-gpu",
+         "pack": "/mnt/models/strata/dsv41/slice-before", "listen": "0.0.0.0:7840", "serve_layers": "0-39", "serve_experts": "0-127",
+         "cpu_threads": 5, "gpu_uuid": "GPU-d526893c-b378-4be2-4e99-71848237f300", "gpu_vram_gb": 20, "token_file": "<remote path of the expert token file>"},
+        {"host": "t340", "bin": "/srv/strata/build/strata-dsv41-expert-server",
+         "pack": "/dev/shm/strata/slice-before", "listen": "0.0.0.0:7840", "serve_layers": "0-39", "serve_experts": "128-255", "cpu_threads": 6,
+         "token_file": "<remote path of the expert token file>"}
+      ]
+    },
+    "after": {
+      "remote_experts": "<the line with --popularity>",
+      "perm": "<conductor path of perm.bin>",
+      "profile": "<conductor path of mix-counts.bin>",
+      "servers": [
+        {"host": "rig", "bin": "/home/dadbodnerd/strata/build/strata-dsv41-expert-server", "gpu_bin": "/home/dadbodnerd/strata/build/strata-dsv41-expert-server-gpu",
+         "pack": "/mnt/models/strata/dsv41/slice-after", "listen": "0.0.0.0:7840", "serve_layers": "0-39", "serve_experts": "0-127",
+         "cpu_threads": 5, "gpu_uuid": "GPU-d526893c-b378-4be2-4e99-71848237f300", "gpu_vram_gb": 20, "token_file": "<remote path of the expert token file>"},
+        {"host": "t340", "bin": "/srv/strata/build/strata-dsv41-expert-server",
+         "pack": "/dev/shm/strata/slice-after", "listen": "0.0.0.0:7840", "serve_layers": "0-39", "serve_experts": "128-255", "cpu_threads": 6,
+         "token_file": "<remote path of the expert token file>"}
+      ]
+    }
+  },
+  "prompts": {"2k": "<ids file, 2048+ token ids of the prompt mix>", "16k": "<ids file, 16384+ token ids>"},
+  "vocab": 129280,
+  "runs": 3,
+  "decode_tokens": 128,
+  "ready_timeout_s": 900
+}

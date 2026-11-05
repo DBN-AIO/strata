@@ -94,6 +94,8 @@ public:
     bool open(const ExpertMap& m, const std::string& spec, std::string& err, uint32_t arch_override = 0xffffffffu);
     bool active() const;
     bool serves(int layer) const;
+    /// BBXL S7: a server owns expert `e` (the router's original id; the S3 renumbering is applied here) of `layer`.
+    bool owns(int layer, int e) const;
     /// Runs the items on the servers.  remote[q] = 1: item q's rows are in y[(slot0 + i) * dim] (i < n).  Items left at 0
     /// (not owned by a route, the route down, an error) are the caller's to compute.  Always true unless the request itself
     /// cannot be built (then nothing is sent and every item stays local).

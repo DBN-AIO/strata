@@ -8,6 +8,7 @@
 // and the program prints the generated tokens and a hash of every expert row it received (bit identity, not just argmax).
 // Equal lines from the two modes, with a server on localhost or on another PC, is the test.
 #include "ds4_net.hpp"
+#include "ds4_net_chunk.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -58,6 +59,14 @@ int main(int argc, char** argv) {
     // instead of 16-token windows; --prompt may then be long (any size, slabs of --slab tokens each through every layer); --local-win N: the window
     // the local arm computes in; --no-hash skips the row hash (timing runs); --time also prints PREFILL ms / tok/s.
     bool prompt_path = false, no_hash = false;
+    // BBXL S7: --chunk-flow is the engine's chunked flow for a served layer (ds4_net_chunk.hpp, the code the engine runs): only the picks a
+    // server OWNS are sent (Remote::owns), every one must come back (no fallback here: the conductor may not have the bytes), the rows are
+    // summed with the moe_combine kernel's arithmetic, and CHUNKSUM prints a hash of those partial sums.  --chunk-own LO-HI: in --mode local,
+    // the experts LO-HI of every layer stand for the servers' share (the reference the remote run must equal bit for bit).
+    bool chunk_flow = false;
+    int own_lo = 0, own_hi = -1, own_l0 = 0, own_l1 = 1 << 30;   // --chunk-own LO-HI[:L0-L1]: experts LO-HI of layers L0-L1 (default all)
+    uint64_t chunk_hash = 14695981039346656037ull;
+    size_t chunk_sent = 0;
     int slab = 256, local_win = kMaxPromptTok;
     int salt = 0;   // --prompt-salt N: another prompt (a unique prefix for every timing run)
     int local_delay_ms = 0;
@@ -81,6 +90,14 @@ int main(int argc, char** argv) {
         else if (a == "--slab") slab = std::max(1, std::atoi(v().c_str()));
         else if (a == "--local-win") local_win = std::max(1, std::min(kMaxPromptTok, std::atoi(v().c_str())));
         else if (a == "--no-hash") no_hash = true;
+        else if (a == "--chunk-flow") chunk_flow = true;
+        else if (a == "--chunk-own") {
+            const std::string r = v();
+            own_lo = std::atoi(r.c_str());
+            const size_t d = r.find('-'), c = r.find(':');
+            own_hi = d == std::string::npos ? own_lo : std::atoi(r.c_str() + d + 1);
+            if (c != std::string::npos) { own_l0 = std::atoi(r.c_str() + c + 1); const size_t d2 = r.find('-', c); own_l1 = d2 == std::string::npos ? own_l0 : std::atoi(r.c_str() + d2 + 1); }
+        }
         else if (a == "--prompt-salt") salt = std::atoi(v().c_str());
         else if (a == "--local-delay-ms") local_delay_ms = std::atoi(v().c_str());
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
@@ -89,7 +106,7 @@ int main(int argc, char** argv) {
     std::string err;
     if (pack.empty() || !map.load(pack, err)) { std::fprintf(stderr, "pack: %s\n", err.c_str()); return 2; }
     const int D = map.dim, L = map.n_layers, K = map.top_k, NE = map.n_exp;
-    if (n_prompt < 1 || (n_prompt > kMaxTok && mode != "local" && !prompt_path)) { std::fprintf(stderr, "--prompt 1..%d (longer: --prompt-path or --mode local)\n", kMaxTok); return 2; }
+    if (n_prompt < 1 || (n_prompt > kMaxTok && mode != "local" && !prompt_path && !chunk_flow)) { std::fprintf(stderr, "--prompt 1..%d (longer: --prompt-path, --chunk-flow or --mode local)\n", kMaxTok); return 2; }
 
     ExpertHost host;
     if (!host.open(map, 0, L - 1, threads, err)) { std::fprintf(stderr, "host: %s\n", err.c_str()); return 1; }
@@ -157,12 +174,40 @@ int main(int argc, char** argv) {
                 if (!counts.empty()) for (int j = 0; j < K; ++j) ++counts[(size_t) l * NE + (size_t) ord[(size_t) j]];
             }
             // the routed experts: the unit under test
-            if (mode == "local") {
+            if (mode == "local" && !(chunk_flow && is_prompt)) {
                 for (int t0 = 0; t0 < nt; t0 += local_win) {
                     const int w = std::min(local_win, nt - t0);
                     if (!host.compute((uint32_t) l, (uint32_t) w, (uint32_t) K, ids.data() + (size_t) t0 * K, mask.data() + (size_t) t0 * K, xn.data() + (size_t) t0 * D,
                                       rows.data() + (size_t) t0 * K * D, err)) { std::fprintf(stderr, "local: %s\n", err.c_str()); std::exit(1); }
                 }
+            } else if (chunk_flow && is_prompt) {
+                // BBXL S7: the engine's chunk hook for a served layer; routing in the engine's kPicks (8) stride
+                constexpr int kStride = 8;
+                std::vector<int> ridx((size_t) nt * kStride, -1);
+                std::vector<float> rw8((size_t) nt * kStride, 0.0f);
+                for (int t = 0; t < nt; ++t) for (int j = 0; j < K; ++j) { ridx[(size_t) t * kStride + j] = ids[(size_t) t * K + j]; rw8[(size_t) t * kStride + j] = wts[(size_t) t * K + j]; }
+                ChunkSlab slab;
+                chunk_slab_build(slab, ridx.data(), rw8.data(), kStride, K, 0, nt, [&](int e) { return mode == "remote" ? remote.owns(l, e) : (l >= own_l0 && l <= own_l1 && e >= own_lo && e <= own_hi); });
+                std::vector<uint8_t> have((size_t) nt * K, 0);
+                if (slab.sent > 0) {
+                    if (mode == "remote") {
+                        std::vector<uint8_t> got;
+                        if (!remote.prompt(l, xn.data(), (size_t) D, nt, slab.ids.data(), rows.data(), got, err)) { std::fprintf(stderr, "chunk flow layer %d: %s\n", l, err.c_str()); std::exit(1); }
+                        for (size_t i = 0; i < have.size(); ++i) if (slab.ids[i] >= 0) { if (!got[i]) { std::fprintf(stderr, "chunk flow layer %d: a served pick was not answered\n", l); std::exit(1); } have[i] = 1; }
+                    } else {
+                        std::vector<uint8_t> m1((size_t) nt * K, 0);
+                        for (size_t i = 0; i < m1.size(); ++i) if (slab.ids[i] >= 0) { m1[i] = 1; have[i] = 1; }
+                        for (int t0 = 0; t0 < nt; t0 += local_win) { const int w = std::min(local_win, nt - t0); if (!host.compute((uint32_t) l, (uint32_t) w, (uint32_t) K, ids.data() + (size_t) t0 * K, m1.data() + (size_t) t0 * K, xn.data() + (size_t) t0 * D, rows.data() + (size_t) t0 * K * D, err)) { std::fprintf(stderr, "local: %s\n", err.c_str()); std::exit(1); } }
+                    }
+                    std::vector<float> acc((size_t) nt * D, 0.0f);
+                    chunk_combine_ref(acc.data(), (size_t) D, rows.data(), slab, D);
+                    chunk_hash = fnv(chunk_hash, acc.data(), acc.size() * 4);
+                    chunk_sent += slab.sent;
+                }
+                std::vector<uint8_t> m2((size_t) nt * K, 0);   // the conductor's own experts: its own lane (the engine: its VRAM and streamed ones)
+                bool any = false;
+                for (size_t i = 0; i < m2.size(); ++i) if (!have[i]) { m2[i] = 1; any = true; }
+                for (int t0 = 0; any && t0 < nt; t0 += local_win) { const int w = std::min(local_win, nt - t0); if (!host.compute((uint32_t) l, (uint32_t) w, (uint32_t) K, ids.data() + (size_t) t0 * K, m2.data() + (size_t) t0 * K, xn.data() + (size_t) t0 * D, rows.data() + (size_t) t0 * K * D, err)) { std::fprintf(stderr, "chunk flow rest: %s\n", err.c_str()); std::exit(1); } }
             } else if (prompt_path && is_prompt) {
                 // BBXL S5: the whole slab of this layer through the servers; what no route owns, and what failed, is computed here
                 std::vector<uint8_t> got;
@@ -307,6 +352,7 @@ int main(int argc, char** argv) {
     for (int t : seq) std::printf(" %d", t);
     std::printf("\nROWHASH %016llx\nROWS %ld FINITE %d\n", (unsigned long long) row_hash, rows_total, (int) !(flag & 1));
     if (mode == "remote") std::printf("STATS %s\n", remote.stats().c_str());
+    if (chunk_flow) std::printf("CHUNKSUM %016llx SENT %zu\n", (unsigned long long) chunk_hash, chunk_sent);
     if (mode == "remote") std::printf("PROMPTWIN %d\n", remote.prompt_window());
     if (host.calls() > 0)
         std::fprintf(stderr, "HOST %llu calls, %.3f ms a call (this process's own lane)\n", (unsigned long long) host.calls(), host.compute_ms() / (double) host.calls());

@@ -488,6 +488,12 @@ Remote::Remote() : p_(new Impl) {}
 Remote::~Remote() = default;
 bool Remote::active() const { return p_->net.active(); }
 bool Remote::serves(int layer) const { return p_->net.serves(layer); }
+bool Remote::owns(int layer, int e) const {
+    const Impl& I = *p_;
+    if (e < 0 || e >= I.n_exp || !I.net.serves(layer)) return false;
+    const int32_t rid = I.perm.empty() ? e : (int32_t) I.perm[(size_t) layer * (size_t) I.n_exp + (size_t) e];
+    return I.net.owns(layer, rid);
+}
 uint64_t Remote::rows_remote() const { return p_->n_remote; }
 uint64_t Remote::rows_local() const { return p_->n_local; }
 std::string Remote::stats() const {
