@@ -24,6 +24,11 @@ namespace strata::ds4::net {
 constexpr int kMaxTok = 16;                   ///< tokens a window holds: kWin in ds4_kernels.cuh (static_assert in ds4_model.cu)
 constexpr int kMaxPicks = 8;                  ///< kPicks
 constexpr int kMaxEntries = kMaxTok * kMaxPicks;
+/// BBXL S5: tokens one PROMPT window sent to a server holds (the decode window stays kMaxTok).  The server's limits are these: n_tok up to
+/// kMaxPromptTok, n_tok x k up to kMaxPromptEntries.  32 tokens at hidden 5120 / top-6 are a 655 KB request and a 3.9 MB answer, inside the wire's
+/// frame limits (1 MiB / 4 MiB); `Remote` lowers its window for a larger hidden size.  An older server (limit 16) refuses a 32-token window: both ends of a prompt path need this build.
+constexpr int kMaxPromptTok = 32;
+constexpr int kMaxPromptEntries = kMaxPromptTok * kMaxPicks;
 constexpr int kEntTok = 8;                    ///< tokens one expert takes in one kernel call (gg::kMxCpuMaxN)
 
 /// ggml type ids of the expert tensors this path computes (the CPU lane's: MXFP4 and the ggml block types).
@@ -93,6 +98,22 @@ public:
     /// (not owned by a route, the route down, an error) are the caller's to compute.  Always true unless the request itself
     /// cannot be built (then nothing is sent and every item stays local).
     bool run(int layer, const float* x, size_t ldx, const Item* items, int n_items, float* y, std::vector<char>& remote);
+    /// BBXL S4: run() in two halves, so the conductor's own experts compute while the servers answer.  begin() writes every route's
+    /// request for the layer (all routes at once, before any answer is read) and returns: pending[q] = 1 means item q's rows are on
+    /// their way; items at 0 are the caller's (no route owns them) - compute them NOW, then call finish().  finish() reads every
+    /// answer and writes the rows of the pending items to y[(slot0 + i) * dim]; remote[q] = 1 means they are there, a pending item
+    /// left at 0 lost its host and is the caller's too.  Same rows, bit for bit, as run().  At most one layer in flight.
+    bool begin(int layer, const float* x, size_t ldx, const Item* items, int n_items, std::vector<char>& pending);
+    bool finish(float* y, std::vector<char>& remote);
+    bool in_flight() const;
+    /// BBXL S5, the prompt path: T tokens of one layer (any T; the caller slices a long prompt into slabs) through the servers that own the
+    /// layer's experts, in windows of up to `prompt_window()` tokens with several in flight on every host (`NetExperts::prompt`).
+    /// x: the T rows of the layer's FFN input, ldx apart; ids: T x top_k expert ids as the router picked them (the S3 renumbering is applied
+    /// here).  rows: T x top_k x dim fp32, the un-weighted expert rows; got[i] = 1 where row i is there.  Entries no route owns (the
+    /// conductor's own experts) and every entry after a failure (the route is dropped and retried later, as in decode) stay at 0: the caller
+    /// computes those from its own copy.  Returns false only when a request failed (got is then all 0); `err` says why.
+    bool prompt(int layer, const float* x, size_t ldx, int T, const int32_t* ids, float* rows, std::vector<uint8_t>& got, std::string& err);
+    int prompt_window() const;   ///< tokens a prompt window holds (STRATA_DS4_PROMPT_WIN lowers it, for measuring)
     uint64_t rows_remote() const;
     uint64_t rows_local() const;
     std::string stats() const;

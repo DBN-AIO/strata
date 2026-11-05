@@ -437,6 +437,7 @@ bool NetExperts::open(const std::string& spec, int64_t n_layers, int64_t n_exper
     }
     if (routes_.empty()) { err = "--remote-experts is empty"; return false; }
     inflight_.assign(routes_.size(), InFlight());
+    { const char* sv = std::getenv("STRATA_NET_SERIAL"); serial_ = sv != nullptr && *sv == '1'; }   // BBXL S4: the before-arm of the measurement; off by default
     return true;
 }
 
@@ -552,6 +553,12 @@ bool NetExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_
         r.bytes_out += f.buf.size() + sizeof(Hdr);
         f.t_send = now_ms();
         f.active = true;
+        f.pre_done = false;
+        if (serial_) {   // (measurement only) wait for this host before asking the next one
+            f.pre_why = recv_resp(r, f.seq, (uint32_t) f.owned.size(), f.pre, f.pre_us);
+            f.pre_rtt = now_ms() - f.t_send;
+            f.pre_done = true;
+        }
         ++sent;
     }
     if (sent == 0) return true;
@@ -575,7 +582,9 @@ bool NetExperts::finish(float* out, std::string& err) {
         f.active = false;
         Route& r = routes_[ri];
         double server_us = 0;
-        const std::string why = recv_resp(r, f.seq, (uint32_t) f.owned.size(), resp_, server_us);
+        std::string why;
+        if (f.pre_done) { why = f.pre_why; server_us = f.pre_us; resp_.swap(f.pre); f.pre_done = false; }
+        else why = recv_resp(r, f.seq, (uint32_t) f.owned.size(), resp_, server_us);
         if (!why.empty()) {   // this host's rows are the caller's; the other hosts' answers are still read (their streams stay in step)
             err = why;
             mark_down(r, why);
@@ -587,7 +596,8 @@ bool NetExperts::finish(float* out, std::string& err) {
         const float* src = (const float*) (resp_.data() + 24);
         for (size_t q = 0; q < f.owned.size(); ++q)
             std::memcpy(out + (size_t) f.owned[q] * H_, src + q * (size_t) H_, (size_t) H_ * 4);
-        const double rtt = now_ms() - f.t_send;
+        const double rtt = f.pre_rtt > 0 ? f.pre_rtt : now_ms() - f.t_send;
+        f.pre_rtt = 0;
         r.rtt_ms += rtt; r.server_ms += server_us / 1000.0; ++r.calls; r.bytes_in += resp_.size() + sizeof(Hdr);
         if (rtt > r.rtt_max_ms) r.rtt_max_ms = rtt;
         if (r.backoff_ms != 0) r.backoff_ms = 0;   // a healthy call ends the outage's backoff
@@ -598,7 +608,7 @@ bool NetExperts::finish(float* out, std::string& err) {
 }
 
 bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
-                        float* const* dst, std::string& err) {
+                        float* const* dst, std::string& err, int64_t max_tok) {
     if (cur_ >= 0) { err = "a decode request is in flight"; return false; }
     static const int depth = [] { const char* v = std::getenv("STRATA_NET_PIPELINE"); return v ? std::max(1, std::atoi(v)) : 4; }();
     struct Req { int64_t t0w, nt; uint64_t seq; uint32_t want; };
@@ -642,7 +652,7 @@ bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64
         const Route& r = routes_[ri];
         own[ri].assign((size_t) (T * k), 0);
         for (int64_t i = 0; i < T * k; ++i) own[ri][(size_t) i] = mask[i] && ids[i] >= r.elo && ids[i] <= r.ehi ? 1 : 0;
-        wins[ri] = np::prompt_windows(T, k, own[ri].data(), strata::kernels::kWindowMaxT);
+        wins[ri] = np::prompt_windows(T, k, own[ri].data(), max_tok > 0 ? max_tok : (int64_t) strata::kernels::kWindowMaxT);
         most = std::max(most, wins[ri].size());
     }
     for (size_t w = 0; w < most && !failed; ++w)

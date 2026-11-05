@@ -346,7 +346,7 @@ bool ExpertHost::compute(uint32_t layer, uint32_t n_tok, uint32_t k, const int32
     std::lock_guard<std::mutex> lk(I.mu);
     const ExpertMap& m = *I.m;
     if ((int) layer < I.lo || (int) layer > I.hi) { err = "layer " + std::to_string(layer) + " is not served here"; return false; }
-    if (n_tok < 1 || (int) n_tok > kMaxTok || (int) k != m.top_k) { err = "window outside the limits"; return false; }
+    if (n_tok < 1 || (int) n_tok > kMaxPromptTok || (int) k != m.top_k) { err = "window outside the limits"; return false; }
     const double t0 = now_ms();
     const ExpertLayer& L = m.layers[(size_t) layer];
     const int E = m.dim, FF = m.ff;
@@ -372,7 +372,7 @@ bool ExpertHost::compute(uint32_t layer, uint32_t n_tok, uint32_t k, const int32
     I.xa.resize(xs * (size_t) n_tok);
     I.ha.resize(hs * (size_t) n_ent);
     I.hf.assign((size_t) n_ent * (size_t) FF, 0.0f);
-    bool need[kMaxTok] = {};
+    bool need[kMaxPromptTok] = {};
     for (const Job& j : jobs) for (int q = 0; q < j.n; ++q) need[j.tok[q]] = true;
     for (uint32_t t = 0; t < n_tok; ++t)
         if (need[t]) {
@@ -476,6 +476,13 @@ struct Remote::Impl {
     uint64_t n_remote = 0, n_local = 0, n_fail = 0;
     std::vector<float> xc, rows;
     std::vector<int32_t> ids, kind;
+    // BBXL S4: the layer between begin() and finish()
+    bool pending = false;
+    int layer_ = 0, n_items_ = 0;
+    int pwin = kMaxPromptTok;                  // BBXL S5: tokens a prompt window holds
+    std::vector<Remote::Item> items_;
+    std::vector<int> pos;
+    std::vector<char> sent;                    // item q's rows are on their way
 };
 Remote::Remote() : p_(new Impl) {}
 Remote::~Remote() = default;
@@ -492,13 +499,24 @@ bool Remote::open(const ExpertMap& m, const std::string& spec, std::string& err,
     if (const char* pf = std::getenv("STRATA_DS4_EXPERT_PERM")) {
         if (*pf && !load_expert_perm(pf, m.n_layers, m.n_exp, p_->perm, err)) return false;
     }
+    // BBXL S5: the prompt window, inside the frame limits of the wire (request 1 MiB, answer 4 MiB) for this hidden size
+    {
+        int w = kMaxPromptTok;
+        if (const char* v = std::getenv("STRATA_DS4_PROMPT_WIN")) w = std::max(1, std::min(w, std::atoi(v)));
+        const long long req_row = (long long) m.dim * 4 + (long long) m.top_k * 5, rsp_row = (long long) m.top_k * m.dim * 4;
+        if (req_row > 0) w = (int) std::min<long long>(w, ((1ll << 20) - 4096) / req_row);
+        if (rsp_row > 0) w = (int) std::min<long long>(w, ((4ll << 20) - 64) / rsp_row);
+        p_->pwin = std::max(1, w);
+    }
     core::NetIdentity id = m.identity();
     if (arch_override != 0xffffffffu) id.arch = arch_override;
     return p_->net.open(spec, m.n_layers, m.n_exp, id, err);
 }
-bool Remote::run(int layer, const float* x, size_t ldx, const Item* items, int n_items, float* y, std::vector<char>& remote) {
+bool Remote::begin(int layer, const float* x, size_t ldx, const Item* items, int n_items, std::vector<char>& pending) {
     Impl& I = *p_;
-    remote.assign((size_t) n_items, 0);
+    I.pending = false;
+    I.n_items_ = n_items;
+    pending.assign((size_t) n_items, 0);
     if (!I.net.serves(layer)) return true;
     const int k = I.top_k, dim = I.dim;
     // the window's distinct tokens, compacted; each token's pairs in the order they come
@@ -520,34 +538,100 @@ bool Remote::run(int layer, const float* x, size_t ldx, const Item* items, int n
     I.ids.assign((size_t) nt * (size_t) k, 0);
     I.kind.assign((size_t) nt * (size_t) k, -2);
     int fill[kMaxTok] = {};
-    std::vector<int> pos((size_t) n_items * kMaxTok, -1);
+    I.pos.assign((size_t) n_items * kMaxTok, -1);
     for (int q = 0; q < n_items; ++q)
         for (int i = 0; i < items[q].n; ++i) {
             const int ct = map_tok[items[q].tok[i]];
             const int at = ct * k + fill[ct]++;
             I.ids[(size_t) at] = I.perm.empty() ? items[q].e : (int32_t) I.perm[(size_t) layer * (size_t) I.n_exp + (size_t) items[q].e];
             I.kind[(size_t) at] = -1;
-            pos[(size_t) q * kMaxTok + (size_t) i] = at;
+            I.pos[(size_t) q * kMaxTok + (size_t) i] = at;
         }
     std::string err;
+    // BBXL S4: NetExperts::begin writes the request to EVERY route that owns an entry of this layer before it reads any answer, so the
+    // hosts compute their shares at the same time (the layer waits for the slowest, not the sum).  It returns with the requests sent.
     I.net.begin(layer, I.xc.data(), I.ids.data(), nt, k, I.kind.data(), 0, err);
     if (!I.net.in_flight()) { for (int q = 0; q < n_items; ++q) I.n_local += (uint64_t) items[q].n; return true; }
     I.rows.resize((size_t) nt * (size_t) k * (size_t) dim);
+    I.items_.assign(items, items + n_items);
+    I.n_items_ = n_items;
+    I.layer_ = layer;
+    I.sent.assign((size_t) n_items, 0);
+    for (int q = 0; q < n_items; ++q) {
+        bool all = items[q].n > 0;
+        for (int i = 0; i < items[q].n; ++i) all = all && I.kind[(size_t) I.pos[(size_t) q * kMaxTok + (size_t) i]] == 3;
+        I.sent[(size_t) q] = all ? 1 : 0;
+        pending[(size_t) q] = I.sent[(size_t) q];
+        if (!all) I.n_local += (uint64_t) items[q].n;   // not owned by a route: the caller's, to compute while the others wait
+    }
+    I.pending = true;
+    return true;
+}
+bool Remote::in_flight() const { return p_->pending; }
+int Remote::prompt_window() const { return p_->pwin; }
+bool Remote::prompt(int layer, const float* x, size_t ldx, int T, const int32_t* ids, float* rows, std::vector<uint8_t>& got, std::string& err) {
+    Impl& I = *p_;
+    const int k = I.top_k, dim = I.dim;
+    got.assign((size_t) std::max(T, 0) * (size_t) k, 0);
+    if (T <= 0 || !I.net.serves(layer)) return true;
+    std::vector<int32_t> rid((size_t) T * (size_t) k, 0);
+    std::vector<uint8_t> mask((size_t) T * (size_t) k, 0);
+    size_t n = 0;
+    for (size_t i = 0; i < mask.size(); ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= I.n_exp) continue;   // not an expert of this pack: the caller's
+        rid[i] = I.perm.empty() ? e : (int32_t) I.perm[(size_t) layer * (size_t) I.n_exp + (size_t) e];
+        if (I.net.owns(layer, rid[i])) { mask[i] = 1; ++n; }
+    }
+    if (n == 0) { I.n_local += mask.size(); return true; }
+    const float* xs = x;
+    std::vector<float> xc;
+    if (ldx != (size_t) dim) {   // the wire wants the rows packed
+        xc.resize((size_t) T * (size_t) dim);
+        for (int t = 0; t < T; ++t) std::memcpy(xc.data() + (size_t) t * (size_t) dim, x + (size_t) t * ldx, (size_t) dim * 4);
+        xs = xc.data();
+    }
+    std::vector<float*> dst(mask.size(), nullptr);
+    for (size_t i = 0; i < mask.size(); ++i) if (mask[i]) dst[i] = rows + i * (size_t) dim;
+    if (!I.net.prompt(layer, xs, rid.data(), T, k, mask.data(), dst.data(), err, I.pwin)) {
+        ++I.n_fail;
+        I.n_local += mask.size();
+        return false;
+    }
+    got = mask;
+    I.n_remote += n;
+    I.n_local += mask.size() - n;
+    return true;
+}
+bool Remote::finish(float* y, std::vector<char>& remote) {
+    Impl& I = *p_;
+    remote.assign((size_t) I.n_items_, 0);
+    if (!I.pending) return true;
+    I.pending = false;
+    const int dim = I.dim;
+    std::string err;
     const bool ok = I.net.finish(I.rows.data(), err);
     if (!ok) {
         ++I.n_fail;
         for (int32_t at : I.net.owned()) I.kind[(size_t) at] = -1;   // the hosts that failed: their rows are the caller's
     }
-    for (int q = 0; q < n_items; ++q) {
+    for (int q = 0; q < I.n_items_; ++q) {
+        if (!I.sent[(size_t) q]) continue;
+        const Item& it = I.items_[(size_t) q];
         bool all = true;
-        for (int i = 0; i < items[q].n; ++i) all = all && I.kind[(size_t) pos[(size_t) q * kMaxTok + (size_t) i]] == 3;
-        if (!all) { I.n_local += (uint64_t) items[q].n; continue; }
-        for (int i = 0; i < items[q].n; ++i)
-            std::memcpy(y + (size_t) (items[q].slot0 + i) * (size_t) dim, I.rows.data() + (size_t) pos[(size_t) q * kMaxTok + (size_t) i] * (size_t) dim, (size_t) dim * 4);
+        for (int i = 0; i < it.n; ++i) all = all && I.kind[(size_t) I.pos[(size_t) q * kMaxTok + (size_t) i]] == 3;
+        if (!all) { I.n_local += (uint64_t) it.n; continue; }
+        for (int i = 0; i < it.n; ++i)
+            std::memcpy(y + (size_t) (it.slot0 + i) * (size_t) dim, I.rows.data() + (size_t) I.pos[(size_t) q * kMaxTok + (size_t) i] * (size_t) dim, (size_t) dim * 4);
         remote[(size_t) q] = 1;
-        I.n_remote += (uint64_t) items[q].n;
+        I.n_remote += (uint64_t) it.n;
     }
     return true;
+}
+bool Remote::run(int layer, const float* x, size_t ldx, const Item* items, int n_items, float* y, std::vector<char>& remote) {
+    std::vector<char> pend;
+    begin(layer, x, ldx, items, n_items, pend);
+    return finish(y, remote);   // (nothing in flight: every item stays at 0, the caller's)
 }
 
 // ================================================================== the server
@@ -643,20 +727,31 @@ int server_main(int argc, char** argv) {
     cfg.host = host; cfg.port = port; cfg.layer_lo = lo; cfg.layer_hi = hi;
     cfg.n_layers = map.n_layers; cfg.n_expert = map.n_exp; cfg.top_k = map.top_k;
     cfg.identity = map.identity();
-    cfg.max_tok = kMaxTok; cfg.max_entries = kMaxEntries; cfg.once = once; cfg.expert_lo = elo; cfg.expert_hi = ehi;
+    cfg.max_tok = kMaxPromptTok; cfg.max_entries = kMaxPromptEntries; cfg.once = once; cfg.expert_lo = elo; cfg.expert_hi = ehi;
 #if defined(STRATA_DS4_NET_GPU)
     if (gpuh) { cfg.gpu = true; cfg.gpu_user = gpuh.get(); cfg.gpu_rows = [](void* u) -> uint64_t { return ((GpuExpertHost*) u)->rows(); }; }
 #endif
     long die_after = 0;   // test hook: the server exits after N requests, as if the host had gone (STRATA_DS4_SERVER_DIE_AFTER)
     if (const char* v = std::getenv("STRATA_DS4_SERVER_DIE_AFTER")) die_after = std::atol(v);
     std::atomic<long> served{0};
+    long delay_ms = 0;   // test hook (BBXL S4): every request takes this long more, so the timing tests are deterministic (STRATA_DS4_SERVER_DELAY_MS)
+    if (const char* v = std::getenv("STRATA_DS4_SERVER_DELAY_MS")) delay_ms = std::atol(v);
     std::fprintf(stderr, "strata net: dsv41 expert server, %d layers x %d experts (top-%d), hidden %d, ffn %d, threads %d, fingerprint %s\n",
                  map.n_layers, map.n_exp, map.top_k, map.dim, map.ff, std::max(1, threads > 0 ? threads : (int) std::thread::hardware_concurrency()),
                  np::hex(cfg.identity.fingerprint, 8).c_str());
     return core::serve_experts(cfg, [&](uint32_t layer, uint32_t n_tok, uint32_t k, int, const int32_t* ids, const uint8_t* mask, const float* x, float* out, std::string& e2) {
         if (die_after > 0 && ++served > die_after) { std::fprintf(stderr, "strata net: STRATA_DS4_SERVER_DIE_AFTER reached, exiting\n"); std::fflush(stderr); std::_Exit(3); }
+        if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
 #if defined(STRATA_DS4_NET_GPU)
-        if (gpuh && gpuh->holds((int) layer)) return gpuh->compute(layer, n_tok, k, ids, mask, x, out, e2);
+        if (gpuh && gpuh->holds((int) layer)) {
+            // BBXL S5 x S3: a prompt window holds up to kMaxPromptTok (32) tokens, the GPU lane's buffers and the engine's window kernels kMaxTok (16):
+            // a longer window goes to the card in sub-windows of kMaxTok tokens (rows are token-major, so each piece is a pointer offset).
+            for (uint32_t t0 = 0; t0 < n_tok; t0 += (uint32_t) kMaxTok) {
+                const uint32_t w = std::min<uint32_t>((uint32_t) kMaxTok, n_tok - t0);
+                if (!gpuh->compute(layer, w, k, ids + (size_t) t0 * k, mask + (size_t) t0 * k, x + (size_t) t0 * (size_t) map.dim, out + (size_t) t0 * k * (size_t) map.dim, e2)) return false;
+            }
+            return true;
+        }
 #endif
         return host_.compute(layer, n_tok, k, ids, mask, x, out, e2);
     });

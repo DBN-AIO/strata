@@ -8402,13 +8402,26 @@ struct Model::Impl {
                 items[q].slot0 = ents[q].slot0;
                 for (int i = 0; i < ents[q].n; ++i) items[q].tok[i] = ents[q].tok[i];
             }
-            std::vector<char> done;
-            remote->run(l.il, x, ldx, items.data(), (int) items.size(), c_yd.data(), done);
-            std::vector<Ent> rest;
-            for (size_t q = 0; q < ents.size(); ++q)
-                if (!done[q]) rest.push_back(ents[q]);
-            if (rest.empty()) return;
-            if (rest.size() < ents.size()) return cpu_experts_local(l, x, rest, ldx, nullptr);
+            // BBXL S4: every route's request goes out first (all hosts of the layer at once); the entries no route owns - the conductor's
+            // own experts - compute while the servers answer, then the answers come in.  Rows are independent, so the bits are the same
+            // as the old run() (ask, wait, compute the rest).  An entry whose host failed is computed after, as before.
+            std::vector<char> pend, done;
+            remote->begin(l.il, x, ldx, items.data(), (int) items.size(), pend);
+            std::vector<Ent> mine;
+            size_t n_pend = 0;
+            for (size_t q = 0; q < ents.size(); ++q) {
+                if (pend[q]) ++n_pend;
+                else mine.push_back(ents[q]);
+            }
+            if (n_pend > 0) {
+                if (!mine.empty()) cpu_experts_local(l, x, mine, ldx, nullptr);
+                remote->finish(c_yd.data(), done);
+                std::vector<Ent> rest;
+                for (size_t q = 0; q < ents.size(); ++q)
+                    if (pend[q] && !done[q]) rest.push_back(ents[q]);
+                if (!rest.empty()) cpu_experts_local(l, x, rest, ldx, nullptr);
+                return;
+            }
         }
 #endif
         cpu_experts_local(l, x, ents, ldx, ord);
@@ -12515,6 +12528,20 @@ struct Model::Impl {
         return pick_min_;
     }
     int pick_min_ = 0;
+    // BBXL S5 (opt-in: STRATA_DS4_NET_PREFILL=1, only with --remote-experts): the prompt goes through the WINDOW path (kWin tokens a window, every
+    // layer's CPU lane in cpu_experts -> net::Remote::begin / finish) and never through the chunked flow.  The chunked flow streams every expert a
+    // chunk picks from THIS host's own files, so the conductor needs the whole model on its disk; the window path asks the servers for the served
+    // layers' experts and reads none of them here (the conductor's own experts, if any, still read theirs).  Same rows as the decode path.  Off by
+    // default because a 16-token window pays one round trip a layer: measure it against the flow (docs/DEEPSEEK41_SPLIT.md "The prompt through the
+    // servers (BBXL S5)") before turning it on for long prompts.
+    bool net_windows() const {
+#if defined(STRATA_DS4_NET)
+        static const bool on = [] { const char* e = std::getenv("STRATA_DS4_NET_PREFILL"); return e != nullptr && *e == '1'; }();
+        return on && remote && remote->active();
+#else
+        return false;
+#endif
+    }
     bool pick_path(int n) {
         static const bool adaptive = [] {
             const char* e = std::getenv("DS4_PICK");
@@ -14925,7 +14952,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err, in
     if (ds4_dbg("DS4_DBG_CHUNK")) std::fprintf(stderr, "feed n %d chunk %d chunk_min %d\n", n, p.chunk, p.chunk_min);
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
         const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all)
-        const bool ok = logits_rows > kWin || p.pick_path(n) ? p.forward_chunks(tokens, n, logits_rows, err, -1, after)
+        const bool ok = logits_rows > kWin || (p.pick_path(n) && !p.net_windows()) ? p.forward_chunks(tokens, n, logits_rows, err, -1, after)
                                                              : p.feed_windows(tokens, n, logits_rows, err);
         if (ok) p.path_done(now_ms() - t0);
         return ok;
@@ -14938,7 +14965,7 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     p.halted = false;
     p.fed_n = n;
     const double t0 = now_ms();
-    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n)) {   // (the last token rides along; its layers
+    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n) && !p.net_windows()) {   // (the last token rides along; its layers
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
         if (ok) p.path_done(now_ms() - t0);
         return ok;
@@ -14963,7 +14990,7 @@ bool Model::feed_marks(const int* tokens, int n, int logits_rows, int slot,
     p.halted = false;
     p.fed_n = n;
     const double t0 = now_ms();
-    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && inner.size() + 1 <= (size_t) kSnapN && p.pick_path(n)) {
+    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && inner.size() + 1 <= (size_t) kSnapN && p.pick_path(n) && !p.net_windows()) {
         const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot, 0, &inner);
         if (ok) p.path_done(now_ms() - t0);
         return ok;
