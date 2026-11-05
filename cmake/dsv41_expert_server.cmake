@@ -38,5 +38,8 @@ if(STRATA_BUILD_DSV41_EXPERT_SERVER AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_EN
 
   add_executable(ds4_net_test tests/dsv41/ds4_net_test.cpp)
   target_link_libraries(ds4_net_test PRIVATE strata_dsv41_expert_host)
+  add_executable(ds4_gpu_place_test tests/dsv41/gpu_place_test.cpp)
+  target_link_libraries(ds4_gpu_place_test PRIVATE strata_dsv41_expert_host)
+  add_test(NAME ds4_gpu_place_test COMMAND ds4_gpu_place_test)
   message(STATUS "Strata: CPU-only DeepSeek expert server enabled (strata-dsv41-expert-server; no CUDA)")
 endif()

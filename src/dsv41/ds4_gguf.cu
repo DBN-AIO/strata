@@ -1543,9 +1543,12 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     check("moe_down");
 }
 
-bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
+namespace {
+// win_experts without or with the combine: combine = false stops after the down matrices, so a.part holds each entry's
+// un-weighted down row (entry t * 8 + i at part + (t * 8 + i) * n_embd) - what an expert server sends back (win_rows)
+bool win_impl(const x3::WinArgs& a, cudaStream_t s, bool combine) {
     if (a.T < 1 || a.T > kMaxEnt || !mx_geometry("win_experts", a.k, a.n_embd, a.n_ff) || a.h == nullptr ||
-        a.part == nullptr || a.out == nullptr) {
+        a.part == nullptr || (combine && a.out == nullptr)) {
         std::fprintf(stderr, "ds4 gguf win_experts: not covered (T %d)\n", a.T);
         return false;
     }
@@ -1602,6 +1605,10 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     } else {
         iq::down(ia, groups, a.T, s);
     }
+    if (!combine) {
+        check("win_rows");
+        return true;
+    }
 #if !defined(STRATA_METAL)
     // (this port's dispatches are synchronous and nothing is published to wait for: ds4_kernels.cu's wait_seq)
     if (a.wait_ptr != nullptr) strata_ds4_launch(mx_wait_kernel, 1, 32, 0, s, a.wait_ptr, a.wait_val);
@@ -1627,6 +1634,10 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     check("win_experts");
     return true;
 }
+}  // namespace
+
+bool win_experts(const x3::WinArgs& a, cudaStream_t s) { return win_impl(a, s, true); }
+bool win_rows(const x3::WinArgs& a, cudaStream_t s) { return win_impl(a, s, false); }
 
 namespace {
 iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (the inputs / outputs and types to fill in)

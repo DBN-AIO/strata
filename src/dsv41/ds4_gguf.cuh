@@ -77,6 +77,9 @@ void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
 void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
 bool win_experts(const x3::WinArgs& a, cudaStream_t s);
+/// win_experts up to the down matrices, no combine (a.out, plan_w, sh_out, cpu_* unused): a.part [T * 8][n_embd] gets each entry's
+/// un-weighted down row; entry t * 8 + i is token t's i-th slot of the plan the grouping tables were built from (the expert server's rows).
+bool win_rows(const x3::WinArgs& a, cudaStream_t s);
 void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
                  cudaStream_t s);
 void set_down(const x3::SetArgs& a, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s);
