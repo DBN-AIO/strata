@@ -330,7 +330,7 @@ int main(int argc, char** argv) {
     seq.push_back(tok);
     // (a recurrent carry stands in for attention's memory, so the toy does not fall into a one-token cycle)
     std::vector<float> carry(h_last);
-    const auto t_dec = std::chrono::steady_clock::now();
+    const auto decode_t0 = std::chrono::steady_clock::now();
     for (int s = 1; s < n_new; ++s) {
         std::vector<float> h1(&emb[(size_t) tok * D], &emb[(size_t) tok * D] + D);
         for (int d = 0; d < D; ++d) h1[(size_t) d] += 0.8f * carry[(size_t) d];
@@ -339,14 +339,15 @@ int main(int argc, char** argv) {
         tok = next_token(h1.data());
         seq.push_back(tok);
     }
-    const double dec_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dec).count();
+    const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - decode_t0).count();
     if (!count_out.empty()) {
         std::FILE* cf = std::fopen(count_out.c_str(), "wb");
         if (cf == nullptr || std::fwrite(counts.data(), 4, counts.size(), cf) != counts.size()) { std::fprintf(stderr, "--count-out: cannot write %s\n", count_out.c_str()); return 1; }
         std::fclose(cf);
     }
     if (show_time) std::printf("PREFILL %.1f ms over %d tokens, %.1f tok/s\n", pre_ms, n_prompt, pre_ms > 0 ? n_prompt * 1000.0 / pre_ms : 0.0);
-    if (show_time) std::printf("DECODE %.3f ms a token over %d tokens\n", n_new > 1 ? dec_ms / (double) (n_new - 1) : 0.0, n_new - 1);
+    if (show_time) std::printf("DECODE %.3f ms a token over %d tokens\n", n_new > 1 ? decode_ms / (double) (n_new - 1) : 0.0, n_new - 1);
+    if (n_new > 1) std::fprintf(stderr, "DECODE %d single-token steps in %.1f ms: %.3f ms a token, %.1f tok/s (the toy's own dense part included)\n", n_new - 1, decode_ms, decode_ms / (n_new - 1), 1000.0 * (n_new - 1) / decode_ms);
     std::printf("TOKENS");
     for (int t : seq) std::printf(" %d", t);
     std::printf("\nROWHASH %016llx\nROWS %ld FINITE %d\n", (unsigned long long) row_hash, rows_total, (int) !(flag & 1));

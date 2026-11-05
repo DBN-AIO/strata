@@ -2501,7 +2501,7 @@ int main(int argc, char** argv) {
     }
 #endif
     for (int i = 1; i < argc; ++i)
-        if (std::string(argv[i]) == "--expert-server") {   // before the options and before any device: this process computes experts for another PC
+        if (std::string(argv[i]) == "--expert-server" || std::string(argv[i]) == "--expert-server-gpu") {   // before the options and before any device: this process computes experts for another PC
 #if defined(STRATA_DS4_NET)
             return strata::ds4::net::server_main(argc, argv);
 #else
