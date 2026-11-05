@@ -18,6 +18,7 @@
 #include "ds4_model.hpp"
 #include "ds4_pick_rule.hpp"
 #include "ds4_experts_rule.hpp"
+#include "ds4_dspark_rule.hpp"
 #include "ds4_engram_io.hpp"
 
 #include "ds4_gguf.cuh"
@@ -2878,7 +2879,14 @@ struct Model::Impl {
             for (const auto& kt : pk.t)
                 if (kt.first.rfind("layers.", 0) == 0 && kt.first.find(".ffn.experts.") != std::string::npos) exp_b += (double) kt.second.bytes;
             for (const Dev& d : devs) room_b += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20));
-            if (exp_b > 1.5 * room_b) {
+#if defined(STRATA_DS4_NET)
+            const bool remote_on = remote != nullptr;
+#else
+            const bool remote_on = false;
+#endif
+            if (remote_on)
+                std::fprintf(stderr, "ds4: DSpark drafter kept with --remote-experts: a verify window is one batched call per served layer\n");
+            if (!dspark_auto_keeps(exp_b, room_b, remote_on)) {
                 o.dspark = false;
                 std::fprintf(stderr, "ds4: DSpark not loaded: the routed experts (%.0f GB) are far more than the GPU holds (%.0f GB), where its verify "
                                      "rounds read 3.3x a token's bytes and gain nothing (--dspark on loads it anyway)\n", exp_b / 1e9, room_b / 1e9);

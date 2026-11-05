@@ -118,6 +118,7 @@ public:
     int prompt_window() const;   ///< tokens a prompt window holds (STRATA_DS4_PROMPT_WIN lowers it, for measuring)
     uint64_t rows_remote() const;
     uint64_t rows_local() const;
+    uint64_t calls() const;   ///< requests sent to the servers: one per run() that reached a route (a window of any n tokens is one)
     std::string stats() const;
 private:
     struct Impl;

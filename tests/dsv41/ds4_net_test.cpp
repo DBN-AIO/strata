@@ -70,6 +70,12 @@ int main(int argc, char** argv) {
     int slab = 256, local_win = kMaxPromptTok;
     int salt = 0;   // --prompt-salt N: another prompt (a unique prefix for every timing run)
     int local_delay_ms = 0;
+    // BBXL DSpark: --causal makes the toy's memory the previous TOKEN (a window equals single steps, as with attention); --spec K verifies K drafts as ONE
+    // window per layer; --draft-acc P is an oracle drafter of accuracy P; --prompt-seed S picks the prompt.  Off by default.
+    bool causal = false;
+    int spec_k = 0;
+    double draft_acc = -1.0;
+    unsigned prompt_seed = 1;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto v = [&]() -> std::string { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); } return argv[++i]; };
@@ -100,13 +106,17 @@ int main(int argc, char** argv) {
         }
         else if (a == "--prompt-salt") salt = std::atoi(v().c_str());
         else if (a == "--local-delay-ms") local_delay_ms = std::atoi(v().c_str());
+        else if (a == "--causal") causal = true;
+        else if (a == "--spec") { spec_k = std::atoi(v().c_str()); causal = true; }
+        else if (a == "--draft-acc") draft_acc = std::atof(v().c_str());
+        else if (a == "--prompt-seed") prompt_seed = (unsigned) std::atoi(v().c_str());
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     ExpertMap map;
     std::string err;
     if (pack.empty() || !map.load(pack, err)) { std::fprintf(stderr, "pack: %s\n", err.c_str()); return 2; }
     const int D = map.dim, L = map.n_layers, K = map.top_k, NE = map.n_exp;
-    if (n_prompt < 1 || (n_prompt > kMaxTok && mode != "local" && !prompt_path && !chunk_flow)) { std::fprintf(stderr, "--prompt 1..%d (longer: --prompt-path, --chunk-flow or --mode local)\n", kMaxTok); return 2; }
+    if (n_prompt < 1 || spec_k < 0 || spec_k >= kMaxTok || (n_prompt > kMaxTok && !causal && mode != "local" && !prompt_path && !chunk_flow)) { std::fprintf(stderr, "--prompt 1..%d (longer: --prompt-path, --chunk-flow or --mode local)\n", kMaxTok); return 2; }
 
     ExpertHost host;
     if (!host.open(map, 0, L - 1, threads, err)) { std::fprintf(stderr, "host: %s\n", err.c_str()); return 1; }
@@ -146,12 +156,16 @@ int main(int argc, char** argv) {
     if (!count_out.empty()) counts.assign((size_t) L * NE, 0u);
     uint64_t row_hash = 14695981039346656037ull, flag = 0;
     long rows_total = 0;
+    uint64_t windows = 0;
+    bool counting = true;                      // false for the oracle's look-ahead pass (not hashed, not counted)
+    bool use_remote = mode == "remote";
     std::vector<int> seq;
     std::vector<int> prompt;
     for (int i = 0; i < n_prompt; ++i) prompt.push_back((int) (((i * 7 + 3 + salt * 13) + (i / vocab) * (1 + salt % 5) * 11) % vocab));
 
     // one window of nt tokens (their hidden states h: nt x D) through every layer
     auto forward = [&](int nt, std::vector<float>& h, bool is_prompt) {
+        if (counting) ++windows;
         std::vector<float> xn((size_t) nt * D), moe((size_t) nt * D), rows((size_t) nt * K * D), sc((size_t) NE);
         std::vector<int32_t> ids((size_t) nt * K);
         std::vector<float> wts((size_t) nt * K);
@@ -174,7 +188,7 @@ int main(int argc, char** argv) {
                 if (!counts.empty()) for (int j = 0; j < K; ++j) ++counts[(size_t) l * NE + (size_t) ord[(size_t) j]];
             }
             // the routed experts: the unit under test
-            if (mode == "local" && !(chunk_flow && is_prompt)) {
+            if ((mode == "local" || !use_remote) && !(chunk_flow && is_prompt)) {
                 for (int t0 = 0; t0 < nt; t0 += local_win) {
                     const int w = std::min(local_win, nt - t0);
                     if (!host.compute((uint32_t) l, (uint32_t) w, (uint32_t) K, ids.data() + (size_t) t0 * K, mask.data() + (size_t) t0 * K, xn.data() + (size_t) t0 * D,
@@ -264,8 +278,10 @@ int main(int argc, char** argv) {
                         for (int i = 0; i < items[q].n; ++i)
                             std::memcpy(&rows[(size_t) slot_entry[(size_t) (items[q].slot0 + i)] * D], &y[(size_t) (items[q].slot0 + i) * D], (size_t) D * 4);
             }
-            rows_total += nt * K;
-            if (!no_hash) row_hash = fnv(row_hash, rows.data(), rows.size() * 4);
+            if (counting) {
+                rows_total += nt * K;
+                if (!no_hash) row_hash = fnv(row_hash, rows.data(), rows.size() * 4);
+            }
             for (int t = 0; t < nt; ++t) {
                 float* mo = &moe[(size_t) t * D];
                 for (int d = 0; d < D; ++d) mo[d] = 0.0f;
@@ -305,49 +321,128 @@ int main(int argc, char** argv) {
         }
         return best;
     };
-    // the prompt: one window (<= 16 tokens), or - long prompts - slabs of --slab tokens, each through every layer (the toy has no attention, so a
-    // slab does not depend on the one before it: the same rows whatever the slab size); then one token a step
-    auto prompt_row = [&](int t, float* dstrow) {
-        std::memcpy(dstrow, &emb[(size_t) prompt[(size_t) t] * D], (size_t) D * 4);
-        if (n_prompt > kMaxTok)   // a long prompt: a per-position part, so the rows (and the routing) differ from token to token
-            for (int d = 0; d < D; ++d) {
-                const uint32_t hv = (uint32_t) t * 2654435761u + (uint32_t) d * 40503u + (uint32_t) salt * 977u;
-                dstrow[d] += 0.5f * ((float) (((hv ^ (hv >> 15)) * 2246822519u) >> 8) / 8388608.0f - 1.0f);
-            }
-    };
-    std::vector<float> h_last((size_t) D);
-    const auto t_pre = std::chrono::steady_clock::now();
-    const int slab_n = n_prompt <= kMaxTok ? n_prompt : slab;
-    for (int t0 = 0; t0 < n_prompt; t0 += slab_n) {
-        const int w = std::min(slab_n, n_prompt - t0);
-        std::vector<float> h((size_t) w * D);
-        for (int t = 0; t < w; ++t) prompt_row(t0 + t, &h[(size_t) t * D]);
-        forward(w, h, true);
-        if (t0 + w >= n_prompt) std::memcpy(h_last.data(), &h[(size_t) (w - 1) * D], (size_t) D * 4);
-    }
-    const double pre_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pre).count();
-    int tok = next_token(h_last.data());
-    seq.push_back(tok);
-    // (a recurrent carry stands in for attention's memory, so the toy does not fall into a one-token cycle)
-    std::vector<float> carry(h_last);
-    const auto decode_t0 = std::chrono::steady_clock::now();
-    for (int s = 1; s < n_new; ++s) {
-        std::vector<float> h1(&emb[(size_t) tok * D], &emb[(size_t) tok * D] + D);
-        for (int d = 0; d < D; ++d) h1[(size_t) d] += 0.8f * carry[(size_t) d];
-        forward(1, h1, false);
-        carry = h1;
-        tok = next_token(h1.data());
+    if (!causal) {
+        // the prompt: one window (<= 16 tokens), or - long prompts - slabs of --slab tokens, each through every layer (the toy has no attention, so a
+        // slab does not depend on the one before it: the same rows whatever the slab size); then one token a step
+        auto prompt_row = [&](int t, float* dstrow) {
+            std::memcpy(dstrow, &emb[(size_t) prompt[(size_t) t] * D], (size_t) D * 4);
+            if (n_prompt > kMaxTok)   // a long prompt: a per-position part, so the rows (and the routing) differ from token to token
+                for (int d = 0; d < D; ++d) {
+                    const uint32_t hv = (uint32_t) t * 2654435761u + (uint32_t) d * 40503u + (uint32_t) salt * 977u;
+                    dstrow[d] += 0.5f * ((float) (((hv ^ (hv >> 15)) * 2246822519u) >> 8) / 8388608.0f - 1.0f);
+                }
+        };
+        std::vector<float> h_last((size_t) D);
+        const auto t_pre = std::chrono::steady_clock::now();
+        const int slab_n = n_prompt <= kMaxTok ? n_prompt : slab;
+        for (int t0 = 0; t0 < n_prompt; t0 += slab_n) {
+            const int w = std::min(slab_n, n_prompt - t0);
+            std::vector<float> h((size_t) w * D);
+            for (int t = 0; t < w; ++t) prompt_row(t0 + t, &h[(size_t) t * D]);
+            forward(w, h, true);
+            if (t0 + w >= n_prompt) std::memcpy(h_last.data(), &h[(size_t) (w - 1) * D], (size_t) D * 4);
+        }
+        const double pre_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pre).count();
+        int tok = next_token(h_last.data());
         seq.push_back(tok);
+        // (a recurrent carry stands in for attention's memory, so the toy does not fall into a one-token cycle)
+        std::vector<float> carry(h_last);
+        const auto decode_t0 = std::chrono::steady_clock::now();
+        for (int s = 1; s < n_new; ++s) {
+            std::vector<float> h1(&emb[(size_t) tok * D], &emb[(size_t) tok * D] + D);
+            for (int d = 0; d < D; ++d) h1[(size_t) d] += 0.8f * carry[(size_t) d];
+            forward(1, h1, false);
+            carry = h1;
+            tok = next_token(h1.data());
+            seq.push_back(tok);
+        }
+        const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - decode_t0).count();
+        if (show_time) std::printf("PREFILL %.1f ms over %d tokens, %.1f tok/s\n", pre_ms, n_prompt, pre_ms > 0 ? n_prompt * 1000.0 / pre_ms : 0.0);
+        if (show_time) std::printf("DECODE %.3f ms a token over %d tokens\n", n_new > 1 ? decode_ms / (double) (n_new - 1) : 0.0, n_new - 1);
+        if (n_new > 1) std::fprintf(stderr, "DECODE %d single-token steps in %.1f ms: %.3f ms a token, %.1f tok/s (the toy's own dense part included)\n", n_new - 1, decode_ms, decode_ms / (n_new - 1), 1000.0 * (n_new - 1) / decode_ms);
+    } else {
+        std::mt19937 prng(prompt_seed * 2654435761u + 17u);
+        std::vector<int> pr((size_t) n_prompt);
+        for (int& t : pr) t = (int) (prng() % (unsigned) vocab);
+        auto cinput = [&](int tk, int pv, float* o) {
+            for (int d = 0; d < D; ++d) o[d] = emb[(size_t) tk * D + d] + 0.8f * emb[(size_t) pv * D + d];
+        };
+        // a window of tokens w (the one before w[0] is pv0): the greedy next token after each
+        auto preds_of = [&](const std::vector<int>& w, int pv0, std::vector<int>& preds) {
+            std::vector<float> hw(w.size() * (size_t) D);
+            for (size_t j = 0; j < w.size(); ++j) cinput(w[j], j ? w[j - 1] : pv0, &hw[j * (size_t) D]);
+            forward((int) w.size(), hw, false);
+            preds.resize(w.size());
+            for (size_t j = 0; j < w.size(); ++j) preds[j] = next_token(&hw[j * (size_t) D]);
+        };
+        std::vector<int> pw, preds;
+        for (int c = 0; c < n_prompt; c += kMaxTok) {   // the prompt, a window of kMaxTok at a time
+            pw.assign(pr.begin() + c, pr.begin() + std::min(n_prompt, c + kMaxTok));
+            preds_of(pw, c ? pr[(size_t) c - 1] : vocab - 1, preds);
+        }
+        seq.push_back(preds.back());
+        const int prompt_last = pr.back();
+        // the oracle drafter's truth: the plain greedy continuation, computed apart from what is measured and counted
+        std::vector<int> truth;
+        std::mt19937 drng(12345u);
+        if (spec_k > 0 && draft_acc >= 0.0) {
+            counting = false;
+            use_remote = false;
+            truth.push_back(seq[0]);
+            for (int i2 = 0; i2 < n_new + spec_k + 2; ++i2) {
+                preds_of({truth.back()}, truth.size() >= 2 ? truth[truth.size() - 2] : prompt_last, preds);
+                truth.push_back(preds[0]);
+            }
+            counting = true;
+            use_remote = mode == "remote";
+        }
+        const uint64_t w0 = windows, c0 = mode == "remote" ? remote.calls() : 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        long rounds = 0, drafted = 0, accepted = 0;
+        while ((int) seq.size() < n_new) {
+            std::vector<int> d;
+            const int have = (int) seq.size();
+            if (spec_k > 0 && draft_acc >= 0.0) {
+                for (int j = 0; j < spec_k && have + j < (int) truth.size(); ++j) {
+                    const int t = truth[(size_t) have + j];
+                    const bool right = (double) (drng() % 1000000u) / 1e6 < draft_acc;
+                    d.push_back(right ? t : (t + 1 + (int) (drng() % (unsigned) (vocab - 1))) % vocab);
+                }
+            } else if (spec_k > 0) {   // prompt lookup: the token after the latest earlier occurrence of the last two
+                std::vector<int> hist(pr);
+                hist.insert(hist.end(), seq.begin(), seq.end());
+                const int n = (int) hist.size();
+                for (int j = n - 3; j >= 0; --j)
+                    if (hist[(size_t) j] == hist[(size_t) n - 2] && hist[(size_t) j + 1] == hist[(size_t) n - 1]) {
+                        for (int q = j + 2; q < n && (int) d.size() < spec_k; ++q) d.push_back(hist[(size_t) q]);
+                        break;
+                    }
+            }
+            std::vector<int> w;
+            w.push_back(seq.back());
+            w.insert(w.end(), d.begin(), d.end());
+            preds_of(w, seq.size() >= 2 ? seq[seq.size() - 2] : prompt_last, preds);
+            int a = 0;
+            while (a < (int) d.size() && preds[(size_t) a] == d[(size_t) a]) ++a;
+            for (int j = 0; j <= a && (int) seq.size() < n_new; ++j) seq.push_back(preds[(size_t) j]);
+            ++rounds;
+            drafted += (long) d.size();
+            accepted += a;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const uint64_t dw = windows - w0, dc = (mode == "remote" ? remote.calls() : 0) - c0;
+        std::printf("SPEC k %d rounds %ld drafted %ld accepted %ld windows %llu layer_calls %llu wire_calls %llu\n", spec_k, rounds, drafted, accepted,
+                    (unsigned long long) windows, (unsigned long long) windows * (unsigned) L,
+                    (unsigned long long) (mode == "remote" ? remote.calls() : 0));
+        std::printf("DECODE tokens %d ms %.1f tok_s %.2f windows %llu layer_calls %llu wire_calls %llu accepted_per_round %.3f\n", n_new - 1, ms,
+                    (n_new - 1) * 1000.0 / ms, (unsigned long long) dw, (unsigned long long) dw * (unsigned) L, (unsigned long long) dc,
+                    rounds ? (double) accepted / (double) rounds : 0.0);
     }
-    const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - decode_t0).count();
     if (!count_out.empty()) {
         std::FILE* cf = std::fopen(count_out.c_str(), "wb");
         if (cf == nullptr || std::fwrite(counts.data(), 4, counts.size(), cf) != counts.size()) { std::fprintf(stderr, "--count-out: cannot write %s\n", count_out.c_str()); return 1; }
         std::fclose(cf);
     }
-    if (show_time) std::printf("PREFILL %.1f ms over %d tokens, %.1f tok/s\n", pre_ms, n_prompt, pre_ms > 0 ? n_prompt * 1000.0 / pre_ms : 0.0);
-    if (show_time) std::printf("DECODE %.3f ms a token over %d tokens\n", n_new > 1 ? decode_ms / (double) (n_new - 1) : 0.0, n_new - 1);
-    if (n_new > 1) std::fprintf(stderr, "DECODE %d single-token steps in %.1f ms: %.3f ms a token, %.1f tok/s (the toy's own dense part included)\n", n_new - 1, decode_ms, decode_ms / (n_new - 1), 1000.0 * (n_new - 1) / decode_ms);
     std::printf("TOKENS");
     for (int t : seq) std::printf(" %d", t);
     std::printf("\nROWHASH %016llx\nROWS %ld FINITE %d\n", (unsigned long long) row_hash, rows_total, (int) !(flag & 1));

@@ -473,7 +473,7 @@ struct Remote::Impl {
     core::NetExperts net;
     int dim = 0, top_k = 0, n_exp = 0;
     std::vector<uint16_t> perm;                // [layer][original expert] -> rank; empty = identity
-    uint64_t n_remote = 0, n_local = 0, n_fail = 0;
+    uint64_t n_remote = 0, n_local = 0, n_fail = 0, n_calls = 0;
     std::vector<float> xc, rows;
     std::vector<int32_t> ids, kind;
     // BBXL S4: the layer between begin() and finish()
@@ -496,6 +496,7 @@ bool Remote::owns(int layer, int e) const {
 }
 uint64_t Remote::rows_remote() const { return p_->n_remote; }
 uint64_t Remote::rows_local() const { return p_->n_local; }
+uint64_t Remote::calls() const { return p_->n_calls; }
 std::string Remote::stats() const {
     return "remote expert rows " + std::to_string(p_->n_remote) + ", computed locally " + std::to_string(p_->n_local) + ", failed calls " + std::to_string(p_->n_fail);
 }
@@ -558,6 +559,7 @@ bool Remote::begin(int layer, const float* x, size_t ldx, const Item* items, int
     // hosts compute their shares at the same time (the layer waits for the slowest, not the sum).  It returns with the requests sent.
     I.net.begin(layer, I.xc.data(), I.ids.data(), nt, k, I.kind.data(), 0, err);
     if (!I.net.in_flight()) { for (int q = 0; q < n_items; ++q) I.n_local += (uint64_t) items[q].n; return true; }
+    ++I.n_calls;
     I.rows.resize((size_t) nt * (size_t) k * (size_t) dim);
     I.items_.assign(items, items + n_items);
     I.n_items_ = n_items;
