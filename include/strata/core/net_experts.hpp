@@ -50,6 +50,8 @@ struct NetIdentity {
 /// `model_files`: the GGUF / experts.bin files the experts are read from (their sizes enter the fingerprint).
 NetIdentity net_identity(const std::vector<std::string>& model_files);
 std::string net_isa_name(uint32_t isa);
+/// The CPU kernel path word of NetIdentity::isa (avx512 / avx512bw / avx2 bits and the STRATA_FORCE_ISA cap).  Not in the dsv41 build (STRATA_NET_NO_QWEN).
+uint32_t net_isa_bits();
 /// Socket read/write/connect timeout in ms for both ends (default 10000; env STRATA_EXPERT_TIMEOUT_MS; --expert-timeout-ms).
 void net_set_timeout_ms(int ms);
 
@@ -89,7 +91,12 @@ public:
     /// to dst[i].  Synchronous, on the prompt thread (never while a decode request is in flight).  False with `err` when the
     /// route is down or fails (it is then dropped and retried later, as in decode): the caller computes those rows itself.
     bool prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
-                float* const* dst, std::string& err);
+                float* const* dst, std::string& err, int64_t max_tok = 0);   ///< max_tok 0: kWindowMaxT; BBXL S5: dsv41 servers take more (ds4_net.hpp kMaxPromptTok)
+    /// BBXL S5: a host of `layer` owns `expert` (a prompt entry no host owns is the caller's to compute).
+    bool owns(int64_t layer, int32_t expert) const {
+        for (const Route& r : routes_) if (layer >= r.lo && layer <= r.hi && expert >= r.elo && expert <= r.ehi) return true;
+        return false;
+    }
 
 private:
     struct Route { std::string host; int port = 7840; int lo = 0, hi = 0; int elo = 0, ehi = 0; intptr_t fd = -1; int top_k = 0;   // top_k: the server's, from its HELLO_ACK; elo..ehi: the experts it owns
@@ -110,7 +117,10 @@ private:
                   int arith, uint64_t& seq, std::vector<uint8_t>& buf);
     std::string recv_resp(Route& r, uint64_t seq, uint32_t want, std::vector<uint8_t>& resp, double& server_us);
     /// B5: per route, the decode request in flight (several hosts may hold parts of one layer)
-    struct InFlight { bool active = false; uint64_t seq = 0; double t_send = 0; std::vector<uint8_t> mask, buf; std::vector<int32_t> owned; };
+    struct InFlight { bool active = false; uint64_t seq = 0; double t_send = 0; std::vector<uint8_t> mask, buf; std::vector<int32_t> owned;
+                      // BBXL S4 measurement hook (STRATA_NET_SERIAL=1): the answer is read right after the send, so the hosts of a layer are asked one after the other
+                      bool pre_done = false; std::string pre_why; double pre_us = 0, pre_rtt = 0; std::vector<uint8_t> pre; };
+    bool serial_ = false;
     std::vector<InFlight> inflight_;
     std::vector<uint8_t> resp_;
     uint64_t layer_calls_ = 0, multi_calls_ = 0;

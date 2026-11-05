@@ -128,6 +128,7 @@ jobs:
         run: |
           python3 tools/dsv41/test_plan_split.py
           python3 tools/dsv41/test_slice_perm.py
+          python3 tools/dsv41/test_bbxl_realweights_run.py build-cpu
 
   # DEFERRED: a Windows compile check of the same target (the server's socket shim has a Winsock branch, never compiled in CI).
   # There is no Windows runner for this repository yet; when one is registered, enable this job.

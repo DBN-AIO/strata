@@ -7,15 +7,8 @@
 //   --mode remote  by expert servers (net::Remote, the conductor's side), with this process's own host as the fallback
 // and the program prints the generated tokens and a hash of every expert row it received (bit identity, not just argmax).
 // Equal lines from the two modes, with a server on localhost or on another PC, is the test.
-//
-// --causal: the toy's memory is the previous TOKEN (not a carried hidden state), so a window of tokens is exactly what a sequence of
-//   single steps would give, as with attention; the prompt goes through in windows of kMaxTok, any length (--prompt N, --prompt-seed S
-//   makes a unique prefix).  --spec K adds speculative decoding on it (greedy, so the tokens must equal plain decoding's): each round a
-//   drafter proposes up to K tokens, ONE window of 1 + K tokens goes through every layer (through the servers in --mode remote), and the
-//   longest matching prefix plus one more token is kept.  --draft-acc P: an oracle drafter right with probability P per draft (the
-//   accept rate is then a knob); without it a prompt-lookup n-gram drafter.  The weights are random: the accept rate says nothing about a
-//   real drafter, the call counts and times are the mechanism's.
 #include "ds4_net.hpp"
+#include "ds4_net_chunk.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -27,6 +20,7 @@
 #include <map>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace strata::ds4::net;
@@ -57,6 +51,27 @@ int main(int argc, char** argv) {
     float skew = 0.0f;
     std::string count_out;
     bool show_time = false;
+    // BBXL S4: --overlap asks the servers with Remote::begin, computes the conductor's own experts while they answer, then Remote::finish
+    // (the engine's cpu_experts); off: Remote::run, then the local ones.  --local-delay-ms N charges every layer N ms of conductor-side lane
+    // time (a sleep: deterministic on a loaded host), so the timing tests can tell "the sum" from "the longer of the two".
+    bool overlap = false;
+    // BBXL S5: --prompt-path sends the prompt through Remote::prompt (T tokens of a layer at once, in --slab token slabs: the engine's chunk path)
+    // instead of 16-token windows; --prompt may then be long (any size, slabs of --slab tokens each through every layer); --local-win N: the window
+    // the local arm computes in; --no-hash skips the row hash (timing runs); --time also prints PREFILL ms / tok/s.
+    bool prompt_path = false, no_hash = false;
+    // BBXL S7: --chunk-flow is the engine's chunked flow for a served layer (ds4_net_chunk.hpp, the code the engine runs): only the picks a
+    // server OWNS are sent (Remote::owns), every one must come back (no fallback here: the conductor may not have the bytes), the rows are
+    // summed with the moe_combine kernel's arithmetic, and CHUNKSUM prints a hash of those partial sums.  --chunk-own LO-HI: in --mode local,
+    // the experts LO-HI of every layer stand for the servers' share (the reference the remote run must equal bit for bit).
+    bool chunk_flow = false;
+    int own_lo = 0, own_hi = -1, own_l0 = 0, own_l1 = 1 << 30;   // --chunk-own LO-HI[:L0-L1]: experts LO-HI of layers L0-L1 (default all)
+    uint64_t chunk_hash = 14695981039346656037ull;
+    size_t chunk_sent = 0;
+    int slab = 256, local_win = kMaxPromptTok;
+    int salt = 0;   // --prompt-salt N: another prompt (a unique prefix for every timing run)
+    int local_delay_ms = 0;
+    // BBXL DSpark: --causal makes the toy's memory the previous TOKEN (a window equals single steps, as with attention); --spec K verifies K drafts as ONE
+    // window per layer; --draft-acc P is an oracle drafter of accuracy P; --prompt-seed S picks the prompt.  Off by default.
     bool causal = false;
     int spec_k = 0;
     double draft_acc = -1.0;
@@ -76,6 +91,21 @@ int main(int argc, char** argv) {
         else if (a == "--skew") skew = (float) std::atof(v().c_str());
         else if (a == "--count-out") count_out = v();
         else if (a == "--time") show_time = true;
+        else if (a == "--overlap") overlap = true;
+        else if (a == "--prompt-path") prompt_path = true;
+        else if (a == "--slab") slab = std::max(1, std::atoi(v().c_str()));
+        else if (a == "--local-win") local_win = std::max(1, std::min(kMaxPromptTok, std::atoi(v().c_str())));
+        else if (a == "--no-hash") no_hash = true;
+        else if (a == "--chunk-flow") chunk_flow = true;
+        else if (a == "--chunk-own") {
+            const std::string r = v();
+            own_lo = std::atoi(r.c_str());
+            const size_t d = r.find('-'), c = r.find(':');
+            own_hi = d == std::string::npos ? own_lo : std::atoi(r.c_str() + d + 1);
+            if (c != std::string::npos) { own_l0 = std::atoi(r.c_str() + c + 1); const size_t d2 = r.find('-', c); own_l1 = d2 == std::string::npos ? own_l0 : std::atoi(r.c_str() + d2 + 1); }
+        }
+        else if (a == "--prompt-salt") salt = std::atoi(v().c_str());
+        else if (a == "--local-delay-ms") local_delay_ms = std::atoi(v().c_str());
         else if (a == "--causal") causal = true;
         else if (a == "--spec") { spec_k = std::atoi(v().c_str()); causal = true; }
         else if (a == "--draft-acc") draft_acc = std::atof(v().c_str());
@@ -86,7 +116,7 @@ int main(int argc, char** argv) {
     std::string err;
     if (pack.empty() || !map.load(pack, err)) { std::fprintf(stderr, "pack: %s\n", err.c_str()); return 2; }
     const int D = map.dim, L = map.n_layers, K = map.top_k, NE = map.n_exp;
-    if (n_prompt < 1 || (!causal && n_prompt > kMaxTok) || spec_k < 0 || spec_k >= kMaxTok) { std::fprintf(stderr, "--prompt 1..%d\n", kMaxTok); return 2; }
+    if (n_prompt < 1 || spec_k < 0 || spec_k >= kMaxTok || (n_prompt > kMaxTok && !causal && mode != "local" && !prompt_path && !chunk_flow)) { std::fprintf(stderr, "--prompt 1..%d (longer: --prompt-path, --chunk-flow or --mode local)\n", kMaxTok); return 2; }
 
     ExpertHost host;
     if (!host.open(map, 0, L - 1, threads, err)) { std::fprintf(stderr, "host: %s\n", err.c_str()); return 1; }
@@ -131,10 +161,10 @@ int main(int argc, char** argv) {
     bool use_remote = mode == "remote";
     std::vector<int> seq;
     std::vector<int> prompt;
-    for (int i = 0; i < n_prompt; ++i) prompt.push_back((int) ((i * 7 + 3) % vocab));
+    for (int i = 0; i < n_prompt; ++i) prompt.push_back((int) (((i * 7 + 3 + salt * 13) + (i / vocab) * (1 + salt % 5) * 11) % vocab));
 
     // one window of nt tokens (their hidden states h: nt x D) through every layer
-    auto forward = [&](int nt, std::vector<float>& h) {
+    auto forward = [&](int nt, std::vector<float>& h, bool is_prompt) {
         if (counting) ++windows;
         std::vector<float> xn((size_t) nt * D), moe((size_t) nt * D), rows((size_t) nt * K * D), sc((size_t) NE);
         std::vector<int32_t> ids((size_t) nt * K);
@@ -158,8 +188,53 @@ int main(int argc, char** argv) {
                 if (!counts.empty()) for (int j = 0; j < K; ++j) ++counts[(size_t) l * NE + (size_t) ord[(size_t) j]];
             }
             // the routed experts: the unit under test
-            if (!use_remote) {
-                if (!host.compute((uint32_t) l, (uint32_t) nt, (uint32_t) K, ids.data(), mask.data(), xn.data(), rows.data(), err)) { std::fprintf(stderr, "local: %s\n", err.c_str()); std::exit(1); }
+            if ((mode == "local" || !use_remote) && !(chunk_flow && is_prompt)) {
+                for (int t0 = 0; t0 < nt; t0 += local_win) {
+                    const int w = std::min(local_win, nt - t0);
+                    if (!host.compute((uint32_t) l, (uint32_t) w, (uint32_t) K, ids.data() + (size_t) t0 * K, mask.data() + (size_t) t0 * K, xn.data() + (size_t) t0 * D,
+                                      rows.data() + (size_t) t0 * K * D, err)) { std::fprintf(stderr, "local: %s\n", err.c_str()); std::exit(1); }
+                }
+            } else if (chunk_flow && is_prompt) {
+                // BBXL S7: the engine's chunk hook for a served layer; routing in the engine's kPicks (8) stride
+                constexpr int kStride = 8;
+                std::vector<int> ridx((size_t) nt * kStride, -1);
+                std::vector<float> rw8((size_t) nt * kStride, 0.0f);
+                for (int t = 0; t < nt; ++t) for (int j = 0; j < K; ++j) { ridx[(size_t) t * kStride + j] = ids[(size_t) t * K + j]; rw8[(size_t) t * kStride + j] = wts[(size_t) t * K + j]; }
+                ChunkSlab slab;
+                chunk_slab_build(slab, ridx.data(), rw8.data(), kStride, K, 0, nt, [&](int e) { return mode == "remote" ? remote.owns(l, e) : (l >= own_l0 && l <= own_l1 && e >= own_lo && e <= own_hi); });
+                std::vector<uint8_t> have((size_t) nt * K, 0);
+                if (slab.sent > 0) {
+                    if (mode == "remote") {
+                        std::vector<uint8_t> got;
+                        if (!remote.prompt(l, xn.data(), (size_t) D, nt, slab.ids.data(), rows.data(), got, err)) { std::fprintf(stderr, "chunk flow layer %d: %s\n", l, err.c_str()); std::exit(1); }
+                        for (size_t i = 0; i < have.size(); ++i) if (slab.ids[i] >= 0) { if (!got[i]) { std::fprintf(stderr, "chunk flow layer %d: a served pick was not answered\n", l); std::exit(1); } have[i] = 1; }
+                    } else {
+                        std::vector<uint8_t> m1((size_t) nt * K, 0);
+                        for (size_t i = 0; i < m1.size(); ++i) if (slab.ids[i] >= 0) { m1[i] = 1; have[i] = 1; }
+                        for (int t0 = 0; t0 < nt; t0 += local_win) { const int w = std::min(local_win, nt - t0); if (!host.compute((uint32_t) l, (uint32_t) w, (uint32_t) K, ids.data() + (size_t) t0 * K, m1.data() + (size_t) t0 * K, xn.data() + (size_t) t0 * D, rows.data() + (size_t) t0 * K * D, err)) { std::fprintf(stderr, "local: %s\n", err.c_str()); std::exit(1); } }
+                    }
+                    std::vector<float> acc((size_t) nt * D, 0.0f);
+                    chunk_combine_ref(acc.data(), (size_t) D, rows.data(), slab, D);
+                    chunk_hash = fnv(chunk_hash, acc.data(), acc.size() * 4);
+                    chunk_sent += slab.sent;
+                }
+                std::vector<uint8_t> m2((size_t) nt * K, 0);   // the conductor's own experts: its own lane (the engine: its VRAM and streamed ones)
+                bool any = false;
+                for (size_t i = 0; i < m2.size(); ++i) if (!have[i]) { m2[i] = 1; any = true; }
+                for (int t0 = 0; any && t0 < nt; t0 += local_win) { const int w = std::min(local_win, nt - t0); if (!host.compute((uint32_t) l, (uint32_t) w, (uint32_t) K, ids.data() + (size_t) t0 * K, m2.data() + (size_t) t0 * K, xn.data() + (size_t) t0 * D, rows.data() + (size_t) t0 * K * D, err)) { std::fprintf(stderr, "chunk flow rest: %s\n", err.c_str()); std::exit(1); } }
+            } else if (prompt_path && is_prompt) {
+                // BBXL S5: the whole slab of this layer through the servers; what no route owns, and what failed, is computed here
+                std::vector<uint8_t> got;
+                if (!remote.prompt(l, xn.data(), (size_t) D, nt, ids.data(), rows.data(), got, err)) std::fprintf(stderr, "prompt path layer %d: %s (computing it here)\n", l, err.c_str());
+                std::vector<uint8_t> m2((size_t) nt * K, 0);
+                bool any = false;
+                for (size_t i = 0; i < m2.size(); ++i) if (!got[i]) { m2[i] = 1; any = true; }
+                if (local_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(local_delay_ms));
+                for (int t0 = 0; any && t0 < nt; t0 += local_win) {
+                    const int w = std::min(local_win, nt - t0);
+                    if (!host.compute((uint32_t) l, (uint32_t) w, (uint32_t) K, ids.data() + (size_t) t0 * K, m2.data() + (size_t) t0 * K, xn.data() + (size_t) t0 * D,
+                                      rows.data() + (size_t) t0 * K * D, err)) { std::fprintf(stderr, "prompt fallback: %s\n", err.c_str()); std::exit(1); }
+                }
             } else {
                 // as the engine's Ents: one item per expert (<= 16 tokens), slots in order; then what did not come back runs here
                 std::map<int, std::vector<int>> by;
@@ -173,23 +248,39 @@ int main(int argc, char** argv) {
                 }
                 std::vector<float> y(slot_entry.size() * (size_t) D);
                 std::vector<char> done;
-                remote.run(l, xn.data(), (size_t) D, items.data(), (int) items.size(), y.data(), done);
                 std::vector<uint8_t> m2((size_t) nt * K, 0);
                 bool any_local = false;
-                for (size_t q = 0; q < items.size(); ++q) {
-                    if (done[q]) {
+                auto mark_local = [&](size_t q) {
+                    for (int i = 0; i < items[q].n; ++i) m2[(size_t) slot_entry[(size_t) (items[q].slot0 + i)]] = 1;
+                    any_local = true;
+                };
+                auto run_local = [&](bool charge) {
+                    if (charge && local_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(local_delay_ms));
+                    if (any_local && !host.compute((uint32_t) l, (uint32_t) nt, (uint32_t) K, ids.data(), m2.data(), xn.data(), rows.data(), err)) { std::fprintf(stderr, "fallback: %s\n", err.c_str()); std::exit(1); }
+                    std::fill(m2.begin(), m2.end(), (uint8_t) 0);
+                    any_local = false;
+                };
+                if (overlap) {
+                    std::vector<char> pend;
+                    remote.begin(l, xn.data(), (size_t) D, items.data(), (int) items.size(), pend);
+                    for (size_t q = 0; q < items.size(); ++q) if (!pend[q]) mark_local(q);
+                    run_local(true);                       // the conductor's own work while the servers answer
+                    remote.finish(y.data(), done);
+                    for (size_t q = 0; q < items.size(); ++q) if (pend[q] && !done[q]) mark_local(q);   // a host that failed
+                    run_local(false);
+                } else {
+                    remote.run(l, xn.data(), (size_t) D, items.data(), (int) items.size(), y.data(), done);
+                    for (size_t q = 0; q < items.size(); ++q) if (!done[q]) mark_local(q);
+                    run_local(true);
+                }
+                for (size_t q = 0; q < items.size(); ++q)
+                    if (done[q])
                         for (int i = 0; i < items[q].n; ++i)
                             std::memcpy(&rows[(size_t) slot_entry[(size_t) (items[q].slot0 + i)] * D], &y[(size_t) (items[q].slot0 + i) * D], (size_t) D * 4);
-                    } else {
-                        for (int i = 0; i < items[q].n; ++i) m2[(size_t) slot_entry[(size_t) (items[q].slot0 + i)]] = 1;
-                        any_local = true;
-                    }
-                }
-                if (any_local && !host.compute((uint32_t) l, (uint32_t) nt, (uint32_t) K, ids.data(), m2.data(), xn.data(), rows.data(), err)) { std::fprintf(stderr, "fallback: %s\n", err.c_str()); std::exit(1); }
             }
             if (counting) {
                 rows_total += nt * K;
-                row_hash = fnv(row_hash, rows.data(), rows.size() * 4);
+                if (!no_hash) row_hash = fnv(row_hash, rows.data(), rows.size() * 4);
             }
             for (int t = 0; t < nt; ++t) {
                 float* mo = &moe[(size_t) t * D];
@@ -231,24 +322,42 @@ int main(int argc, char** argv) {
         return best;
     };
     if (!causal) {
-        // the prompt as one window, then one token a step
-        std::vector<float> h((size_t) n_prompt * D);
-        for (int t = 0; t < n_prompt; ++t) std::memcpy(&h[(size_t) t * D], &emb[(size_t) prompt[(size_t) t] * D], (size_t) D * 4);
-        forward(n_prompt, h);
-        int tok = next_token(&h[(size_t) (n_prompt - 1) * D]);
+        // the prompt: one window (<= 16 tokens), or - long prompts - slabs of --slab tokens, each through every layer (the toy has no attention, so a
+        // slab does not depend on the one before it: the same rows whatever the slab size); then one token a step
+        auto prompt_row = [&](int t, float* dstrow) {
+            std::memcpy(dstrow, &emb[(size_t) prompt[(size_t) t] * D], (size_t) D * 4);
+            if (n_prompt > kMaxTok)   // a long prompt: a per-position part, so the rows (and the routing) differ from token to token
+                for (int d = 0; d < D; ++d) {
+                    const uint32_t hv = (uint32_t) t * 2654435761u + (uint32_t) d * 40503u + (uint32_t) salt * 977u;
+                    dstrow[d] += 0.5f * ((float) (((hv ^ (hv >> 15)) * 2246822519u) >> 8) / 8388608.0f - 1.0f);
+                }
+        };
+        std::vector<float> h_last((size_t) D);
+        const auto t_pre = std::chrono::steady_clock::now();
+        const int slab_n = n_prompt <= kMaxTok ? n_prompt : slab;
+        for (int t0 = 0; t0 < n_prompt; t0 += slab_n) {
+            const int w = std::min(slab_n, n_prompt - t0);
+            std::vector<float> h((size_t) w * D);
+            for (int t = 0; t < w; ++t) prompt_row(t0 + t, &h[(size_t) t * D]);
+            forward(w, h, true);
+            if (t0 + w >= n_prompt) std::memcpy(h_last.data(), &h[(size_t) (w - 1) * D], (size_t) D * 4);
+        }
+        const double pre_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pre).count();
+        int tok = next_token(h_last.data());
         seq.push_back(tok);
         // (a recurrent carry stands in for attention's memory, so the toy does not fall into a one-token cycle)
-        std::vector<float> carry(&h[(size_t) (n_prompt - 1) * D], &h[(size_t) (n_prompt - 1) * D] + D);
+        std::vector<float> carry(h_last);
         const auto decode_t0 = std::chrono::steady_clock::now();
         for (int s = 1; s < n_new; ++s) {
             std::vector<float> h1(&emb[(size_t) tok * D], &emb[(size_t) tok * D] + D);
             for (int d = 0; d < D; ++d) h1[(size_t) d] += 0.8f * carry[(size_t) d];
-            forward(1, h1);
+            forward(1, h1, false);
             carry = h1;
             tok = next_token(h1.data());
             seq.push_back(tok);
         }
         const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - decode_t0).count();
+        if (show_time) std::printf("PREFILL %.1f ms over %d tokens, %.1f tok/s\n", pre_ms, n_prompt, pre_ms > 0 ? n_prompt * 1000.0 / pre_ms : 0.0);
         if (show_time) std::printf("DECODE %.3f ms a token over %d tokens\n", n_new > 1 ? decode_ms / (double) (n_new - 1) : 0.0, n_new - 1);
         if (n_new > 1) std::fprintf(stderr, "DECODE %d single-token steps in %.1f ms: %.3f ms a token, %.1f tok/s (the toy's own dense part included)\n", n_new - 1, decode_ms, decode_ms / (n_new - 1), 1000.0 * (n_new - 1) / decode_ms);
     } else {
@@ -262,7 +371,7 @@ int main(int argc, char** argv) {
         auto preds_of = [&](const std::vector<int>& w, int pv0, std::vector<int>& preds) {
             std::vector<float> hw(w.size() * (size_t) D);
             for (size_t j = 0; j < w.size(); ++j) cinput(w[j], j ? w[j - 1] : pv0, &hw[j * (size_t) D]);
-            forward((int) w.size(), hw);
+            forward((int) w.size(), hw, false);
             preds.resize(w.size());
             for (size_t j = 0; j < w.size(); ++j) preds[j] = next_token(&hw[j * (size_t) D]);
         };
@@ -338,6 +447,8 @@ int main(int argc, char** argv) {
     for (int t : seq) std::printf(" %d", t);
     std::printf("\nROWHASH %016llx\nROWS %ld FINITE %d\n", (unsigned long long) row_hash, rows_total, (int) !(flag & 1));
     if (mode == "remote") std::printf("STATS %s\n", remote.stats().c_str());
+    if (chunk_flow) std::printf("CHUNKSUM %016llx SENT %zu\n", (unsigned long long) chunk_hash, chunk_sent);
+    if (mode == "remote") std::printf("PROMPTWIN %d\n", remote.prompt_window());
     if (host.calls() > 0)
         std::fprintf(stderr, "HOST %llu calls, %.3f ms a call (this process's own lane)\n", (unsigned long long) host.calls(), host.compute_ms() / (double) host.calls());
     return 0;

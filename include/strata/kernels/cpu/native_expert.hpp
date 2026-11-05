@@ -13,10 +13,15 @@
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest quantized activation any native layer uses.  Qwen3.8-Max (qwen35moe, n_embd 8192) is the
+/// widest: 8192 values as Q8_K = 32 x 292 = 9344 (Flash-Next's 2560 need 2920, Qwen3.6's 2048 need 2336); 12288 holds
+/// n_embd up to 10240 as Q8_K.  `native_fmt` refuses a layer that needs more.
+inline constexpr size_t kNativeActBytes = 12288;
+/// Bytes of the largest quantized down activation (Max: 2048 values as Q8_K = 8 x 292 = 2336, or Q8_0 64 x 34 = 2176;
+/// Flash-Next's 640 need 876); 3072 holds an expert width up to 2560 as Q8_K.
+inline constexpr size_t kNativeHBytes = 3072;
+/// The widest expert (n_ff) the pool's per-expert SwiGLU buffers hold: Max's 2048 (Flash-Next 640, Qwen3.6 512).
+inline constexpr int64_t kNativeMaxFF = 2560;
 
 /// Arithmetic fixed for one pool batch. WindowInvariant preserves the legacy singleton result at every width.
 enum class NativeArithmetic { Default, WindowInvariant };

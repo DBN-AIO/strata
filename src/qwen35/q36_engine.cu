@@ -29,6 +29,8 @@
 #include "strata/qwen35/sampling.hpp"
 #include "q36_kernels.cuh"
 #if defined(STRATA_Q36_CPU_POOL)
+#include "strata/core/native_rows.hpp"
+#include "strata/core/net_experts.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #endif
@@ -1029,6 +1031,18 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp
     (void) want_mtp;
     m.has_mtp = g.n_mtp_layers > 0;
+    if (m.has_mtp) {
+        // Qwen3.8-Max's UD-IQ1_M / UD-IQ2_XXS files keep the MTP block's experts in Q2_K, which has no GPU expert kernel (the
+        // trunk's IQ1_M / IQ2_XXS have): the block is left out, with a note, and the model runs without MTP drafts
+        size_t sg = 0, sd = 0;
+        const strata::TensorInfo* tg = gm.find(L(g.n_layers, "ffn_gate_exps.weight"), &sg);
+        const strata::TensorInfo* td = gm.find(L(g.n_layers, "ffn_down_exps.weight"), &sd);
+        if (tg && td && !K::native_expert_supported((int) tg->type, (int) td->type, g.n_embd, g.n_ff)) {
+            std::fprintf(stderr, "strata-q36: the MTP block's experts are %s/%s, which the native expert kernels do not take: "
+                                 "the block is not loaded, no MTP drafts\n", tg->type_name(), td->type_name());
+            m.has_mtp = false;
+        }
+    }
     for (int64_t l = 0; l < g.n_layers + (m.has_mtp ? 1 : 0); ++l) {
         const bool is_mtp = l == g.n_layers;
         Layer& y = is_mtp ? m.mtp : m.layers[(size_t) l];
@@ -1255,6 +1269,12 @@ struct Engine {
 #if defined(STRATA_Q36_CPU_POOL)
     std::unique_ptr<strata::kernels::cpu::ExpertPool> pool;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs;
+    // --remote-experts: the blocks whose experts live on expert servers (strata-expert-server); a block served there has
+    // no host copy here, its CPU share goes over the LAN (docs/QWEN_MAX.md)
+    std::unique_ptr<strata::core::NetExperts> net;
+    std::vector<uint8_t> net_mask;
+    std::vector<float*> net_dst;
+    bool wi_arith = false;   // STRATA_Q36_ARITH=wi: the local CPU pool runs window-invariant arithmetic, as a server's rows do
 #endif
     float *h_h = nullptr, *cpu_out = nullptr, *ecpu = nullptr;
     int32_t *h_ids = nullptr, *h_miss = nullptr, *d_miss = nullptr, *h_cnt = nullptr;
@@ -2244,6 +2264,11 @@ struct Engine {
         const int n_ent = T * Kp;
         Hy& H = hy[li];
         const Layer& L = layer_at((int) li);
+        const bool remote = net != nullptr && net->serves((int64_t) li);
+        if (remote) {
+            net_mask.assign((size_t) n_ent, 0);
+            net_dst.assign((size_t) n_ent, nullptr);
+        }
         while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
         }
         const auto t0 = Clock::now();
@@ -2263,6 +2288,11 @@ struct Engine {
             h_miss[e] = H.slot_of[(size_t) x] < 0;
             if (!h_miss[e]) continue;
             ++n_miss;
+            if (remote) {   // the server computes this entry's row: it lands where the local pool would have written it
+                net_mask[(size_t) e] = 1;
+                net_dst[(size_t) e] = cpu_out + (size_t) e * N;
+                continue;
+            }
             const int t = e / Kp;
             if (!quantized[(size_t) t]) {
                 C::native_quant_act(H.fmt, h_h + (size_t) t * N, acts + (size_t) t * C::kNativeActBytes);
@@ -2283,7 +2313,17 @@ struct Engine {
         hy_cpu += n_miss;
         hy_gpu += n_ent - n_miss;
         if (n_miss == 0) return;
-        pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
+        if (remote) {
+            std::string nerr;
+            if (!net->prompt((int64_t) li, h_h, h_ids, T, Kp, net_mask.data(), net_dst.data(), nerr)) {
+                // no host copy of a served block exists to fall back on (that is the point of serving it elsewhere)
+                std::fprintf(stderr, "strata-q36: remote experts, block %zu: %s\n", li, nerr.c_str());
+                std::exit(1);
+            }
+        } else {
+            pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size(),
+                                         wi_arith ? C::NativeArithmetic::WindowInvariant : C::NativeArithmetic::Default);
+        }
         hy_cpu_ms += ms_since(t0);
         CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
@@ -2305,7 +2345,7 @@ struct Engine {
             Hy& H = hy[li];
             const Layer& L = layer_at((int) li);
             const int S = L.n_slots;
-            if (S <= 0 || S >= ne) continue;
+            if (S <= 0 || S >= ne || L.hblobs == nullptr) continue;
             std::vector<int> order((size_t) ne);
             for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
             std::sort(order.begin(), order.end(), [&](int a, int b) { return H.score[(size_t) a] > H.score[(size_t) b]; });
@@ -2810,6 +2850,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         per_slot += L->stride;
         max_layer = std::max(max_layer, L->stride * (size_t) ne);
     }
+#if defined(STRATA_Q36_CPU_POOL)
+    const bool net_on = E.net != nullptr && E.net->active();   // some blocks' experts are on expert servers
+#else
+    const bool net_on = false;
+#endif
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     const size_t reserve = (size_t) 768 << 20;
@@ -2849,7 +2894,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     size_t total_main = 0;
     for (Layer& L : m.layers) total_main += L.stride * (size_t) ne + kMmqTail;
     bool mtp_only = false;
-    if (slots <= 0 && vram_gib < 0 && m.has_mtp && total > budget2 && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr) {
+    if (slots <= 0 && vram_gib < 0 && m.has_mtp && !net_on && total > budget2 && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr) {
         const size_t att_save = (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;   // att_s (4 B) + att_p16 (2 B)
         const size_t small_reserve = (size_t) 256 << 20;
         const size_t room = fr + att_save > small_reserve ? fr + att_save - small_reserve : 0;
@@ -2866,7 +2911,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                          "budget instead\n");
         }
     }
-    if (slots <= 0 && total <= budget2 && total + ((size_t) 256 << 20) <= fr) {
+    if (slots <= 0 && total <= budget2 && total + ((size_t) 256 << 20) <= fr && !net_on) {
         std::vector<uint8_t> blob;
         for (Layer* L : all) {
             CK(cudaMalloc(&L->blobs, L->stride * (size_t) ne + kMmqTail));
@@ -2895,8 +2940,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (E.main_hybrid) E.use_graph = false;   // the host takes part in every layer
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
-    if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
-    const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
+    if (!E.use_mmq || net_on) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool (+ the servers)
+    const size_t staging = E.use_mmq && E.main_hybrid && !net_on ? 2 * (max_layer + kMmqTail) : 0;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
@@ -2923,8 +2968,13 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     }
     // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
     size_t host = 0;
-    for (Layer* L : all)
-        if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
+    size_t li_count = 0;
+    for (Layer* L : all) {
+        const bool rem = net_on && E.net->serves((int64_t) li_count);   // a served block keeps no host copy
+        ++li_count;
+        if ((!mtp_only || L == &m.mtp) && !rem) host += L->stride * (size_t) ne + kMmqTail;
+    }
+    if (host == 0) host = 64;   // every block is served elsewhere
     uint8_t* arena = nullptr;
     bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
     if (!pinned) {
@@ -2950,15 +3000,26 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             L.n_slots = (int) ne;
             continue;
         }
-        L.hblobs = arena + off;
-        off += L.stride * (size_t) ne + kMmqTail;
-        std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
-        for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
+        const bool rem = net_on && E.net->serves((int64_t) li);
+        if (!rem) {
+            L.hblobs = arena + off;
+            off += L.stride * (size_t) ne + kMmqTail;
+            std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
+            for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
+        }
         L.n_slots = S;
         if (S > 0) {
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
-            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
+            if (rem) {   // no host copy: the first S experts straight from the mapped file
+                std::vector<uint8_t> blob(L.L.bytes, 0);
+                for (int s = 0; s < S; ++s) {
+                    expert_blob(L, s, blob.data());
+                    CK(cudaMemcpy(L.blobs + (size_t) s * L.stride, blob.data(), L.L.bytes, cudaMemcpyHostToDevice));
+                }
+            } else {
+                CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
+            }
         }
         Engine::Hy& H = E.hy[li];
         H.slot_of.assign((size_t) ne, -1);
@@ -2997,6 +3058,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     E.pool = std::make_unique<C::ExpertPool>(threads);
+    // a server's rows are window-invariant (arith 1): the local CPU rows beside them are too.  STRATA_Q36_ARITH=wi gives a
+    // single process the same arithmetic, so its text can be compared with a split's
+    E.wi_arith = net_on;
+    if (const char* a = std::getenv("STRATA_Q36_ARITH")) E.wi_arith = E.wi_arith || std::string(a) == "wi";
     CK(cudaDeviceSynchronize());
     if (mtp_only)
         std::fprintf(stderr, "strata-q36: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
@@ -3732,6 +3797,7 @@ int strata::qwen35::run(int argc, char** argv) {
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
+    std::string remote_spec;   // --remote-experts HOST:PORT=LO-HI[,...]: blocks LO..HI computed by strata-expert-server hosts
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -3772,6 +3838,7 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
+        else if (a == "--remote-experts") remote_spec = next();
         else if (serve_mode && a.rfind("--", 0) == 0) {
             // serve passes the config's args plus a few of its own: one this engine does not have is said and skipped
             // (with its value), not fatal
@@ -3854,6 +3921,36 @@ int strata::qwen35::run(int argc, char** argv) {
                          fr / 1073741824.0, fr_raw / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0, chunk);
     }
     E.init(m, ctx, chunk, batch, vision);
+    if (!remote_spec.empty()) {
+#if defined(STRATA_Q36_CPU_POOL)
+        // the experts of the listed blocks stay on the servers: same model file on both ends (the handshake compares the
+        // expert tensors' types and shapes and the files' sizes), the same CPU kernel path
+        try {
+            const std::vector<std::string> files = strata::gguf_split_paths(model);
+            const strata::core::NetIdentity id = strata::core::native_net_identity(*m.file, m.g, m.top_k, files);
+            auto net = std::make_unique<strata::core::NetExperts>();
+            if (!net->open(remote_spec, m.g.n_layers + m.g.n_mtp_layers, m.g.n_expert, id, err)) {
+                std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
+                return 1;
+            }
+            // a block served for only some of its experts would leave the others' rows unwritten (no host copy to compute them from)
+            for (int64_t l = 0; l < m.g.n_layers + m.g.n_mtp_layers; ++l)
+                if (net->serves(l) && !net->covers(l)) {
+                    std::fprintf(stderr, "strata-q36: --remote-experts: block %lld is served for only some of its experts (host ranges /E0-E1 must "
+                                         "together cover all %lld): this family keeps no local copy of a served block\n", (long long) l,
+                                 (long long) m.g.n_expert);
+                    return 1;
+                }
+            E.net = std::move(net);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata-q36: --remote-experts: %s\n", e.what());
+            return 1;
+        }
+#else
+        std::fprintf(stderr, "strata-q36: --remote-experts needs the CPU expert pool (this build has STRATA_NATIVE_EXPERTS=OFF)\n");
+        return 1;
+#endif
+    }
     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;

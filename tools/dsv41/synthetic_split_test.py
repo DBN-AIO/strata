@@ -6,6 +6,13 @@ against expert servers on localhost, and compares the 64 greedy tokens and the h
   1. one server for all layers
   2. two servers splitting the layers
   3. a partial split (the conductor computes the other layers itself)
+  3c-3e. (BBXL S4) one layer's experts on two servers asked at the same time; the conductor's own experts computed while the servers
+         answer (Remote::begin / finish); both with an injected delay (server: STRATA_DS4_SERVER_DELAY_MS, conductor: --local-delay-ms)
+         so the timing assertions are deterministic on a loaded host
+  3f-3k. (BBXL S5) the prompt through the servers: a 100-token prompt in slabs through every layer (Remote::prompt, windows of 32 tokens), a
+         conductor pack WITHOUT the served layers' bytes, experts split over hosts, a server that dies mid-prompt
+  3l-3n. (BBXL S7) the chunked flow's hook (ds4_net_chunk.hpp, --chunk-flow): only owned picks sent, partial sums bit-identical, a conductor pack without
+         the served layers, a dying server stops the run
   4. a server that dies mid-run (STRATA_DS4_SERVER_DIE_AFTER): the conductor falls back to its own lane, same output
   4c. (BBXL S3) experts renumbered by popularity: the conductor calls ranks (STRATA_DS4_EXPERT_PERM), the slice is laid out by rank
   5. a conductor of the wrong engine family (qwen38) is refused at the handshake; so are a wrong token and another geometry
@@ -142,7 +149,7 @@ def stop(p):
 def lines(r):
     d = {}
     for ln in r.stdout.splitlines():
-        m = re.match(r"(TOKENS|ROWHASH|ROWS|STATS|OPEN_FAILED|SPEC|DECODE)\s*(.*)", ln)
+        m = re.match(r"(TOKENS|ROWHASH|ROWS|STATS|OPEN_FAILED|SPEC|DECODE|PROMPTWIN)\s*(.*)", ln)
         if m:
             d[m.group(1)] = m.group(2)
     return d
@@ -197,6 +204,130 @@ with tempfile.TemporaryDirectory(prefix="synth-split-", dir=parent) as tmp:
     L = lines(r)
     check("experts split over two hosts (0-15 / 16-31): identical, none local", r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and L.get("ROWHASH") == R.get("ROWHASH")
           and "computed locally 0," in L.get("STATS", ""), r.stderr[-300:] + L.get("STATS", ""))
+    # 3c. BBXL S4: every layer's experts on TWO servers, each answering in 30 ms (injected).  Asked one after the other a layer would cost
+    # 60 ms (480 ms a token over 8 layers); asked at the same time, 30 ms (240 ms).  Same tokens and rows as the local run.
+    DEL = 30
+    ref6 = run(["--pack", pack, "--mode", "local", "--tokens", "6"])
+    R6 = lines(ref6)
+    dl = dict(token, STRATA_DS4_SERVER_DELAY_MS=str(DEL))
+    y1 = start(pack, 17853, "0-7", dl, experts="0-15")
+    y2 = start(pack, 17854, "0-7", dl, experts="16-31")
+    r = run(["--pack", pack, "--mode", "remote", "--tokens", "6", "--time", "--remote", "127.0.0.1:17853=0-7/0-15,127.0.0.1:17854=0-7/16-31"], token)
+    rs = run(["--pack", pack, "--mode", "remote", "--tokens", "6", "--time", "--remote", "127.0.0.1:17853=0-7/0-15,127.0.0.1:17854=0-7/16-31"], dict(token, STRATA_NET_SERIAL="1"))
+    stop(y1)
+    stop(y2)
+    LSr = lines(rs)
+    msr = re.match(r"([\d.]+) ms a token", LSr.get("DECODE", ""))
+    msr = float(msr.group(1)) if msr else -1.0
+    check("the serial arm (STRATA_NET_SERIAL=1, the measurement hook): same tokens and rows", rs.returncode == 0 and LSr.get("TOKENS") == R6.get("TOKENS") and LSr.get("ROWHASH") == R6.get("ROWHASH"), rs.stderr[-300:])
+    check("the serial arm costs the sum of the servers (8 x 2 x %d ms): %.0f ms" % (DEL, msr), msr >= 0.9 * 16 * DEL, "%.1f ms" % msr)
+    L = lines(r)
+    m = re.match(r"([\d.]+) ms a token", L.get("DECODE", ""))
+    ms = float(m.group(1)) if m else -1.0
+    check("two delayed servers: tokens and rows identical", r.returncode == 0 and L.get("TOKENS") == R6.get("TOKENS") and L.get("ROWHASH") == R6.get("ROWHASH"), r.stderr[-300:] + L.get("STATS", ""))
+    check("two delayed servers: a token costs ~ one server's time (8 x %d ms), not the sum (%d ms): %.0f ms" % (DEL, 16 * DEL, ms),
+          0.9 * 8 * DEL <= ms <= 1.5 * 8 * DEL, "%.1f ms" % ms)
+    # 3d. BBXL S4: the conductor's own experts (0-15) cost 25 ms a layer (injected) while the one server (16-31) takes 30 ms.  One after the other:
+    # 55 ms a layer (440 ms a token); overlapped (Remote::begin, the local work, Remote::finish): about 30 ms (240 ms).
+    LOC = 25
+    z = start(pack, 17855, "0-7", dl, experts="16-31")
+    seqr = run(["--pack", pack, "--mode", "remote", "--tokens", "6", "--time", "--local-delay-ms", str(LOC), "--remote", "127.0.0.1:17855=0-7/16-31"], token)
+    ovr = run(["--pack", pack, "--mode", "remote", "--tokens", "6", "--time", "--overlap", "--local-delay-ms", str(LOC), "--remote", "127.0.0.1:17855=0-7/16-31"], token)
+    stop(z)
+    LS, LO = lines(seqr), lines(ovr)
+    def msof(d):
+        mm = re.match(r"([\d.]+) ms a token", d.get("DECODE", ""))
+        return float(mm.group(1)) if mm else -1.0
+    ms_s, ms_o = msof(LS), msof(LO)
+    check("conductor work, one after the other: tokens and rows identical", seqr.returncode == 0 and LS.get("TOKENS") == R6.get("TOKENS") and LS.get("ROWHASH") == R6.get("ROWHASH"), seqr.stderr[-300:])
+    check("conductor work overlapped with the server: tokens and rows identical", ovr.returncode == 0 and LO.get("TOKENS") == R6.get("TOKENS") and LO.get("ROWHASH") == R6.get("ROWHASH"), ovr.stderr[-300:] + ovr.stdout[-200:])
+    check("one after the other costs the sum (8 x 55 ms): %.0f ms" % ms_s, ms_s >= 0.9 * 8 * (DEL + LOC), "%.1f ms" % ms_s)
+    check("overlapped costs the longer of the two (8 x 30 ms), not the sum: %.0f ms" % ms_o, 0.9 * 8 * DEL <= ms_o <= 0.8 * 8 * (DEL + LOC), "%.1f ms" % ms_o)
+    # 3e. the overlapped path with a server that dies mid-run: its pending rows come back to the conductor's own lane, same output
+    z = start(pack, 17856, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="40"), experts="16-31")
+    r = run(["--pack", pack, "--mode", "remote", "--overlap", "--remote", "127.0.0.1:17856=0-7/16-31"], dict(token, STRATA_EXPERT_TIMEOUT_MS="1500"))
+    stop(z)
+    L = lines(r)
+    m = re.search(r"remote expert rows (\d+), computed locally (\d+)", L.get("STATS", ""))
+    check("overlapped, server dies after 40 requests: identical via the local fallback", r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and L.get("ROWHASH") == R.get("ROWHASH"), r.stderr[-300:] + r.stdout[-200:])
+    check("overlapped, server dies: remote and local rows both used", m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, L.get("STATS", ""))
+    # 3f. BBXL S5: the prompt path.  100 tokens in slabs of 40 through every layer, 4 tokens; the local reference computes the same rows in windows.
+    PP = ["--prompt", "100", "--slab", "40", "--tokens", "4"]
+    refp = run(["--pack", pack, "--mode", "local"] + PP)
+    RPL = lines(refp)
+    check("prompt reference run (100 tokens, local)", refp.returncode == 0 and "TOKENS" in RPL, refp.stderr[-300:])
+    # 3g. a conductor pack WITHOUT the served layers' bytes (a slice holding layers 0-1 only), layers 2-7 on one server: the prompt (and the
+    # decode) of layers 2-7 must come over the wire; a read of a missing byte would give zeros and change the rows
+    cs = os.path.join(tmp, "cslice")
+    em = subprocess.Popen([sys.executable, os.path.join(here, "slice_stream.py"), "emit", pack, "0-1"], stdout=subprocess.PIPE)
+    ap = subprocess.run([sys.executable, os.path.join(here, "slice_stream.py"), "apply", cs], stdin=em.stdout, capture_output=True, text=True)
+    em.wait()
+    check("slice_stream emit 0-1 | apply (the conductor's pack)", em.returncode == 0 and ap.returncode == 0, ap.stderr[-200:])
+    ctl = run(["--pack", cs, "--mode", "local"] + PP)
+    check("control: that conductor pack run alone (no server) does NOT give the reference rows (the bytes of layers 2-7 are really missing)",
+          ctl.returncode != 0 or lines(ctl).get("ROWHASH") != RPL.get("ROWHASH"), lines(ctl).get("ROWHASH", ""))
+    q = start(pack, 17860, "2-7", token)
+    r = run(["--pack", cs, "--mode", "remote", "--prompt-path", "--remote", "127.0.0.1:17860=2-7"] + PP, token)
+    stop(q)
+    L = lines(r)
+    m = re.search(r"remote expert rows (\d+), computed locally (\d+)", L.get("STATS", ""))
+    check("prompt path, conductor pack without layers 2-7: tokens and rows identical to the local run",
+          r.returncode == 0 and L.get("TOKENS") == RPL.get("TOKENS") and L.get("ROWHASH") == RPL.get("ROWHASH"), r.stderr[-300:] + r.stdout[-200:])
+    check("prompt path: every row of layers 2-7 came from the server (103 tokens x 6 picks x 6 layers)", m is not None and int(m.group(1)) == 103 * 6 * 6 and int(m.group(2)) == 0, L.get("STATS", ""))
+    check("prompt path: windows of 32 tokens", L.get("PROMPTWIN") == "32", L.get("PROMPTWIN", ""))
+    # 3h. the server owns experts 16-31 only: the conductor computes its own 0-15 from its copy, the rest is remote
+    q = start(pack, 17861, "0-7", token, experts="16-31")
+    r = run(["--pack", pack, "--mode", "remote", "--prompt-path", "--remote", "127.0.0.1:17861=0-7/16-31"] + PP, token)
+    stop(q)
+    L = lines(r)
+    m = re.search(r"remote expert rows (\d+), computed locally (\d+)", L.get("STATS", ""))
+    check("prompt path, server owns experts 16-31 only: identical", r.returncode == 0 and L.get("TOKENS") == RPL.get("TOKENS") and L.get("ROWHASH") == RPL.get("ROWHASH"), r.stderr[-300:])
+    check("prompt path, partial experts: some rows remote, some here", m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, L.get("STATS", ""))
+    # 3i. experts split over two servers; the window size does not change a row (32 against 16 tokens)
+    q1 = start(pack, 17862, "0-7", token, experts="0-15")
+    q2 = start(pack, 17863, "0-7", token, experts="16-31")
+    spec = "127.0.0.1:17862=0-7/0-15,127.0.0.1:17863=0-7/16-31"
+    r32 = run(["--pack", pack, "--mode", "remote", "--prompt-path", "--remote", spec] + PP, token)
+    r16 = run(["--pack", pack, "--mode", "remote", "--prompt-path", "--remote", spec] + PP, dict(token, STRATA_DS4_PROMPT_WIN="16"))
+    stop(q1)
+    stop(q2)
+    L32, L16 = lines(r32), lines(r16)
+    check("prompt path, experts over two servers, windows of 32: identical", r32.returncode == 0 and L32.get("TOKENS") == RPL.get("TOKENS") and L32.get("ROWHASH") == RPL.get("ROWHASH"), r32.stderr[-300:])
+    check("prompt path, windows of 16 (STRATA_DS4_PROMPT_WIN): the same rows", r16.returncode == 0 and L16.get("PROMPTWIN") == "16" and L16.get("ROWHASH") == RPL.get("ROWHASH"), r16.stderr[-300:] + L16.get("PROMPTWIN", ""))
+    # 3j. a server that dies in the middle of the prompt: the conductor (which has the whole pack) computes the rest; the output is the same
+    q = start(pack, 17864, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="12"))
+    r = run(["--pack", pack, "--mode", "remote", "--prompt-path", "--remote", "127.0.0.1:17864=0-7"] + PP, dict(token, STRATA_EXPERT_TIMEOUT_MS="1500"))
+    stop(q)
+    L = lines(r)
+    check("prompt path, server dies mid-prompt: identical through the local fallback", r.returncode == 0 and L.get("TOKENS") == RPL.get("TOKENS") and L.get("ROWHASH") == RPL.get("ROWHASH"), r.stderr[-300:])
+    # 3l-3n. BBXL S7: the chunked flow's hook (ds4_net_chunk.hpp: the code the engine runs for a served layer; --chunk-flow).  Only the picks a server owns
+    # are sent, every one must come back, and the rows are summed with moe_combine's arithmetic (CHUNKSUM = a hash of those partial sums).  The
+    # reference is the same run in one process, --chunk-own naming the experts a server would hold.
+    CF = PP + ["--chunk-flow"]
+    refc = run(["--pack", pack, "--mode", "local", "--chunk-own", "16-31"] + CF)
+    RC = lines(refc)
+    check("chunk flow reference run (experts 16-31 stand for the server)", refc.returncode == 0 and "CHUNKSUM" in refc.stdout and RC.get("ROWHASH") == RPL.get("ROWHASH"), refc.stderr[-300:] + refc.stdout[-200:])
+    q = start(pack, 17865, "0-7", token, experts="16-31")
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17865=0-7/16-31"] + CF, token)
+    stop(q)
+    L = lines(r)
+    mc, mr = re.search(r"CHUNKSUM (\w+) SENT (\d+)", r.stdout), re.search(r"CHUNKSUM (\w+) SENT (\d+)", refc.stdout)
+    check("chunk flow, server owns experts 16-31: tokens, every row and every partial sum identical", r.returncode == 0 and L.get("TOKENS") == RPL.get("TOKENS") and L.get("ROWHASH") == RPL.get("ROWHASH")
+          and mc is not None and mr is not None and mc.groups() == mr.groups() and int(mc.group(2)) > 0, r.stderr[-300:] + r.stdout[-300:])
+    q = start(pack, 17866, "2-7", token)
+    refa = run(["--pack", pack, "--mode", "local", "--chunk-own", "0-31:2-7"] + CF)
+    r = run(["--pack", cs, "--mode", "remote", "--remote", "127.0.0.1:17866=2-7"] + CF, token)
+    stop(q)
+    L = lines(r)
+    mc, mr = re.search(r"CHUNKSUM (\w+) SENT (\d+)", r.stdout), re.search(r"CHUNKSUM (\w+) SENT (\d+)", refa.stdout)
+    m = re.search(r"remote expert rows (\d+), computed locally (\d+)", L.get("STATS", ""))
+    check("chunk flow, conductor pack WITHOUT layers 2-7: identical, nothing read from the conductor's files for them", r.returncode == 0 and L.get("TOKENS") == RPL.get("TOKENS") and L.get("ROWHASH") == RPL.get("ROWHASH")
+          and mc is not None and mr is not None and mc.groups() == mr.groups(), r.stderr[-300:] + r.stdout[-300:])
+    check("chunk flow: every row of layers 2-7 came from the server (103 x 6 x 6), none computed here for them", m is not None and int(m.group(1)) == 103 * 6 * 6 and int(m.group(2)) == 0, L.get("STATS", ""))
+    q = start(pack, 17867, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="12"))
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17867=0-7"] + CF, dict(token, STRATA_EXPERT_TIMEOUT_MS="1500"))
+    stop(q)
+    check("chunk flow, server dies mid-prompt: the run stops with an error (no silent zeros; a conductor without the bytes cannot fall back)", r.returncode != 0 and "chunk flow" in r.stderr, r.stderr[-300:])
     # 4. the server dies mid-run
     d = start(pack, 17844, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="40"))
     r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17844=0-7"], dict(token, STRATA_EXPERT_TIMEOUT_MS="1500"))

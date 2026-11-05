@@ -8,7 +8,6 @@
 // STRATA_NET_NO_QWEN: the dsv41 expert server (src/dsv41/ds4_net_server.cpp) compiles this file without the qwen38 engine's
 // expert pool, layout and kernels: only the protocol, the client and the generic server loop (serve_experts with a callback).
 #ifndef STRATA_NET_NO_QWEN
-#include "strata/core/expert_source.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #endif
@@ -321,6 +320,13 @@ std::string net_isa_name(uint32_t isa) {
     return s;
 }
 
+#ifndef STRATA_NET_NO_QWEN
+uint32_t net_isa_bits() {
+    using namespace strata::kernels::cpu;
+    return (cpu_avx512_ok() ? 1u : 0u) | (cpu_avx512bw_ok() ? 2u : 0u) | (cpu_avx2_ok() ? 4u : 0u) | ((uint32_t) cpu_isa_cap() << 8);
+}
+#endif
+
 const char* net_arch_name(uint32_t arch) { return arch == kArchQwen38 ? "qwen38" : arch == kArchDsv41 ? "dsv41" : "unknown"; }
 
 #ifndef STRATA_NET_NO_QWEN
@@ -353,7 +359,7 @@ NetIdentity net_identity(const std::vector<std::string>& files) {
     u64(seen.size());
     NetIdentity id;
     h.finish(id.fingerprint);
-    id.isa = (cpu_avx512_ok() ? 1u : 0u) | (cpu_avx512bw_ok() ? 2u : 0u) | (cpu_avx2_ok() ? 4u : 0u) | ((uint32_t) cpu_isa_cap() << 8);
+    id.isa = net_isa_bits();
     id.arch = kArchQwen38;
     id.n_embd = (uint32_t) kQwenH;
     return id;
@@ -437,6 +443,7 @@ bool NetExperts::open(const std::string& spec, int64_t n_layers, int64_t n_exper
     }
     if (routes_.empty()) { err = "--remote-experts is empty"; return false; }
     inflight_.assign(routes_.size(), InFlight());
+    { const char* sv = std::getenv("STRATA_NET_SERIAL"); serial_ = sv != nullptr && *sv == '1'; }   // BBXL S4: the before-arm of the measurement; off by default
     return true;
 }
 
@@ -552,6 +559,12 @@ bool NetExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_
         r.bytes_out += f.buf.size() + sizeof(Hdr);
         f.t_send = now_ms();
         f.active = true;
+        f.pre_done = false;
+        if (serial_) {   // (measurement only) wait for this host before asking the next one
+            f.pre_why = recv_resp(r, f.seq, (uint32_t) f.owned.size(), f.pre, f.pre_us);
+            f.pre_rtt = now_ms() - f.t_send;
+            f.pre_done = true;
+        }
         ++sent;
     }
     if (sent == 0) return true;
@@ -575,7 +588,9 @@ bool NetExperts::finish(float* out, std::string& err) {
         f.active = false;
         Route& r = routes_[ri];
         double server_us = 0;
-        const std::string why = recv_resp(r, f.seq, (uint32_t) f.owned.size(), resp_, server_us);
+        std::string why;
+        if (f.pre_done) { why = f.pre_why; server_us = f.pre_us; resp_.swap(f.pre); f.pre_done = false; }
+        else why = recv_resp(r, f.seq, (uint32_t) f.owned.size(), resp_, server_us);
         if (!why.empty()) {   // this host's rows are the caller's; the other hosts' answers are still read (their streams stay in step)
             err = why;
             mark_down(r, why);
@@ -587,7 +602,8 @@ bool NetExperts::finish(float* out, std::string& err) {
         const float* src = (const float*) (resp_.data() + 24);
         for (size_t q = 0; q < f.owned.size(); ++q)
             std::memcpy(out + (size_t) f.owned[q] * H_, src + q * (size_t) H_, (size_t) H_ * 4);
-        const double rtt = now_ms() - f.t_send;
+        const double rtt = f.pre_rtt > 0 ? f.pre_rtt : now_ms() - f.t_send;
+        f.pre_rtt = 0;
         r.rtt_ms += rtt; r.server_ms += server_us / 1000.0; ++r.calls; r.bytes_in += resp_.size() + sizeof(Hdr);
         if (rtt > r.rtt_max_ms) r.rtt_max_ms = rtt;
         if (r.backoff_ms != 0) r.backoff_ms = 0;   // a healthy call ends the outage's backoff
@@ -598,7 +614,7 @@ bool NetExperts::finish(float* out, std::string& err) {
 }
 
 bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64_t T, int64_t k, const uint8_t* mask,
-                        float* const* dst, std::string& err) {
+                        float* const* dst, std::string& err, int64_t max_tok) {
     if (cur_ >= 0) { err = "a decode request is in flight"; return false; }
     static const int depth = [] { const char* v = std::getenv("STRATA_NET_PIPELINE"); return v ? std::max(1, std::atoi(v)) : 4; }();
     struct Req { int64_t t0w, nt; uint64_t seq; uint32_t want; };
@@ -642,7 +658,7 @@ bool NetExperts::prompt(int64_t layer, const float* x, const int32_t* ids, int64
         const Route& r = routes_[ri];
         own[ri].assign((size_t) (T * k), 0);
         for (int64_t i = 0; i < T * k; ++i) own[ri][(size_t) i] = mask[i] && ids[i] >= r.elo && ids[i] <= r.ehi ? 1 : 0;
-        wins[ri] = np::prompt_windows(T, k, own[ri].data(), strata::kernels::kWindowMaxT);
+        wins[ri] = np::prompt_windows(T, k, own[ri].data(), max_tok > 0 ? max_tok : (int64_t) strata::kernels::kWindowMaxT);
         most = std::max(most, wins[ri].size());
     }
     for (size_t w = 0; w < most && !failed; ++w)
@@ -819,43 +835,6 @@ bool is_loopback(const sockaddr* a) {
     return false;
 }
 }  // namespace
-
-#ifndef STRATA_NET_NO_QWEN
-int serve_experts(ExpertDispatch& d, const ExpertServeCfg& cfg) {
-    // The server answers with the plain CPU pool.  A second GPU, helper GPUs, a resident plan or a net route would compute
-    // some rows on other arithmetic than the conductor's CPU kernels (and a net route would forward the request again).
-    // --expert-server-gpu (cfg.gpu) lets helper GPUs compute the experts they hold; they take only kind -1 entries, i.e. the
-    // asked-for ones (only_mask), and write into the same rows.
-    if (d.peer != nullptr || (d.remote_count != 0 && !cfg.gpu) || d.net != nullptr || d.plan != nullptr || d.host_res != nullptr) {
-        std::fprintf(stderr, "strata net: the expert server needs a CPU-only dispatch (no peer GPU, helper GPUs, resident plan or net route); "
-                             "helper GPUs only with --expert-server-gpu\n");
-        return 1;
-    }
-    if (cfg.gpu && d.remote_count > 0)
-        std::fprintf(stderr, "strata net: GPU expert server: %d helper GPU(s) compute the served experts they hold; their rows are the GPU "
-                             "kernels' (within kernel tolerance of the conductor's CPU rows, not bit-identical)\n", d.remote_count);
-    ExpertServeCfg c2 = cfg;
-    c2.identity.arch = kArchQwen38;
-    c2.identity.n_embd = (uint32_t) kQwenH;
-    const ExpertComputeFn compute = [&d](uint32_t layer, uint32_t n_tok, uint32_t k, int arith, const int32_t* ids, const uint8_t* mask,
-                                         const float* x, float* out, std::string& err) {
-        d.failed = false; d.fail = nullptr;   // a failure answers one request; it must not poison the next
-        d.layers = layer;
-        d.only_mask = mask;
-        strata::core::expert_pool_dispatch_multi(d, x, ids, n_tok, k, out,
-                                                  arith == 1 ? strata::kernels::cpu::NativeArithmetic::WindowInvariant
-                                                             : strata::kernels::cpu::NativeArithmetic::Default);
-        d.only_mask = nullptr;
-        if (d.failed) {
-            err = d.fail != nullptr ? d.fail : "?";
-            d.failed = false; d.fail = nullptr;
-            return false;
-        }
-        return true;
-    };
-    return serve_experts(c2, compute);
-}
-#endif
 
 int serve_experts(const ExpertServeCfg& cfg, const ExpertComputeFn& compute) {
     if (const std::string why = np::serve_cfg_problem(cfg.top_k, cfg.identity.fingerprint); !why.empty()) {
