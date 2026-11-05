@@ -9,17 +9,33 @@ against expert servers on localhost, and compares the 64 greedy tokens and the h
   4. a server that dies mid-run (STRATA_DS4_SERVER_DIE_AFTER): the conductor falls back to its own lane, same output
   4c. (BBXL S3) experts renumbered by popularity: the conductor calls ranks (STRATA_DS4_EXPERT_PERM), the slice is laid out by rank
   5. a conductor of the wrong engine family (qwen38) is refused at the handshake; so are a wrong token and another geometry
-Needs the built ds4_net_test and strata-dsv41-expert-server:   synthetic_split_test.py BUILD_DIR
+Needs the built ds4_net_test and strata-dsv41-expert-server:   synthetic_split_test.py [BUILD_DIR] [--tmp DIR]
+
+Scratch space: the packs (about 45 MB apparent at the peak, measured) never go to the system temp dir (/tmp is a shared, quota-limited
+tmpfs on the CI runner and was full of other jobs' leftovers: "Disk quota exceeded", CI runs #13-#16).  `--tmp DIR` (else $RUNNER_TEMP, else BUILD_DIR) is the parent; the test makes its own
+subdirectory there, points TMPDIR of every child at it and removes it on exit, a failure or SIGTERM included.  It refuses to start when that
+directory has less than NEED_GIB free (default 1, STRATA_TEST_NEED_GIB) or is a tmpfs/ramfs: a clear message instead of a mid-run write error.
+Servers are waited for by polling their port (30 s), not a fixed sleep; STRATA_TEST_SERVER_START_DELAY=SECONDS delays each server's start to
+prove it.
 """
+import argparse
+import atexit
 import os
 import re
+import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 
 here = os.path.dirname(os.path.abspath(__file__))
-build = sys.argv[1] if len(sys.argv) > 1 else "build-cpu"
+ap_ = argparse.ArgumentParser()
+ap_.add_argument("build", nargs="?", default="build-cpu")
+ap_.add_argument("--tmp", default=None, help="parent directory for the scratch packs (default $RUNNER_TEMP, else the build dir; never /tmp)")
+args_ = ap_.parse_args()
+build = args_.build
 exe = ".exe" if os.name == "nt" else ""
 test_bin = os.path.join(build, "ds4_net_test" + exe)
 srv_bin = os.path.join(build, "strata-dsv41-expert-server" + exe)
@@ -32,20 +48,82 @@ def check(name, ok, detail=""):
         fails.append(name)
 
 
+NEED_GIB = float(os.environ.get("STRATA_TEST_NEED_GIB", "1"))
+
+
+def fs_type(path):
+    """Filesystem type of the mount holding path (Linux /proc/mounts; "" when unknown)."""
+    best, typ = "", ""
+    try:
+        real = os.path.realpath(path)
+        for ln in open("/proc/mounts"):
+            f = ln.split()
+            mp = f[1].replace("\\040", " ")
+            if (real == mp or real.startswith(mp.rstrip("/") + "/")) and len(mp) >= len(best):
+                best, typ = mp, f[2]
+    except OSError:
+        pass
+    return typ
+
+
+def scratch_parent():
+    base = args_.tmp or os.environ.get("RUNNER_TEMP") or build
+    base = os.path.abspath(base)
+    os.makedirs(base, exist_ok=True)
+    free = shutil.disk_usage(base).free / 2 ** 30
+    typ = fs_type(base)
+    if typ in ("tmpfs", "ramfs"):
+        sys.exit("synthetic_split_test: scratch dir %s is on %s (RAM-backed, size/quota limited; the packs need up to %g GiB): "
+                 "pass --tmp DIR on a disk, e.g. under the workspace" % (base, typ, NEED_GIB))
+    if free < NEED_GIB:
+        sys.exit("synthetic_split_test: scratch dir %s has %.1f GiB free, the packs need %g GiB: pass --tmp DIR on a bigger disk" % (base, free, NEED_GIB))
+    return base
+
+
 def run(args, env=None, timeout=300):
     e = dict(os.environ)
     e.update(env or {})
     return subprocess.run([test_bin] + args, capture_output=True, text=True, env=e, timeout=timeout)
 
 
+_servers = []
+
+
+def _kill_servers():   # a failure or SIGTERM must not leave servers running on the pack that is being removed
+    for q in _servers:
+        if q.poll() is None:
+            q.kill()
+
+
+atexit.register(_kill_servers)
+
+
 def start(pack, port, layers, env=None, experts=None):
     e = dict(os.environ)
     e.update(env or {})
-    p = subprocess.Popen([srv_bin, "--pack", pack, "--listen", "127.0.0.1:%d" % port, "--serve-layers", layers, "--no-warm", "--cpu-threads", "2"]
+    cmd = [srv_bin]
+    delay = os.environ.get("STRATA_TEST_SERVER_START_DELAY")   # fault injection: the server binds late, as on a loaded runner
+    if delay:
+        cmd = [sys.executable, "-c", "import os,sys,time;time.sleep(float(sys.argv[1]));os.execv(sys.argv[2],sys.argv[2:])", delay, srv_bin]
+    p = subprocess.Popen(cmd + ["--pack", pack, "--listen", "127.0.0.1:%d" % port, "--serve-layers", layers, "--no-warm", "--cpu-threads", "2"]
                          + (["--serve-experts", experts] if experts else []),
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=e)
-    time.sleep(1.0)
+    _servers.append(p)
+    check("server on :%d is listening" % port, wait_port(p, port), "not listening after 30 s, or exited early")
     return p
+
+
+def wait_port(p, port, timeout=30.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if p.poll() is not None:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.05)
+    return False
 
 
 def stop(p):
@@ -68,7 +146,15 @@ def lines(r):
     return d
 
 
-with tempfile.TemporaryDirectory() as tmp:
+def _term(sig, frm):
+    raise SystemExit(128 + sig)   # unwinds the with-block below so the scratch dir is removed
+
+
+signal.signal(signal.SIGTERM, _term)
+parent = scratch_parent()
+with tempfile.TemporaryDirectory(prefix="synth-split-", dir=parent) as tmp:
+    os.environ["TMPDIR"] = tmp    # every child (make_synthetic_pack, the servers) stays under the same removable directory
+    tempfile.tempdir = None
     pack = os.path.join(tmp, "pack")
     pack3 = os.path.join(tmp, "pack3")
     subprocess.check_call([sys.executable, os.path.join(here, "make_synthetic_pack.py"), pack, "--seed", "1"], stdout=subprocess.DEVNULL)
