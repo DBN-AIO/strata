@@ -48,6 +48,15 @@ strata --pack PACK --native SHARD1.gguf --max-context 1024 --prefill auto --spec
 ```
 (`STRATA_EXPERT_TOKEN` set in the environment of both commands: see "Security".)
 
+Not sure which layers each host should take? `tools/remote_experts_plan.py` does the arithmetic and prints both
+commands (nothing is started): the conductor keeps the first layers, each server takes a block of the last layers that
+fits its RAM after a 15% headroom.
+
+```sh
+python tools/remote_experts_plan.py --shards MODEL-00001-of-0000N.gguf     --host rig=192.0.2.10:7840:24 --host t340=192.0.2.11:7840:48        # NAME=ADDRESS:PORT:RAM_GB
+python tools/remote_experts_plan.py --layers 48 --layer-gib 0.71 --host rig=192.0.2.10:7840:12   # without the files
+```
+
 Conductor (the normal command plus one flag):
 
 ```sh
