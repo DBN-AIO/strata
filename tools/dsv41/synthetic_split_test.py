@@ -394,6 +394,16 @@ with tempfile.TemporaryDirectory(prefix="synth-split-", dir=parent) as tmp:
     r = run(["--pack", pack3, "--mode", "remote", "--remote", "127.0.0.1:17845=0-7", "--expect-open-fail"], token)
     check("another expert count is refused", "OPEN_FAILED" in r.stdout, r.stdout)
     stop(e)
+    # 5b. a listener on a non-loopback address without a token is refused at start (it used to start and only print a warning)
+    env_nt = {k: v for k, v in os.environ.items() if k not in ("STRATA_EXPERT_TOKEN", "STRATA_EXPERT_ALLOW_NO_TOKEN")}
+    ob = subprocess.run([srv_bin, "--pack", pack, "--listen", "0.0.0.0:17899", "--serve-layers", "0-7", "--no-warm", "--cpu-threads", "2"],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env_nt, timeout=60)
+    check("a non-loopback listener without a token is refused", ob.returncode != 0 and "refusing to listen" in ob.stdout, ob.stdout[-300:])
+    # 5c. a conductor holding a token refuses a server that does not ask for one (downgrade: an impostor skips the challenge flag)
+    nt = start(pack, 17898, "0-7")
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17898=0-7", "--expect-open-fail"], token)
+    check("a conductor with a token refuses a server without one", "does not ask for a token" in r.stdout, r.stdout + r.stderr[-200:])
+    stop(nt)
 
     # 6. speculative decoding through the servers (a drafter, a verify window of k+1 tokens, the longest matching prefix kept)
     plain = run(["--pack", pack, "--mode", "local", "--causal", "--tokens", "64", "--prompt", "40", "--prompt-seed", "5"])

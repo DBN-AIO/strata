@@ -87,13 +87,14 @@ like an NFS export: **trusted LAN only, firewall port 7840 to the conductor's IP
 port 7840 proto tcp`), and never expose it to the internet.
 
 - **Bind address.** Loopback unless you write another address after `--listen`. A non-loopback bind prints a warning with
-  the address, and a second one when no token is set.
+  the address, and **is refused when no token is set** (`STRATA_EXPERT_ALLOW_NO_TOKEN=1` overrides it, for a closed test
+  network only).
 - **Shared secret.** Set `STRATA_EXPERT_TOKEN` (any string, 16+ random characters; never put it on a command line) in the
   environment of the server **and** the conductor. The server sends a random 32-byte nonce; the conductor answers in HELLO
   with `HMAC-SHA256(token, nonce || hello fields)`; the server compares in constant time and refuses with a generic
   "authentication failed". The token never crosses the wire and a recorded HELLO cannot be replayed (new nonce per
-  connection). A server with a token refuses a conductor without one, and the other way round the conductor warns that the
-  server does not ask. What the token does **not** do: encrypt the hidden states, or authenticate the frames after the
+  connection). A server with a token refuses a conductor without one, and the other way round the conductor refuses a server
+  that does not ask (an impostor would skip the challenge flag). What the token does **not** do: encrypt the hidden states, or authenticate the frames after the
   handshake. Anyone who can sniff or hijack the TCP stream can still read or alter it; use a trusted segment or a tunnel
   (`ssh -L`, WireGuard) for anything more.
 - **Requests are validated before anything runs.** Every expert id in `[0, n_expert)`, `k` equal to the model's top-k,
