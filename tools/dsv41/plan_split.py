@@ -3,12 +3,12 @@
 
 Reads the size of every layer's routed experts (from a pack's tensors.txt, or --uniform-gb for a set that is not on disk) and the
 hosts' budgets (RAM + VRAM usable for experts, free disk), gives each host a CONTIGUOUS range of layers in the order conductor,
-rig, T340, stream PC (the order of the conductor's own hops), and prints the `--remote-experts` line.  A host takes layers while
+rig, host-b, Windows host (the order of the conductor's own hops), and prints the `--remote-experts` line.  A host takes layers while
 both its memory and its disk budget last.  When the layers do not fit it says by how many GB and exits 3, so a launcher refuses the
 run instead of starting a model that pages from the SSD at every token.
 
   plan_split.py PACK                          # the fleet as inventoried 2026-11-03
-  plan_split.py PACK --drop stream            # stream mode: the stream PC's server is stopped, the others take its layers (or: shortfall)
+  plan_split.py PACK --drop stream            # stream mode: the Windows host's server is stopped, the others take its layers (or: shortfall)
   plan_split.py --uniform-gb 5.2022           # a 3 bit set (IQ3_XXS everywhere): 40 layers of 5.2 GB
   plan_split.py PACK --hosts fleet.json       # [{"name","addr","mem_gb","disk_gb","compute_ms","wire_ms"[,"vram_gb","gpu_ms"]}, ...] in hop order
 
@@ -46,11 +46,11 @@ import sys
 FLEET = [
     {"name": "gaming", "addr": None, "mem_gb": 87.0, "vram_gb": 35.0, "disk_gb": 1e9, "compute_ms": 2.5, "wire_ms": 0.0,
      "note": "conductor: 35 GB of VRAM for hot experts (48 - dense - KV) + 52 GB page cache; its layers are its own CPU lane / GPU"},
-    {"name": "rig", "addr": "192.168.1.130:7840", "mem_gb": 13.0, "disk_gb": 20.0, "compute_ms": 4.5, "wire_ms": 1.2,
+    {"name": "rig", "addr": "192.0.2.10:7840", "mem_gb": 13.0, "disk_gb": 20.0, "compute_ms": 4.5, "wire_ms": 1.2,
      "note": "32 GB RAM with the fleet's TabbyAPI cards loaded (15 GB free); 24 GB free disk"},
-    {"name": "t340", "addr": "192.168.1.133:7840", "mem_gb": 30.0, "disk_gb": 14.0, "compute_ms": 6.4, "wire_ms": 0.75,
-     "note": "64 GB RAM, AIO services use 22; 17 GB free disk (the binding limit)"},
-    {"name": "stream", "addr": "192.168.1.27:7840", "mem_gb": 48.0, "disk_gb": 24.0, "compute_ms": 2.9, "wire_ms": 0.9,
+    {"name": "host-b", "addr": "192.0.2.11:7840", "mem_gb": 30.0, "disk_gb": 14.0, "compute_ms": 6.4, "wire_ms": 0.75,
+     "note": "64 GB RAM, other services use 22; 17 GB free disk (the binding limit)"},
+    {"name": "stream", "addr": "192.0.2.12:7840", "mem_gb": 48.0, "disk_gb": 24.0, "compute_ms": 2.9, "wire_ms": 0.9,
      "note": "64 GB RAM, ~16 GB used by the stream; C: has 27 GB free (D: is failing); no VRAM until TabbyAPI's 11 GB are freed"},
 ]
 GPU_MS = 0.416       # one layer call (6 experts, 1 token) on a 3090, measured (S2)
@@ -60,7 +60,7 @@ SSD_MBPS = 3000.0    # NVMe sequential read, the cold-expert read speed of the c
 # ---------------------------------------------------------------------------------------------------- storage tiers (BBXL S6)
 # A host's "storage" lists its mounts: {"name", "kind": "tmpfs"|"nvme"|"sata"|"hdd"|"excluded", "free_gb", "reserve_gb" (kept free, default 0),
 # "path" (where the slice goes)}.  Tier order VRAM > RAM (tmpfs) > NVMe > SATA.  Experts go to tmpfs / NVMe only; SATA (and hdd) only with
-# --allow-sata and only for what NVMe cannot hold anywhere; "excluded" (the stream PC's failing D:) is never used.  A host with no "storage"
+# --allow-sata and only for what NVMe cannot hold anywhere; "excluded" (the Windows host's failing D:) is never used.  A host with no "storage"
 # keeps the old single number, disk_gb, taken as NVMe.
 KINDS = ("tmpfs", "nvme", "sata", "hdd", "excluded")
 FAST = ("tmpfs", "nvme")

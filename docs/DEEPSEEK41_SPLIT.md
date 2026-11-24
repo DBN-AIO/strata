@@ -1,22 +1,22 @@
 # DeepSeek-V4.1-Flash across several PCs (BigBrain-XL, "Strata strategy")
 
-Goal (Jack, 2026-11-03: "BigBrain 2.0 XL CAN spread them across the network using the Strata strategy"): run DeepSeek-V4.1-Flash with a bigger
-quantization than one PC holds (about 3 bit, about 210 GB of routed experts) by spreading the experts' layers over the gaming PC, the AI rig,
-the T340 and the stream PC. Branch `dsv41-remote-experts` (off `remote-experts`). The protocol and the cut point are the Qwen engine's;
+Goal (the operator, 2026-11-03: "BigBrain 2.0 XL CAN spread them across the network using the Strata strategy"): run DeepSeek-V4.1-Flash with a bigger
+quantization than one PC holds (about 3 bit, about 210 GB of routed experts) by spreading the experts' layers over the Linux workstation, the AI rig,
+the host-b and the Windows host. Branch `dsv41-remote-experts` (off `remote-experts`). The protocol and the cut point are the Qwen engine's;
 what is DeepSeek-specific is written down in docs/REMOTE_EXPERTS.md, "DeepSeek-V4.1-Flash". This file is placement, numbers and the record.
 
 ## Where things stand
 
 | | State |
 | --- | --- |
-| dsv41 expert server on Linux (`strata-dsv41-expert-server`, no CUDA; also `strata-dsv41 --expert-server`) | built and run: nobara (gcc 16), T340 (gcc, Xeon E-2234), rig (the T340 binary, i5-9400) |
-| dsv41 expert server on Windows (stream PC) | built with MSVC 14.51 (the capped CPU lane, 32 s) and run; rows bit-identical to the Linux conductor |
+| dsv41 expert server on Linux (`strata-dsv41-expert-server`, no CUDA; also `strata-dsv41 --expert-server`) | built and run: linux-workstation (gcc 16), host-b (gcc, Xeon E-2234), rig (the host-b binary, i5-9400) |
+| dsv41 expert server on Windows (Windows host) | built with MSVC 14.51 (the capped CPU lane, 32 s) and run; rows bit-identical to the Linux conductor |
 | CUDA `strata-dsv41` with `--remote-experts` / `--expert-server` | compiles and links (CUDA 13.2, sm_86, gcc 15); the server mode runs with `CUDA_VISIBLE_DEVICES=""`; **the conductor hook has not run end to end: no GPU was free** (GPU 0/1 belong to the other agent's 2.00 bpw run) |
 | synthetic DeepSeek-shaped model, local vs split, 64 tokens | passes (CI step, 15 checks) |
 | DSpark drafter with `--remote-experts` | **fixed in code, not run on real weights**: `--dspark auto` dropped the drafter in every split (the rule counted the whole pack's 132 GB of experts against the conductor's 35 GB of VRAM, `ds4_model.cu`, now `ds4_dspark_rule.hpp`); with remote experts auto now keeps it. A verify window of k + 1 tokens already went to the servers as one call per layer (`cpu_experts` -> `Remote::run`, up to `kMaxTok` = 16 tokens, one request per route); the synthetic split test proves that (wire calls == layer calls). Mechanism numbers below; the real-weights before / after is one command (below), waiting for free GPUs |
-| real weights, real split | **not run**: `/mnt/bulk/strata/models/deepseek41/RESULTS.md` did not exist when this was written (the 2.00 bpw set is on disk, 4 shards, sha256 ok). Tools are ready: `slice_stream.py`, `plan_split.py`, the server flags below |
-| GPU expert server for dsv41 (`--expert-server-gpu`, BBXL) | built and measured on the rig RTX 3090 (synthetic pack only): rows within 1.1e-3 of the CPU server's, 8-13x faster a call; **not run on the stream PC 5070 Ti** (no CUDA toolkit there yet, TODO-1276) and not run on real weights; see "GPU expert server" |
-| parallel remote calls, conductor work overlapped with the servers (BBXL S4) | done, measured on synthetic packs (T340 + rig): "Parallel remote calls (BBXL S4)"; the real engine has not run it |
+| real weights, real split | **not run**: `<mount>/strata/models/deepseek41/RESULTS.md` did not exist when this was written (the 2.00 bpw set is on disk, 4 shards, sha256 ok). Tools are ready: `slice_stream.py`, `plan_split.py`, the server flags below |
+| GPU expert server for dsv41 (`--expert-server-gpu`, BBXL) | built and measured on the rig RTX 3090 (synthetic pack only): rows within 1.1e-3 of the CPU server's, 8-13x faster a call; **not run on the Windows host 5070 Ti** (no CUDA toolkit there yet, a tracked to-do) and not run on real weights; see "GPU expert server" |
+| parallel remote calls, conductor work overlapped with the servers (BBXL S4) | done, measured on synthetic packs (host-b + rig): "Parallel remote calls (BBXL S4)"; the real engine has not run it |
 | prompt path through the servers (BBXL S5) | host side done and tested (`Remote::prompt`, 32-token windows, a conductor pack without the served layers passes the synthetic test); engine: opt-in `STRATA_DS4_NET_PREFILL=1` sends the prompt down the window path (compiled, not run). **Not done:** the chunked flow itself does not call `Remote::prompt` (needs a running engine). "The prompt through the servers (BBXL S5)" |
 | chunked prompt flow through the servers + the combined real-weights script (BBXL S7, stacked on S5) | host side done and tested (`Remote::owns`, `ds4_net_chunk.hpp`, synthetic steps 3l-3n); engine: `STRATA_DS4_NET_PREFILL=2` makes the chunked flow ask the servers for a served layer's experts (**compiled on the rig, not run**: no real weights); `tools/dsv41/bbxl_realweights_run.py` runs S1-S7 before/after arms in one command (dry-run and synthetic end to end tested, **not run on real weights**). "The chunked flow through the servers (BBXL S7)", "The combined real-weights run (BBXL S7)" |
 
@@ -25,39 +25,39 @@ what is DeepSeek-specific is written down in docs/REMOTE_EXPERTS.md, "DeepSeek-V
 Build (every host; `strata-dsv41-expert-server` and `ds4_net_test` need no CUDA):
 
 ```sh
-# Linux (T340: ~/tools/cmake-3.31.6-linux-x86_64/bin/cmake, g++ 15 or newer)
+# Linux (host-b: ~/tools/cmake-3.31.6-linux-x86_64/bin/cmake, g++ 15 or newer)
 cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF
 cmake --build build-cpu --target strata-dsv41-expert-server ds4_net_test -j8
 ```
 
 ```bat
-:: Windows (stream PC), through the capped CPU lane; MSVC 14.51 from Visual Studio Build Tools 2026, all on C:
-MSYS_NO_PATHCONV=1 C:\Python314\python.exe "D:/AIStuff/AIO/AIO/AI Projects/AIOrchestrator/tools/cpu_lane/win_job.py" --cwd C:\AIO-strata -- cmd /c C:\AIO-strata\build_dsv41_cpu.bat
+:: Windows (Windows host), through the capped CPU lane; MSVC 14.51 from Visual Studio Build Tools 2026, all on C:
+<cpu-cap-wrapper> --cwd <strata-dir> -- cmd /c <strata-dir>\build_dsv41_cpu.bat
 :: build_dsv41_cpu.bat: call ...\VC\Auxiliary\Build\vcvars64.bat ; cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF ;
 ::                      cmake --build build-cpu --target strata-dsv41-expert-server ds4_net_test -j 6
 ```
 
-**The CUDA build on the stream PC (RTX 5070 Ti, sm_120) once the toolkit is installed** (Jack's TODO: NVIDIA CUDA Toolkit 13.x, "Visual Studio
+**The CUDA build on the Windows host (RTX 5070 Ti, sm_120) once the toolkit is installed** (the operator's TODO: NVIDIA CUDA Toolkit 13.x, "Visual Studio
 integration" off). CMake finds it through `CUDA_PATH`, which the installer sets (`packaging\build_dsv41_windows.bat` now defaults
 `CUDA_ROOT` to it). CUDA 13.0-13.2 accept **Visual Studio 2022 only**; the PC has the 2026 Build Tools (MSVC 14.51), which CUDA accepts from
 13.3. So either install the 2022 Build Tools beside them or take CUDA 13.3+:
 
 ```bat
 set DSV41_ARCH=120-real
-set STRATA_GGML_DIR=C:\AIO-strata\build-cpu\_deps\strata_llamacpp-src
+set STRATA_GGML_DIR=<strata-dir>\build-cpu\_deps\strata_llamacpp-src
 :: CUDA 13.0-13.2 with VS 2022:   (default STRATA_VCVARS is the 2022 BuildTools vcvars64.bat)
 :: CUDA 13.3+ with VS 2026:       set STRATA_VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat
 set BUILD_JOBS=6
-MSYS_NO_PATHCONV=1 C:\Python314\python.exe "D:/AIStuff/AIO/AIO/AI Projects/AIOrchestrator/tools/cpu_lane/win_job.py" --cwd C:\AIO-strata -- cmd /c packaging\build_dsv41_windows.bat C:\AIO-strata\build-cuda
+<cpu-cap-wrapper> --cwd <strata-dir> -- cmd /c packaging\build_dsv41_windows.bat <strata-dir>\build-cuda
 ```
 
-Result `C:\AIO-strata\build-cuda\strata-dsv41.exe` (the build links `ws2_32` for the socket shim; `--expert-server` on it takes the same flags
+Result `<strata-dir>\build-cuda\strata-dsv41.exe` (the build links `ws2_32` for the socket shim; `--expert-server` on it takes the same flags
 and never calls CUDA). The equivalent direct CMake line is `-DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_DSV41=ON -DCMAKE_CUDA_ARCHITECTURES=120-real
 -DCMAKE_CUDA_COMPILER=%CUDA_PATH%/bin/nvcc.exe -DCUDAToolkit_ROOT=%CUDA_PATH%`. Not run (no toolkit); the CPU-only build and the Linux CUDA
 build (`-DCMAKE_CUDA_ARCHITECTURES=86-real`, gcc 15 as host compiler) are the evidence that the sources build.
 
-Start the stream PC's server outside the agent's job object: `powershell -File tools\stream_pc\start_dsv41_server.ps1 -Pack C:\AIO-strata-model\dsv41-pack -Layers 34-39 -Listen 0.0.0.0:7840`
-(the one-shot Task Scheduler pattern; token from `C:\AIO-strata-model\expert.token`; stop with the PID in `<log>.pid`). Port 7840 from .30 / .130 / .133 is open on the stream PC.
+Start the Windows host's server outside the agent's job object: `powershell -File tools\win_server\start_dsv41_server.ps1 -Layers 34-39` (paths and the listen address come from the untracked `tools\win_server\local.json`)
+(the one-shot Task Scheduler pattern; token from `<model-dir>\expert.token`; stop with the PID in `<log>.pid`). Port 7840 from .30 / .130 / .133 is open on the Windows host.
 
 Slices (a server needs only its layers' bytes): `python3 tools/dsv41/slice_stream.py emit PACK 34-39 | ssh HOST 'python3 slice_stream.py apply SLICE'`;
 for a split layer add the expert range (`emit PACK 20-23 0-191`). The slice has the real shard sizes (sparse), so the fingerprint is the conductor's.
@@ -72,25 +72,25 @@ the 2.00 bpw set mixes them: IQ1_M, IQ2_XXS / IQ1_M, IQ2_XS / IQ1_M, IQ2_XXS / I
 layer calls: one 6-token prompt window per layer, then single tokens). "Compute" is one layer-call: 6 experts (3 matrices of 5120 x 2304) for
 one token on the host's CPU, all threads. The weights are random: timing and bit identity, not quality.
 
-| Host | CPU | threads | compute a call | as server: round trip from the gaming PC | wire (round trip - compute) |
+| Host | CPU | threads | compute a call | as server: round trip from the Linux workstation | wire (round trip - compute) |
 | --- | --- | ---: | ---: | ---: | ---: |
-| gaming PC (nobara) | Ryzen 9 5950X | 16 | 1.9 ms (quiet), 3.0 ms (other agent running) | - | - |
-| stream PC (Windows) | Ryzen 9 5950X, beside the stream's services | 16 | 2.87 ms as a server; 3.74 ms inside the 70 % CPU lane | 3.75 ms | 0.88 ms |
-| AI rig | i5-9400 (6 cores, no AVX-512) | 6 | 4.36 ms local, 4.51 ms as a server | 6.44 ms **through an ssh tunnel** (the rig's ufw lets only the T340 reach 7840-7843; I did not change it) | 1.9 ms with the tunnel, about 1.2 ms direct (estimate) |
-| T340 | Xeon E-2234 (4 cores, 8 threads), AIO services running | 8 | 7.2 ms local, 6.44 ms as a server | 7.18 ms | 0.75 ms |
+| Linux workstation (linux-workstation) | 16-core Zen 3 CPU | 16 | 1.9 ms (quiet), 3.0 ms (other agent running) | - | - |
+| Windows host (Windows) | 16-core Zen 3 CPU, beside the stream's services | 16 | 2.87 ms as a server; 3.74 ms inside the 70 % CPU lane | 3.75 ms | 0.88 ms |
+| AI rig | i5-9400 (6 cores, no AVX-512) | 6 | 4.36 ms local, 4.51 ms as a server | 6.44 ms **through an ssh tunnel** (the rig's ufw lets only the host-b reach 7840-7843; I did not change it) | 1.9 ms with the tunnel, about 1.2 ms direct (estimate) |
+| host-b | 4-core Xeon (8 threads), other services running | 8 | 7.2 ms local, 6.44 ms as a server | 7.18 ms | 0.75 ms |
 
-Per call 21.6 KB out and 129.4 KB back (hidden 5120 fp32 x 1 token out, x 6 rows back). `ping`: T340 0.12 ms, rig 0.18 ms, stream PC 0.39 ms.
-An IQ3_XXS pack of the same shape costs 2.28 ms on the gaming PC against 1.91 ms for the 2.00 mix (+19 %).
+Per call 21.6 KB out and 129.4 KB back (hidden 5120 fp32 x 1 token out, x 6 rows back). `ping`: host-b 0.12 ms, rig 0.18 ms, Windows host 0.39 ms.
+An IQ3_XXS pack of the same shape costs 2.28 ms on the Linux workstation against 1.91 ms for the 2.00 mix (+19 %).
 
-**Bit identity.** The hash of every expert row received (64 tokens, 1656 rows of 5120 floats) is `e7f2d1b3164e44c1` for: the gaming PC's own lane
-(gcc 16, `-march=native`), the T340 (gcc, Coffee Lake class), the rig (the T340 binary), the Linux conductor with the **Windows (MSVC) server**,
-and the Linux conductor with the T340 and the rig (tunnel) as servers; thread counts 1 to 16 give the same hash. The CUDA engine binary's
+**Bit identity.** The hash of every expert row received (64 tokens, 1656 rows of 5120 floats) is `e7f2d1b3164e44c1` for: the Linux workstation's own lane
+(gcc 16, `-march=native`), the host-b (gcc, Coffee Lake class), the rig (the host-b binary), the Linux conductor with the **Windows (MSVC) server**,
+and the Linux conductor with the host-b and the rig (tunnel) as servers; thread counts 1 to 16 give the same hash. The CUDA engine binary's
 `--expert-server` returns the same rows as the CPU-only server (checked on the small synthetic pack).
 
 ### DSpark drafter through the servers (2026-11-03, synthetic)
 
 Program: `ds4_net_test --causal --spec K` on the same synthetic pack as above (hidden 5120, expert FFN 2304, top-6, 4 layers x 48 experts, 1.7 GB), one
-`strata-dsv41-expert-server` on loopback (T340, 8 threads, other AIO services running: load average 8-10, so the numbers are noisy; read the ratios).
+`strata-dsv41-expert-server` on loopback (host-b, 8 threads, other other services running: load average 8-10, so the numbers are noisy; read the ratios).
 The toy is causal (its memory is the previous token, so a window equals single steps), greedy; a round = a drafter proposes K tokens, ONE window of 1 + K
 tokens goes through every layer, the longest matching prefix and one token more are kept. Prompt 2048 or 16384 random tokens, a unique prefix per run (the
 toy has no attention, so the context length does not change the decode: it only costs prefill), 128 tokens, warm-up run first, decode phase only. **The
@@ -117,7 +117,7 @@ NEW = this PR; same plan line as "Placement"; `PACK` the dsv41 pack with the DSp
 separated token ids, e.g. `python3 -c "import random;random.seed(7);print(','.join(str(random.randrange(1000,100000)) for _ in range(2048)))"`):
 
 ```sh
-PLAN=192.168.1.130:7840=27-29,192.168.1.133:7840=30-33,192.168.1.27:7840=34-39   # servers up first, as in "Commands"
+PLAN=192.0.2.10:7840=27-29,192.0.2.11:7840=30-33,192.0.2.12:7840=34-39   # servers up first, as in "Commands"
 for IDS in ids_2k.txt ids_16k.txt; do
   # warm-up first: one short run (--n 16) of each binary, results dropped
   for MODE in "BASE auto" "NEW auto" "NEW none"; do set -- $MODE
@@ -140,38 +140,38 @@ What each host can give to experts (GB; the binding number is the smaller of mem
 
 | Host | RAM free for the page cache | VRAM free | Free disk | Used here |
 | --- | ---: | ---: | ---: | --- |
-| gaming PC (conductor) | 52 of 64 | about 35 of 48 (dense 6-8, KV and graphs 5) for the hottest experts of any layer | NVMe, plenty | 87 |
+| Linux workstation (conductor) | 52 of 64 | about 35 of 48 (dense 6-8, KV and graphs 5) for the hottest experts of any layer | NVMe, plenty | 87 |
 | AI rig | 13 (32 GB, 15 free while the fleet runs) | 0 (TabbyAPI holds 36 of 72 GB); 66 if unloaded, but no dsv41 GPU server yet | 24 | min(13, 20) |
-| T340 | 30 (64 GB, AIO services use 22) | none | **17** | min(30, 14) |
-| stream PC | 48 (64 GB, about 16 used by the stream) | 5 (TabbyAPI holds 11 of 16) | **27** on C: (D: is failing) | min(48, 24) |
+| host-b | 30 (64 GB, other services use 22) | none | **17** | min(30, 14) |
+| Windows host | 48 (64 GB, about 16 used by the stream) | 5 (TabbyAPI holds 11 of 16) | **27** on C: (D: is failing) | min(48, 24) |
 
 Today's plan (CPU servers only), layers in hop order, `plan_split.py` output:
 
 | 2.00 bpw (132.1 GB) | layers | GB | `--remote-experts` |
 | --- | --- | ---: | --- |
-| gaming PC (conductor) | 0-26 | 86.8 | (local) |
-| rig | 27-29 | 10.4 | `192.168.1.130:7840=27-29` |
-| T340 | 30-33 | 13.3 | `192.168.1.133:7840=30-33` |
-| stream PC | 34-39 | 21.6 | `192.168.1.27:7840=34-39` |
+| Linux workstation (conductor) | 0-26 | 86.8 | (local) |
+| rig | 27-29 | 10.4 | `192.0.2.10:7840=27-29` |
+| host-b | 30-33 | 13.3 | `192.0.2.11:7840=30-33` |
+| Windows host | 34-39 | 21.6 | `192.0.2.12:7840=34-39` |
 
-It fits with 0.2 GB to spare on the conductor, 2.6 GB on the rig, 0.7 GB on the T340, 2.4 GB on the stream PC. **Stream mode stops the stream PC's
+It fits with 0.2 GB to spare on the conductor, 2.6 GB on the rig, 0.7 GB on the host-b, 2.4 GB on the Windows host. **Stream mode stops the Windows host's
 server**: its six layers (21.6 GB) have no other host (`plan_split.py --drop stream` exits 3, "6 layers (21.6 GB) have no host"). The launcher must refuse the run, or accept
-the conductor reading those layers from its SSD (about 3.3 GB x 6 layers cold, a read of up to 119 MB per token); the conductor's route list without the stream PC
+the conductor reading those layers from its SSD (about 3.3 GB x 6 layers cold, a read of up to 119 MB per token); the conductor's route list without the Windows host
 runs as is, because a layer no route owns is the conductor's own lane.
 
 | ~3 bit, IQ3_XXS (208.1 GB) | layers | GB | |
 | --- | --- | ---: | --- |
-| gaming PC | 0-15 | 83.2 | |
+| Linux workstation | 0-15 | 83.2 | |
 | rig | 16-17 | 10.4 | RAM-limited |
-| T340 | 18-19 | 10.4 | disk-limited (3 layers need 15.6 GB, 17 are free) |
-| stream PC | 20-23 | 20.8 | disk-limited |
+| host-b | 18-19 | 10.4 | disk-limited (3 layers need 15.6 GB, 17 are free) |
+| Windows host | 20-23 | 20.8 | disk-limited |
 | **no host** | 24-39 | **83.2** | 16 layers |
 
 So **the ~3 bit set does not fit the fleet as it is today**: 83 GB short, and the limit is disk and free RAM, not VRAM (136 GB of VRAM sit mostly in
 the fleet's TabbyAPI cards, and dsv41 has no GPU expert server yet). What makes it fit (`plan_split.py --uniform-gb 5.2022 --hosts fleet.json`,
-rig as a GPU server with 66 GB VRAM and 80 GB of disk, T340 with 40 GB of disk): gaming 0-15 (83.2), rig 16-30 (78.0), T340 31-35 (26.0), stream 36-39 (20.8): all 40 layers,
-with 3.8 GB to spare on the conductor, 1 GB on the rig, 4 GB on the T340 and 3.2 GB on the stream PC; without the stream PC it is 20.8 GB short. Needs, in
-order: free disk on the rig (+60 GB) and the T340 (+25 GB) or a NAS mount, the dsv41 GPU expert server, and the rig's TabbyAPI unloaded for the run.
+rig as a GPU server with 66 GB VRAM and 80 GB of disk, host-b with 40 GB of disk): gaming 0-15 (83.2), rig 16-30 (78.0), host-b 31-35 (26.0), stream 36-39 (20.8): all 40 layers,
+with 3.8 GB to spare on the conductor, 1 GB on the rig, 4 GB on the host-b and 3.2 GB on the Windows host; without the Windows host it is 20.8 GB short. Needs, in
+order: free disk on the rig (+60 GB) and the host-b (+25 GB) or a NAS mount, the dsv41 GPU expert server, and the rig's TabbyAPI unloaded for the run.
 
 Expected speed (experts only, from the measured numbers; add the conductor's dense/attention time per token, which the single-GPU run in RESULTS.md will give):
 
@@ -245,7 +245,7 @@ and the hosts' compute. One thing is assumed: a remote GPU server places whole s
 Read it with care: most of the gain over layer-major is that the conductor keeps 66 % of the experts and the other hosts answer in parallel; the doc's 84 ms for a uniform
 expert split (above, not measured) is the fair "no popularity" comparison for the parallel part, and 41.7 ms is about half of it. These are estimates; the real prompt mix decides.
 
-**Toy, measured (T340, CPU only, loopback).** Real-shape synthetic pack (4 layers x 48 experts, 5120 x 2304, the 2.00 mix of types), a router with a hidden Zipf-like preference
+**Toy, measured (host-b, CPU only, loopback).** Real-shape synthetic pack (4 layers x 48 experts, 5120 x 2304, the 2.00 mix of types), a router with a hidden Zipf-like preference
 (`ds4_net_test --skew 0.3`: the top quarter of the experts take 51-64 % of the hits), counted with `ds4_net_test --count-out` (the engine's profile format), planned with
 `plan_split.py --popularity`, a slice laid out by rank, 128 greedy tokens, one warm-up run not counted, then five runs:
 
@@ -256,10 +256,10 @@ expert split (above, not measured) is the fair "no popularity" comparison for th
 
 The wire work drops by 58 % and the output is bit-identical; the wall time does not move because on ONE 4-core box the "remote" server competes with the conductor for the same
 cores, so there is no parallelism to win. The time gain needs separate hosts: the estimate for this toy's two-host fleet is 8.4 ms against 10.2 ms. (The unique-prefix 2k / 16k
-prompts of the order need the real engine: not run.) Commands: `~/max2work/s3_toy.sh`, `s3_toy2.sh` on the T340 (not committed: they hold local paths).
+prompts of the order need the real engine: not run.) Commands: `~/max2work/s3_toy.sh`, `s3_toy2.sh` on the host-b (not committed: they hold local paths).
 
 **Not done / needs a go.** (1) The real prompt-mix count (needs the real weights loaded). (2) The engine's own conductor-side VRAM / RAM choice is already popularity-driven by
-its `--expert-profile`; pass the same counts there. (3) The CUDA `strata-dsv41` binary was not built here (no CUDA on the T340): the conductor change is in `ds4_net.cpp`, which
+its `--expert-profile`; pass the same counts there. (3) The CUDA `strata-dsv41` binary was not built here (no CUDA on the host-b): the conductor change is in `ds4_net.cpp`, which
 the CPU build compiles and `ds4_net_test` exercises, and the engine reaches it unchanged through `net::Remote::run`. (4) A GPU expert server that places the hottest RANKS in VRAM
 (not whole layers) would make the remote GPU tier worth more than this estimate says.
 
@@ -298,14 +298,14 @@ hook: 7 failures); on this branch all pass (0 failures, whole script). The timin
 | the same with `--overlap` | the longer of the two, 8 x 30 = 240 ms | 240 ms |
 | `--overlap` and the server dies after 40 requests | identical tokens and rows through the local fallback | identical, remote and local rows both used |
 
-**Measured on real shapes (T340 conductor, the T340's server on loopback and the rig's over an ssh tunnel; CPU kernels).** Pack: 4 layers x 32 experts, hidden 5120, ffn 2304,
+**Measured on real shapes (host-b conductor, the host-b's server on loopback and the rig's over an ssh tunnel; CPU kernels).** Pack: 4 layers x 32 experts, hidden 5120, ffn 2304,
 the 2.00 mix of types (`make_synthetic_pack.py --fast`), 64 greedy tokens, one warm-up run not counted, then five runs each with its own prompt (`--prompt-salt` 1-5, so no
-two runs share a prefix). Expert rows are the local run's in every run (row hash equal for all five prompts). `ms/token` is the decode time; the T340's server and conductor
+two runs share a prefix). Expert rows are the local run's in every run (row hash equal for all five prompts). `ms/token` is the decode time; the host-b's server and conductor
 share its cores, so only the two-host arms show a gain that is not an artifact of one box.
 
 | Arm | ms/token, 5 runs | median |
 | --- | --- | ---: |
-| two remote hosts (T340 0-15, rig 16-31), one after the other (`STRATA_NET_SERIAL=1`, before) | 54.2 / 58.1 / 64.6 / 66.0 / 73.0 | 64.6 |
+| two remote hosts (host-b 0-15, rig 16-31), one after the other (`STRATA_NET_SERIAL=1`, before) | 54.2 / 58.1 / 64.6 / 66.0 / 73.0 | 64.6 |
 | the same, asked at the same time (S4 / B5) | 24.3 / 24.9 / 31.0 / 31.9 / 32.6 | 31.0 |
 | rig 16-31 + the conductor's own 0-15, ask then compute (before) | 65.5 / 73.4 / 74.5 / 76.4 / 82.7 | 74.5 |
 | the same, the conductor computes while the rig answers (`--overlap`, S4) | 29.6 / 29.7 / 30.6 / 34.2 / 34.5 | 30.6 |
@@ -340,7 +340,7 @@ disk". `pick_path` chooses the flow from the prompt's length alone (`pick_flow_m
 round trip). The hook is where the flow turns a chunk's picks for a SERVED layer into stream items (`flow_spec` / `flow_pump`, `run_dev_layers`): copy the chunk's FFN input and the
 routed ids to the host, `Remote::prompt` in slabs, weight and sum the rows exactly as the local path's combine does, copy the partial sums back in stream order, and skip the layer's
 streams and expert kernels. It is a change inside the async multi-stream GPU pipeline of `ds4_model.cu`; it needs a running engine with weights (the synthetic packs have no dense
-part, the T340 has no CUDA), so it was not attempted blind. `Remote::prompt` is the whole host side of it and is tested.
+part, the host-b has no CUDA), so it was not attempted blind. `Remote::prompt` is the whole host side of it and is tested.
 
 **Tests (CI: `tools/dsv41/synthetic_split_test.py`, steps 3f-3j; failing first).** Against the base binaries every one fails (`unknown option --prompt-path`, `--slab`: 9 of the 17
 failures that run reports; the other 8 are S4's checks); on this branch the whole script passes. `ds4_net_test --prompt-path` drives a prompt of any length through the layers in slabs
@@ -355,7 +355,7 @@ over every expert row:
 | experts split over two servers, windows of 32 and of 16 (`STRATA_DS4_PROMPT_WIN`) | identical in both: a row does not depend on its window |
 | a server dies in the middle of the prompt (`STRATA_DS4_SERVER_DIE_AFTER=12`) | identical through the local fallback |
 
-**Measured: prefill tok/s at 2k and 16k tokens (synthetic, CPU kernels).** T340 conductor; the servers are the T340's own (loopback, experts 0-15, 4 threads) and the rig's (ssh tunnel,
+**Measured: prefill tok/s at 2k and 16k tokens (synthetic, CPU kernels).** host-b conductor; the servers are the host-b's own (loopback, experts 0-15, 4 threads) and the rig's (ssh tunnel,
 experts 16-31, 5 threads). Pack: 2 layers x 32 experts, hidden 5120, ffn 512 (the real wire shape with cheap compute, so 16k tokens finish in a minute; the real ffn is 2304). Prompts in slabs
 of 512 tokens, a 512-token warm-up (its own prefix) before each arm, then every timed run with its own prompt (`--prompt-salt`: unique prefix). The row hash of the 2k prompt is
 `f7e72e76f25e1b50` for both the local arm and the servers (hash off in the timed runs). "Local" is this box's CPU doing the experts (the stand-in for the conductor's own copy; the
@@ -388,15 +388,15 @@ The exit log prints, per server, `prompt path: N windows, N rows, ... ms (server
 ## Storage tiers: experts on NVMe, never SATA (BBXL S6)
 
 Captain 1's order (2026-11-03): every expert slice and conductor spill goes on NVMe, never SATA; `plan_split.py` takes a per-host storage tier (VRAM > RAM > NVMe > SATA)
-and refuses SATA for experts when NVMe room exists; prefill reads from NVMe too. Survey of 2026-11-03 (gaming PC and stream PC from the order, the rig and the T340 read
+and refuses SATA for experts when NVMe room exists; prefill reads from NVMe too. Survey of 2026-11-03 (Linux workstation and Windows host from the order, the rig and the host-b read
 only by this session with `lsblk` / `df` / `findmnt`; nothing was changed or deleted):
 
 | Host | NVMe / RAM for experts | SATA (never for experts) | Note |
 | --- | --- | --- | --- |
-| gaming PC | 3 NVMe mounts: `Games` 30 GB free (after Flash-Next), `/mnt/ai` 38, `/mnt/ai_models` 36 = **104 GB** | `/mnt/bulk` (860 EVO, 550 MB/s; where the 2.00 set sits today) | RAM floor 12 GB free: 35 GB VRAM + 52 GB page cache of 64 leaves 12 |
-| rig | WD Green SN3000 1 TB `/mnt/models`: **41 GB free** (96 % used) | `/` and `/home` are LVM on a PNY 500 GB **SATA** SSD: **`/var/tmp` is on that SATA disk, so today's slice there is on SATA**; 17 GB free | RAM floor 10 GB free (15 free with the fleet loaded). A stale NFS mount to the gaming PC (`/mnt/gaming_bulk_models`) makes a bare `df -h` hang: ask for the paths |
-| T340 | none: RAM (tmpfs `/dev/shm`) only. 29 GB available, floor 16 GB free, so **13 GB** | `/` WD spinning disk behind the PERC, 11 GB free (98 %) | no NVMe, loads no AI models |
-| stream PC | `C:` 500 GB NVMe, 16 GB free, floor 15 GB free: **1 GB usable** (a new SSD is coming) | `D:` SATA and failing: **excluded, never used** | RAM 64 GB, about 16 used by the stream |
+| Linux workstation | 3 NVMe mounts: `Games` 30 GB free (after Flash-Next), `<mount>` 38, `<mount>` 36 = **104 GB** | `<mount>` (860 EVO, 550 MB/s; where the 2.00 set sits today) | RAM floor 12 GB free: 35 GB VRAM + 52 GB page cache of 64 leaves 12 |
+| rig | 1 TB NVMe `<mount>`: **41 GB free** (96 % used) | `/` and `/home` are LVM on a 500 GB **SATA** SSD: **`/var/tmp` is on that SATA disk, so today's slice there is on SATA**; 17 GB free | RAM floor 10 GB free (15 free with the fleet loaded). A stale NFS mount to the Linux workstation (`<mount>`) makes a bare `df -h` hang: ask for the paths |
+| host-b | none: RAM (tmpfs `/dev/shm`) only. 29 GB available, floor 16 GB free, so **13 GB** | `/` WD spinning disk behind the PERC, 11 GB free (98 %) | no NVMe, loads no AI models |
+| Windows host | `C:` 500 GB NVMe, 16 GB free, floor 15 GB free: **1 GB usable** (a new SSD is coming) | `D:` SATA and failing: **excluded, never used** | RAM 64 GB, about 16 used by the stream |
 
 **The schema.** A host in the `--hosts` JSON gets `"storage": [{"name", "kind": "tmpfs" | "nvme" | "sata" | "hdd" | "excluded", "free_gb", "reserve_gb", "path"}, ...]`;
 `tools/dsv41/fleet.json` is the survey above in this form (hop order, the same memory, VRAM and per-call numbers as the built-in fleet, which is unchanged: a host without
@@ -409,9 +409,9 @@ only by this session with `lsblk` / `df` / `findmnt`; nothing was changed or del
 - SATA (and hdd) holds experts only with `--allow-sata`, and only when the tmpfs / NVMe of ALL hosts together cannot hold the set; then only the tail that did not fit (layer-major:
   the SATA disk of the host that holds the layers before it; popularity: after every NVMe tier, remote hosts only) and every such slice is printed `LAST RESORT: SATA`. If NVMe room
   exists but whole layers or expert ranges do not fit it, the run is refused and says so (use `--popularity` or more `--groups`), not rescued with SATA.
-- An `excluded` mount (the stream PC's `D:`) is never used, with or without the flag.
+- An `excluded` mount (the Windows host's `D:`) is never used, with or without the flag.
 - A refused run says how much SATA is on the hosts and that it was not used. A bad storage entry (unknown kind, negative size, no name) is refused with exit 2.
-- Output (`--json`: `storage.targets`, `storage.sata_used_gb`): `slice rig -> /mnt/models (nvme) /mnt/models/strata/dsv41  layers 0-39/E254-290  12.7 GB`. That path is the
+- Output (`--json`: `storage.targets`, `storage.sata_used_gb`): `slice rig -> <mount> (nvme) <mount>/strata/dsv41  layers 0-39/E254-290  12.7 GB`. That path is the
   `slice_stream.py apply` target. A host with two mounts gets one `apply` and one server per mount (`--serve-layers` of that line).
 
 **Prefill and the conductor's spill.** The conductor needs its own experts on disk (the layers it computes, and the cold tail with `--allow-ssd`) and the dense and Engram files. They
@@ -424,29 +424,29 @@ hop order of the layer-major plan; a host with no NVMe keeps its tmpfs as the li
 
 | Host | experts it holds | NVMe / tmpfs room | fits | free to hold its share | + conductor spill (dense 6.2 + Engram 111) |
 | --- | ---: | ---: | --- | ---: | ---: |
-| gaming PC | 85.8 GB | 104.0 | yes, 18 GB spare | 0 | 99.0 GB more, or 145.3 GB more with `--conductor-copy all` (the whole 132.07 GB set on the conductor) |
+| Linux workstation | 85.8 GB | 104.0 | yes, 18 GB spare | 0 | 99.0 GB more, or 145.3 GB more with `--conductor-copy all` (the whole 132.07 GB set on the conductor) |
 | rig | 9.9 | 41.0 | yes | 0 | - |
-| T340 | 9.9 | 13.0 (tmpfs) | yes | 0 | - |
-| stream PC | 26.4 | 1.0 | **no** | **25.4 GB on `C:`** (or the new SSD) | - |
-| fleet | 132.1 | 159.0 | 106.7 GB of the set fits on NVMe / tmpfs as the disks are; **132.1 once 25.4 GB are freed on the stream PC** | 25.4 | 99.0 (gaming PC) |
+| host-b | 9.9 | 13.0 (tmpfs) | yes | 0 | - |
+| Windows host | 26.4 | 1.0 | **no** | **25.4 GB on `C:`** (or the new SSD) | - |
+| fleet | 132.1 | 159.0 | 106.7 GB of the set fits on NVMe / tmpfs as the disks are; **132.1 once 25.4 GB are freed on the Windows host** | 25.4 | 99.0 (Linux workstation) |
 
 Read off the table: today's plan with the survey's disks **refuses** (8 layers, 26.4 GB, have no host: `plan_split.py --uniform-gb 3.30175 --hosts tools/dsv41/fleet.json`, exit 3), and the
-conductor's spill (dense + Engram = 117.2 GB) is the larger problem: it does not fit the gaming PC's 104 GB of NVMe beside 85.8 GB of experts. With the popularity plan (`--popularity`) the stream
-PC's fast CPU draws 45.4 GB instead of 26.4 (free 44.4 GB there) and the rig and T340 draw nothing; give the stream PC a `reserve`/cap if it should not be the big host. The conductor's NVMe
-needs `max(0, 85.8 + 117.2 - 104.0) = 99.0 GB` for experts plus spill. The rig needs nothing freed and should serve from `/mnt/models`, not `/var/tmp`.
-RAM floors (gaming 12, T340 16, rig 10 GB free): the planner's memory numbers are page cache, which the kernel gives back; the rig's 13 GB leaves only 2 of the 15 free GB if those pages were
+conductor's spill (dense + Engram = 117.2 GB) is the larger problem: it does not fit the Linux workstation's 104 GB of NVMe beside 85.8 GB of experts. With the popularity plan (`--popularity`) the stream
+PC's fast CPU draws 45.4 GB instead of 26.4 (free 44.4 GB there) and the rig and host-b draw nothing; give the Windows host a `reserve`/cap if it should not be the big host. The conductor's NVMe
+needs `max(0, 85.8 + 117.2 - 104.0) = 99.0 GB` for experts plus spill. The rig needs nothing freed and should serve from `<mount>`, not `/var/tmp`.
+RAM floors (gaming 12, host-b 16, rig 10 GB free): the planner's memory numbers are page cache, which the kernel gives back; the rig's 13 GB leaves only 2 of the 15 free GB if those pages were
 pinned, so do not `mlock` them.
 
-**Cleanup candidates (text only, proposals for the cleanup list; nothing was posted or deleted).** I could read only the rig and the T340:
+**Cleanup candidates (text only, proposals for the cleanup list; nothing was posted or deleted).** I could read only the rig and the host-b:
 
 | Host / path | Size | Why a candidate | Verdict |
 | --- | ---: | --- | --- |
-| stream PC `C:` | need 25.4 GB | the slice's room | not surveyed (I did not touch that PC); a `C:` survey or the new SSD |
-| gaming PC `/mnt/ai`, `/mnt/ai_models`, `Games` | need 99.0 GB for the spill (or 145.3 with the whole set) | the conductor's NVMe | not surveyed; or leave the Engram off the NVMe and say so |
-| rig `/mnt/models/comfyui` | 499 GB (unet 188, diffusion_models 107, clip 62, text_encoders 58, checkpoints 44) | the rig does not need room for this set; only if the rig is to hold more than 13 GB | needs the owner's call |
-| rig `/mnt/models/tabbyapi` | 161 GB (`gpt-oss-120b-4.0bpw-exl3` 36, two `Qwen3.8-27B` 4.0 / 5.0 bpw builds with DFlash variants 19 + 16 + 16, `qwen14b_5bpw` 10) | duplicates of one model at several bit widths | needs the owner's call |
-| rig `/mnt/models/{bb_models 61, hf_train 23, muse-glimmer 19, qwen38-uncensored 24}` | 127 GB | BigBrain's Devstral-2-123B (the engine's own models: keep), a training merge, a 30B GGUF | needs the owner's call |
-| rig `/mnt/models/swapfile-ai` | 30 GB | active swap (21.9 GB in use): not a candidate | keep |
+| Windows host `C:` | need 25.4 GB | the slice's room | not surveyed (I did not touch that PC); a `C:` survey or the new SSD |
+| Linux workstation `<mount>`, `<mount>`, `Games` | need 99.0 GB for the spill (or 145.3 with the whole set) | the conductor's NVMe | not surveyed; or leave the Engram off the NVMe and say so |
+| rig `<mount>/comfyui` | 499 GB (unet 188, diffusion_models 107, clip 62, text_encoders 58, checkpoints 44) | the rig does not need room for this set; only if the rig is to hold more than 13 GB | needs the owner's call |
+| rig `<mount>/tabbyapi` | 161 GB (`gpt-oss-120b-4.0bpw-exl3` 36, two `Qwen3.8-27B` 4.0 / 5.0 bpw builds with DFlash variants 19 + 16 + 16, `qwen14b_5bpw` 10) | duplicates of one model at several bit widths | needs the owner's call |
+| rig `<mount>/{bb_models 61, hf_train 23, muse-glimmer 19, qwen38-uncensored 24}` | 127 GB | BigBrain's Devstral-2-123B (the engine's own models: keep), a training merge, a 30B GGUF | needs the owner's call |
+| rig `<mount>/swapfile-ai` | 30 GB | active swap (21.9 GB in use): not a candidate | keep |
 
 ## GPU expert server (`--expert-server-gpu`, BBXL)
 
@@ -477,7 +477,7 @@ token 5, deterministically: the same GPU server twice gives the same hash).
 
 ### Measured (2026-11-03, synthetic pack of the real shape, no real weights)
 
-Rig, RTX 3090 (sm_86, CUDA 12.4, gcc 13) pinned by UUID, TabbyAPI's 1.9 GB on it idle; CPU server = the T340 binary on the rig's i5-9400, 6 threads.
+Rig, RTX 3090 (sm_86, CUDA 12.4, gcc 13) pinned by UUID, TabbyAPI's 1.9 GB on it idle; CPU server = the host-b binary on the rig's i5-9400, 6 threads.
 Pack: hidden 5120, FFN 2304, top-6, 4 layers x 48 experts (IQ1_M, IQ2_XXS / IQ1_M, IQ2_XS / IQ1_M, IQ2_XXS / IQ2_XS), 1.58 GiB in VRAM
 (upload 2.2 s warm, 19 s cold). A layer call, 200 calls a window size after 20 warm-up, fresh random picks and layer every call (`ds4_gpu_rows_test --bench 200`):
 
@@ -489,7 +489,7 @@ Pack: hidden 5120, FFN 2304, top-6, 4 layers x 48 experts (IQ1_M, IQ2_XXS / IQ1_
 | 8 | 21.170 | 2.153 | 9.8x | 5.15 | 6.58 |
 | 16 | 34.932 | 4.276 | 8.2x | 8.49 | 13.07 |
 
-**The K=4 verify window costs 3.5x one token on the GPU server and 3.0x on this rig's CPU (S1 measured 4.8x on the T340): the GPU is not flat in the window.**
+**The K=4 verify window costs 3.5x one token on the GPU server and 3.0x on this rig's CPU (S1 measured 4.8x on the host-b): the GPU is not flat in the window.**
 Distinct experts are read once, but a window of 4 touches about 20 experts against 6 for one token, and a 3090 reading 8.6 MB experts is
 memory bound, so compute grows with the distinct experts. What changes is its size next to the round trip: the server's own mean compute a call over the 64-token run was
 0.416 ms (GPU) against 4.516 ms (CPU). With a fixed 1 ms of wire and protocol a call (an estimate from the decode below, loopback), a K=4 window costs about 1.7x one token on the
@@ -501,10 +501,10 @@ Conductor's split test (`ds4_net_test --mode remote`, 64 greedy tokens: 63 singl
 | --- | --- | ---: | ---: |
 | CPU (rig) | on the rig, loopback | 20.5 | 48.9 |
 | GPU (rig 3090) | on the rig, loopback | 4.8 | 207 |
-| CPU (rig) | T340 through an ssh tunnel (the rig's ufw does not admit the T340 on 7841-7842 directly; left as it is) | 27.4 | 36.6 |
-| GPU (rig 3090) | T340 through an ssh tunnel | 14.0 | 71.5 |
+| CPU (rig) | host-b through an ssh tunnel (the rig's ufw does not admit the host-b on 7841-7842 directly; left as it is) | 27.4 | 36.6 |
+| GPU (rig 3090) | host-b through an ssh tunnel | 14.0 | 71.5 |
 
-CPU-server rows hash `e7f2d1b3164e44c1` as in the table above; the GPU server's is `145113bd71350179` every run. The tunnel adds about 2.2 ms a call, and the T340 runs the toy's dense part slower than the rig.
+CPU-server rows hash `e7f2d1b3164e44c1` as in the table above; the GPU server's is `145113bd71350179` every run. The tunnel adds about 2.2 ms a call, and the host-b runs the toy's dense part slower than the rig.
 Not done: the 2k / 16k prompts with unique prefixes. An expert server's cost does not depend on the context length (attention is the conductor's), and the prompt path
 through the servers (Next, item 3) and the real weights are not there, so no such run exists; the numbers above are per layer call and per toy token.
 
@@ -521,11 +521,11 @@ CUDA_VISIBLE_DEVICES=<card uuid> build/ds4_gpu_rows_test --pack SYNTHETIC_PACK [
 ```
 
 The rig has six cards, pinned by UUID (`add_a_3060.md`): the 3090 (24 GB) holds seven 3.3 GB layers, each 3060 (12 GB) about three. The three 3060s and the 5070 hold
-TabbyAPI models today, so a real run needs them unloaded, as the Placement table says. **Stream PC (RTX 5070 Ti, sm_120):** the same two targets with
-`-DCMAKE_CUDA_ARCHITECTURES=120-real` and CUDA 13.x (the build section above, TODO-1276); `strata-dsv41-expert-server-gpu.exe` takes the same flags, and
-`--gpu-vram-gb 5` fits what the Placement table says is free beside TabbyAPI. Not built or run there (no toolkit; the stream PC is not touched from this work). Plan, Jack-only steps and scripts: "Blackwell (sm_120) builds" below.
+TabbyAPI models today, so a real run needs them unloaded, as the Placement table says. **Windows host (RTX 5070 Ti, sm_120):** the same two targets with
+`-DCMAKE_CUDA_ARCHITECTURES=120-real` and CUDA 13.x (the build section above, a tracked to-do); `strata-dsv41-expert-server-gpu.exe` takes the same flags, and
+`--gpu-vram-gb 5` fits what the Placement table says is free beside TabbyAPI. Not built or run there (no toolkit; the Windows host is not touched from this work). Plan, operator-only steps and scripts: "Blackwell (sm_120) builds" below.
 
-## Blackwell (sm_120) builds: the stream PC's 5070 Ti and the rig's 5070 (BBXL)
+## Blackwell (sm_120) builds: the Windows host's 5070 Ti and the rig's 5070 (BBXL)
 
 Both cards are Blackwell (sm_120, compute capability 12.0). sm_120 needs **nvcc 12.8 or newer**; CMake and the two build scripts now refuse an older
 nvcc with the install step instead of failing inside nvcc (`cmake/strata_cuda_arch_check.cmake`, `tools/dsv41/cuda_arch_check.py`; the same table, both
@@ -535,57 +535,57 @@ The architecture is the standard `-DCMAKE_CUDA_ARCHITECTURES` (a dsv41 build wit
 (3090 / 3060 and 5070 in one binary). Kernel code is not arch-gated beyond `__CUDA_ARCH__ >= 700` (ds4_gguf.cu, ds4_kernels.cu, ds4_pcie.cuh), so no
 source change is needed for sm_120; `ds4_iq.cu` has no arch guard.
 
-| | Rig (Ubuntu, 6 GPUs) | Stream PC (Windows, one NVIDIA card) |
+| | Rig (Ubuntu, 6 GPUs) | Windows host (Windows, one NVIDIA card) |
 | --- | --- | --- |
 | Card | RTX 5070 12 GB, TabbyAPI :5000 holds 8.7 GB of it now | RTX 5070 Ti 16 GB, TabbyAPI `LOCAL` :5000 (9B; the doc's Placement table: 11 of 16 GB held) |
 | Driver today | 610.57.04, CUDA UMD **13.3**: new enough for any 12.8-13.3 toolkit, **no driver change** | not read from here (the PC is not touched); 13.x needs a driver that reports CUDA 13.0+ |
-| Toolkit today | Ubuntu `nvidia-cuda-toolkit` 12.4.131 at `/usr/bin/nvcc` (the S2 build used it, `CMAKE_CUDA_HOST_COMPILER=g++-13`, `86-real`); `/usr/local/cuda` is a dangling link | none (TODO-1276) |
-| Disk | `/home` 6.6 GB free (99%): never; `/mnt/models` (NVMe) 38 GB free: fits a toolkit (about 6-7 GB) and a build dir (about 3 GB) | C: 27 GB free before the install (floor 15 GB); D: is failing, never used |
+| Toolkit today | Ubuntu `nvidia-cuda-toolkit` 12.4.131 at `/usr/bin/nvcc` (the S2 build used it, `CMAKE_CUDA_HOST_COMPILER=g++-13`, `86-real`); `/usr/local/cuda` is a dangling link | none (a tracked to-do) |
+| Disk | `/home` 6.6 GB free (99%): never; `<mount>` (NVMe) 38 GB free: fits a toolkit (about 6-7 GB) and a build dir (about 3 GB) | C: 27 GB free before the install (floor 15 GB); D: is failing, never used |
 | Script | `tools/dsv41/build_gpu_server_linux.sh` | `tools\dsv41\build_gpu_server_windows.ps1` |
 
-**Jack-only steps** (nothing here installs anything):
+**operator-only steps** (nothing here installs anything):
 
-1. **Stream PC (TODO-1276).** Install the NVIDIA CUDA Toolkit **13.0 or newer** (13.0.x / 13.1.x / 13.2.2+; not 13.2.0 / 13.2.1) from NVIDIA's installer, Custom
+1. **Windows host (a tracked to-do).** Install the NVIDIA CUDA Toolkit **13.0 or newer** (13.0.x / 13.1.x / 13.2.2+; not 13.2.0 / 13.2.1) from NVIDIA's installer, Custom
    install: CUDA Toolkit components (Compiler, Runtime, cuBLAS, Development), Visual Studio integration **off**, driver component **off** (keep the PC's driver),
    installed on C:. The installer sets `CUDA_PATH`, which the scripts read. With CUDA 13.0-13.2 also install the **Visual Studio 2022 Build Tools** (C++ workload)
    beside the 2026 ones; CUDA 13.3+ accepts the 2026 Build Tools the PC already has (the script picks the right `vcvars64.bat`; `STRATA_VCVARS` overrides).
 2. **Rig, only to serve layers from the 5070** (the 3090 and the 3060s already work with the 12.4 toolkit, `ARCH=86-real`): a toolkit that fits beside the system one, user-local,
-   so the driver and `/usr/bin/nvcc` stay as they are: download `cuda_13.0.2_*_linux.run` (about 4 GB) to `/mnt/models/cuda-dl/` and run
-   `sh cuda_13.0.2_*_linux.run --silent --toolkit --toolkitpath=/mnt/models/cuda-13.0 --no-opengl-libs --no-man-page` as the normal user (no `sudo`, no `--driver`;
-   `--toolkitpath` under a user-writable directory needs no root and writes nothing to `/usr/local`). Then delete the `.run` from `/mnt/models/cuda-dl/` through the
+   so the driver and `/usr/bin/nvcc` stay as they are: download `cuda_13.0.2_*_linux.run` (about 4 GB) to `<mount>/cuda-dl/` and run
+   `sh cuda_13.0.2_*_linux.run --silent --toolkit --toolkitpath=<mount>/cuda-13.0 --no-opengl-libs --no-man-page` as the normal user (no `sudo`, no `--driver`;
+   `--toolkitpath` under a user-writable directory needs no root and writes nothing to `/usr/local`). Then delete the `.run` from `<mount>/cuda-dl/` through the
    cleanup list. Nothing changes for TabbyAPI: it does not use the toolkit (it ships its own CUDA runtime in `venv164`).
    To-do text for the board (not posted): *title* "Rig: install a user-local CUDA 13.0 toolkit for the 5070 GPU expert server (BBXL)"; *why* "Without nvcc 12.8+ the rig's 5070 (sm_120) cannot run
-   the dsv41 GPU expert server; the 3090 and 3060s are unaffected"; *steps* "1. On the rig, as dadbodnerd: `mkdir -p /mnt/models/cuda-dl && cd /mnt/models/cuda-dl`; download the CUDA 13.0.2 Linux x86_64 runfile (developer.nvidia.com/cuda-13-0-2-download-archive,
-   Linux, x86_64, Ubuntu, runfile local). 2. `sh cuda_13.0.2_*_linux.run --silent --toolkit --toolkitpath=/mnt/models/cuda-13.0 --no-opengl-libs --no-man-page` (about 6 GB; no driver, no sudo). 3. `/mnt/models/cuda-13.0/bin/nvcc --version` says release 13.0. 4. Tell Claude;
+   the dsv41 GPU expert server; the 3090 and 3060s are unaffected"; *steps* "1. On the rig, as <user>: `mkdir -p <mount>/cuda-dl && cd <mount>/cuda-dl`; download the CUDA 13.0.2 Linux x86_64 runfile (developer.nvidia.com/cuda-13-0-2-download-archive,
+   Linux, x86_64, Ubuntu, runfile local). 2. `sh cuda_13.0.2_*_linux.run --silent --toolkit --toolkitpath=<mount>/cuda-13.0 --no-opengl-libs --no-man-page` (about 6 GB; no driver, no sudo). 3. `<mount>/cuda-13.0/bin/nvcc --version` says release 13.0. 4. Tell Claude;
    the runfile goes on the cleanup list." priority soon, kind action.
 
 **Rig commands** (after step 2; the 12.4 build of the S2 section above is unchanged):
 
 ```sh
-CUDA=/mnt/models/cuda-13.0 B=/mnt/models/strata-build/gpu-server ARCH="86-real;120-real" JOBS=3 tools/dsv41/build_gpu_server_linux.sh
+CUDA=<mount>/cuda-13.0 B=<mount>/strata-build/gpu-server ARCH="86-real;120-real" JOBS=3 tools/dsv41/build_gpu_server_linux.sh
 # prints: driver CUDA 13.3 >= toolkit 13.0, host compiler g++-15, the SASS list (sm_86 sm_120), the card UUIDs, the smoke commands, then the binary
-CUDA_VISIBLE_DEVICES=GPU-d43aa31e-2a27-67f7-43b7-2acbb4c1c63f build/ds4_gpu_rows_test --pack SYNTHETIC_PACK --bench 200      # the 5070; needs it free of TabbyAPI's 8.7 GB
+CUDA_VISIBLE_DEVICES=GPU-00000000-0000-0000-0000-000000000000 build/ds4_gpu_rows_test --pack SYNTHETIC_PACK --bench 200      # the 5070; needs it free of TabbyAPI's 8.7 GB
 ```
 
 The script refuses, naming the step, when: `CUDA` or `B` is unset, no `nvcc` at `CUDA`, the toolkit cannot build `ARCH` (12.4 with 120), the driver's CUDA is older than the
 toolkit's, no host compiler fits (12.x needs g++-13; 13.x takes g++-15 / 14), `B` has under 6 GB free (`MIN_FREE_GB`), no cmake / ninja, or the binary lacks the SASS asked for.
-The UUIDs of this rig (read 2026-11-04, nvidia-smi 610.57.04): 5070 `GPU-d43aa31e-2a27-67f7-43b7-2acbb4c1c63f`, 3090 `GPU-d526893c-b378-4be2-4e99-71848237f300`; the
+The UUIDs of this rig (read 2026-11-04, nvidia-smi 610.57.04): 5070 `GPU-00000000-0000-0000-0000-000000000000`, 3090 `GPU-00000000-0000-0000-0000-000000000000`; the
 5070 is index 0 today and the doc rule stands: never address by index. A binary built `86-real;120-real` runs on all of them.
 
-**Stream PC commands** (after step 1; the PC is the streaming machine: the build runs through the capped CPU lane, below normal priority):
+**Windows host commands** (after step 1; the PC is the streaming machine: the build runs through the capped CPU lane, below normal priority):
 
 ```bat
 powershell -File tools\dsv41\build_gpu_server_windows.ps1 -Check          :: reads only: prints each missing step, builds nothing
-MSYS_NO_PATHCONV=1 C:\Python314\python.exe "D:/AIStuff/AIO/AIO/AI Projects/AIOrchestrator/tools/cpu_lane/win_job.py" --cwd C:\AIO-strata -- powershell -File tools\dsv41\build_gpu_server_windows.ps1
+<cpu-cap-wrapper> --cwd <strata-dir> -- powershell -File tools\dsv41\build_gpu_server_windows.ps1
 ```
 
 It checks, in this order, and exits 2 with every missing step listed: C: free >= 15 GB; the checkout; `CUDA_PATH` and `bin\nvcc.exe`; the toolkit can build sm_120 (12.8+); the right
 Visual Studio Build Tools for that toolkit; `nvidia-smi` and a 5070 Ti among the cards (pinned by its UUID) with at least 1 GB of VRAM free after the headroom. Then it builds
-`strata-dsv41-expert-server-gpu.exe` and `ds4_gpu_rows_test.exe` into `C:\AIO-strata\build-cuda-gpu` and prints the smoke commands. **`--gpu-vram-gb` is sized live**:
+`strata-dsv41-expert-server-gpu.exe` and `ds4_gpu_rows_test.exe` into `<strata-dir>\build-cuda-gpu` and prints the smoke commands. **`--gpu-vram-gb` is sized live**:
 free VRAM now (16 GB minus what TabbyAPI's 9B and the desktop hold; `config.json` `LOCAL` is `vram_gb 16`) minus 1 GB headroom for the stream (NVENC, capture), rounded down to a half GB and
 capped at 5 (`-MaxVramGb`): with TabbyAPI holding 11 GB that is 4. A server that cannot hold its layers in that budget refuses to start and prints the shortfall; `--gpu-cpu-rest` serves the rest
 by the CPU lane. Start it the usual way, never from an agent shell:
-`powershell -File tools\stream_pc\start_dsv41_server.ps1 -Exe C:\AIO-strata\build-cuda-gpu\strata-dsv41-expert-server-gpu.exe -Layers 34-39 -ExtraArgs "--expert-server-gpu --gpu-vram-gb 4 --gpu-cpu-rest"`.
+`powershell -File tools\win_server\start_dsv41_server.ps1 -Exe <strata-dir>\build-cuda-gpu\strata-dsv41-expert-server-gpu.exe -Layers 34-39 -ExtraArgs "--expert-server-gpu --gpu-vram-gb 4 --gpu-cpu-rest"`.
 Stream mode still stops this server by its PID. No GPU power or clock setting is touched anywhere in these scripts.
 
 Not done: nothing was built with CUDA 12.8+ or run on a Blackwell card (no such toolkit on any host yet); the tests cover the version gate, the script refusals (stub `nvcc`), and the
@@ -620,7 +620,7 @@ A conductor pack WITHOUT the served layers' bytes: the flow has nothing to read 
 | conductor pack = layers 0-1 only, layers 2-7 on a server | identical; 103 tokens x 6 x 6 = 3708 rows from the server, 0 computed here for those layers |
 | server dies mid-prompt | the run stops with an error naming the layer (no zeros, no silent fallback) |
 
-**Measured (synthetic, the toy's CPU stand-in for the chunk flow).** T340 conductor (8 threads), T340 server (experts 0-15) + rig CPU server (experts 16-31, ssh tunnel), hidden 5120 / ffn 512, 2 layers, warm-up run first, unique prefixes, `ROWHASH` and `CHUNKSUM` equal local vs servers at 2k. The T340 was loaded by other work during the run (load average 6 on 4 cores), so absolute numbers are lower than S5's quiet run and the ratios are the result. Prefill tok/s:
+**Measured (synthetic, the toy's CPU stand-in for the chunk flow).** host-b conductor (8 threads), host-b server (experts 0-15) + rig CPU server (experts 16-31, ssh tunnel), hidden 5120 / ffn 512, 2 layers, warm-up run first, unique prefixes, `ROWHASH` and `CHUNKSUM` equal local vs servers at 2k. The host-b was loaded by other work during the run (load average 6 on 4 cores), so absolute numbers are lower than S5's quiet run and the ratios are the result. Prefill tok/s:
 
 | prompt | chunked local (conductor's CPU) | through servers, 32-token windows 4 in flight | through servers, one window at a time |
 | --- | --- | --- | --- |
@@ -635,17 +635,17 @@ The toy is CPU-bound and has no dense part: it shows that the pipelined slab pat
 
 ## The combined real-weights run (BBXL S7)
 
-Captain 1's order (#22865 item 1): one command that runs S1-S6 on real weights the moment the gaming PC is back: warm-up first, RESULTS table and dashboard rows written.
+Captain 1's order (#22865 item 1): one command that runs S1-S6 on real weights the moment the Linux workstation is back: warm-up first, RESULTS table and dashboard rows written.
 
 ```sh
-# on the conductor (the gaming PC). Hosts: tools/dsv41/fleet.json (BBXL S6). Site paths: copy tools/dsv41/bbxl_run_manifest.example.json and fill every <...>
+# on the conductor (the Linux workstation). Hosts: tools/dsv41/fleet.json (BBXL S6). Site paths: copy tools/dsv41/bbxl_run_manifest.example.json and fill every <...>
 python3 tools/dsv41/bbxl_realweights_run.py --manifest run.json --dry-run     # prints every command (preflight, servers, engine runs), runs none
 python3 tools/dsv41/bbxl_realweights_run.py --manifest run.json               # the run: runs/bbxl-<time>/RESULTS.md + results.jsonl + every log
 ```
 
 | Step | What |
 | --- | --- |
-| preflight | the probes run first and the script REFUSES (exit 3, nothing started) when a floor breaks: free RAM (`MemAvailable`) gaming >= 12 GB, T340 >= 16, rig >= 10; stream PC: C: free disk >= 15 GB; and every GPU the manifest names (by UUID, `nvidia-smi`) must have its `min_free_mib` (the rig 3090, GPU-d526893c-b378-4be2-4e99-71848237f300: 3000). Floors can be overridden per host in the manifest (`floors`). |
+| preflight | the probes run first and the script REFUSES (exit 3, nothing started) when a floor breaks: free RAM (`MemAvailable`) gaming >= 12 GB, host-b >= 16, rig >= 10; Windows host: C: free disk >= 15 GB; and every GPU the manifest names (by UUID, `nvidia-smi`) must have its `min_free_mib` (the rig 3090, GPU-00000000-0000-0000-0000-000000000000: 3000). Floors can be overridden per host in the manifest (`floors`). |
 | arms | `base` = everything off (CPU servers, plan without popularity, `STRATA_NET_SERIAL=1`, `--dspark none`, prompt through the conductor's own flow). One change each: `s1` `--dspark auto`; `s2` GPU expert servers (`--expert-server-gpu`, a host without a GPU server in the manifest keeps its CPU server); `s3` the popularity plan + `STRATA_DS4_EXPERT_PERM` + `--expert-profile`; `s4` parallel remote calls (serial hook off); `s5` `STRATA_DS4_NET_PREFILL=1`; `s7` `STRATA_DS4_NET_PREFILL=2`; and `all`. Arms are grouped by (server kind, plan) so servers restart as seldom as possible; an arm the manifest cannot run (no `after` plan, no GPU server) is listed under "Not run". |
 | runs | per arm: one warm-up run (not counted), then `--runs` (default 3) timed runs at 2k and 16k tokens, each with its OWN 16-token unique prefix (the same prefixes in every arm, so tokens can be compared). Metrics from the engine's own lines: `prompt: N tokens in X ms (Y tok/s` and `decode: N tokens in X ms (Z tok/s`. |
 | servers | started and stopped by the script over ssh (`ssh` in the manifest's host entry; a host without it, or `"managed": false`, is only probed on its port); the token comes from a token FILE on each host (`token_file`), never from the command line; stopped on every exit, also an error. |
@@ -662,20 +662,20 @@ Dashboard rows (no earlier BBXL row format existed in this repo; defined here, `
 
 **Tests** (`tools/dsv41/test_bbxl_realweights_run.py`, in CI): one change per arm, the floors, the preflight refusal, `--dry-run` runs nothing, the RESULTS / JSON writer, the engine-line parsers; with a build dir the whole run end to end on a synthetic pack (`--synthetic BUILD_DIR PACK`: `ds4_net_test` as the engine, two loopback expert servers; arms `base`, `s4`, `s5`, `s7` run, the arms that need real weights or a GPU are listed as not run). The synthetic numbers prove the machinery, not the speed.
 
-**Not done.** Never run on real weights, the stream PC's server is not managed by the script (its Task Scheduler one-shot stays manual), the ssh start path was exercised only as printed commands (`--dry-run`) and once live on the T340 -> rig leg for a harmless command.
+**Not done.** Never run on real weights, the Windows host's server is not managed by the script (its Task Scheduler one-shot stays manual), the ssh start path was exercised only as printed commands (`--dry-run`) and once live on the host-b -> rig leg for a harmless command.
 
 ## Faults, security
 
 As for Qwen (docs/REMOTE_EXPERTS.md): shared token, the server binds loopback unless told otherwise, a route that fails is computed locally and retried
 with backoff, a request outside the served layers or experts is refused, one conductor at a time per server. A conductor of the other engine family is refused
-at the handshake. The stream PC's server is a Task Scheduler one-shot (never started from an agent shell); stream mode stops it by its PID.
+at the handshake. the Windows host's server is a Task Scheduler one-shot (never started from an agent shell); stream mode stops it by its PID.
 Cross-OS rows were identical in the test above; the swiglu `exp` is the host's libm, so a different libm could differ in the last bit of a row (greedy tokens
 would still agree except on near-ties) - the synthetic test and `ROWHASH` are how to see it.
 
 ## Next
 
-1. The real-weights split (RESULTS.md gate): conductor `strata-dsv41` on the gaming PC, T340 + stream PC (CPU servers) with slices of their layers, 64 tokens against the single-process
+1. The real-weights split (RESULTS.md gate): conductor `strata-dsv41` on the Linux workstation, host-b + Windows host (CPU servers) with slices of their layers, 64 tokens against the single-process
    reference, tok/s and round trip. Until then the synthetic test and the row-hash runs above are the evidence.
-2. The GPU expert server on the stream PC's 5070 Ti and on real weights (done on the rig's 3090 with a synthetic pack: "GPU expert server" above).
+2. The GPU expert server on the Windows host's 5070 Ti and on real weights (done on the rig's 3090 with a synthetic pack: "GPU expert server" above).
 3. The chunked flow's hook for `Remote::prompt` is written (BBXL S7, compiled, not run): the first real run is `bbxl_realweights_run.py` ("The combined real-weights run (BBXL S7)").
-4. Disk: the 3 bit set needs about 60 GB more on the rig and 25 GB on the T340, or a NAS mount.
+4. Disk: the 3 bit set needs about 60 GB more on the rig and 25 GB on the host-b, or a NAS mount.

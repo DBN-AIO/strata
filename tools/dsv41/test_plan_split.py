@@ -21,7 +21,7 @@ NL, NE = 8, 32
 FLEET = [
     {"name": "cond", "addr": None, "mem_gb": 3.0, "vram_gb": 1.0, "disk_gb": 1e9, "compute_ms": 2.5, "wire_ms": 0.0},
     {"name": "rig", "addr": "10.0.0.2:7840", "mem_gb": 3.0, "disk_gb": 3.0, "compute_ms": 4.5, "wire_ms": 1.2},
-    {"name": "t340", "addr": "10.0.0.3:7840", "mem_gb": 3.0, "disk_gb": 3.0, "compute_ms": 6.4, "wire_ms": 0.75},
+    {"name": "host-b", "addr": "10.0.0.3:7840", "mem_gb": 3.0, "disk_gb": 3.0, "compute_ms": 6.4, "wire_ms": 0.75},
 ]
 
 
@@ -164,14 +164,14 @@ def mount(name, kind, free, reserve=0.0, path=None):
 
 
 # 8 layers of 1 GB.  disk_gb (the old single number) counts the SATA disks too: it is what plan_split used before the storage tiers.
-def sfleet(rig_nvme=2.0, t340_tmpfs=3.0, rig_sata=50.0, stream=None):
+def sfleet(rig_nvme=2.0, hostb_tmpfs=3.0, rig_sata=50.0, stream=None):
     f = [
         {"name": "cond", "addr": None, "mem_gb": 3.0, "disk_gb": 1e9, "compute_ms": 2.5, "wire_ms": 0.0,
          "storage": [mount("nvmeA", "nvme", 2.0), mount("nvmeB", "nvme", 1.5), mount("bulk", "sata", 400.0)]},
         {"name": "rig", "addr": "10.0.0.2:7840", "mem_gb": 10.0, "disk_gb": rig_nvme + rig_sata, "compute_ms": 4.5, "wire_ms": 1.2,
          "storage": [mount("models", "nvme", rig_nvme), mount("root", "sata", rig_sata)]},
-        {"name": "t340", "addr": "10.0.0.3:7840", "mem_gb": 10.0, "disk_gb": 53.0, "compute_ms": 6.4, "wire_ms": 0.75,
-         "storage": [mount("shm", "tmpfs", t340_tmpfs), mount("root", "sata", 50.0)]},
+        {"name": "host-b", "addr": "10.0.0.3:7840", "mem_gb": 10.0, "disk_gb": 53.0, "compute_ms": 6.4, "wire_ms": 0.75,
+         "storage": [mount("shm", "tmpfs", hostb_tmpfs), mount("root", "sata", 50.0)]},
     ]
     if stream is not None:
         f.append(stream)
@@ -245,7 +245,7 @@ class Storage(unittest.TestCase):
         res = json.loads(self.plan(sfleet()).stdout)
         names = {(t["host"], t["mount"]) for t in self.targets(res)}
         self.assertIn(("rig", "models"), names)
-        self.assertIn(("t340", "shm"), names)
+        self.assertIn(("host-b", "shm"), names)
         for t in self.targets(res):
             self.assertTrue(t["path"] and t["layers"] and t["gb"] > 0, t)
         # a host with two NVMe mounts splits by whole layers
@@ -267,8 +267,8 @@ class Storage(unittest.TestCase):
         self.assertIn("SATA", r.stderr)
 
     def test_the_storage_report_says_what_to_free(self):
-        # no disk limit would put 3 / 3 / 2 GB; the rig has 1 GB of NVMe, the t340 has 2 GB of tmpfs
-        f = sfleet(rig_nvme=1.0, t340_tmpfs=2.0)
+        # no disk limit would put 3 / 3 / 2 GB; the rig has 1 GB of NVMe, the host-b has 2 GB of tmpfs
+        f = sfleet(rig_nvme=1.0, hostb_tmpfs=2.0)
         r = self.plan(f, "--storage-report")
         res = json.loads(r.stdout) if r.stdout.strip() else {}
         self.assertIn("storage_report", res, r.stderr)

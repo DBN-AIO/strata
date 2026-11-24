@@ -8,7 +8,7 @@
 //
 // This file is host only: no CUDA, no ggml headers.  The same code serves two programs:
 //   strata-dsv41 --expert-server ...     (the CUDA engine binary; the server path returns before any CUDA call)
-//   strata-dsv41-expert-server ...       (no CUDA at all: T340, and the stream PC until its toolkit exists)
+//   strata-dsv41-expert-server ...       (no CUDA at all: host-b, and the Windows host until its toolkit exists)
 // and the conductor side (Remote) is compiled into strata-dsv41.
 #pragma once
 

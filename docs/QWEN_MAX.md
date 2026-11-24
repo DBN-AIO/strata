@@ -73,7 +73,7 @@ hidden 256 (file 2.2 GiB). With flags it writes the **real widths** too (`--n-em
 --ssm-k-heads 16 --ssm-v-heads 128`, two blocks, 11.5 GiB). `tests/qwen_max/run_synthetic.sh BUILD_CUDA BUILD_CPU [WORKDIR]` runs
 both shapes on one 3090 (peak 3.6 GB of VRAM of ours on the real-width one) and compares 64 greedy tokens.
 
-Measured 2026-11-03, nobara-pc (RTX 3090 #1, Ryzen 9 5950X, `strata-expert-server` on the same host, 8 workers, loopback), reference =
+Measured 2026-11-03, linux-workstation (RTX 3090 #1, 16-core Zen 3 CPU, `strata-expert-server` on the same host, 8 workers, loopback), reference =
 single process with the experts on the CPU pool (`STRATA_Q36_ARITH=wi`, `STRATA_Q36_FIXED_SLOTS=1`, `--expert-slots` 8 / 4), split = every
 block's experts on the server:
 
@@ -86,7 +86,7 @@ block's experts on the server:
 path, not a speed.) CPU-only, in CI: `ctest -R qmax_native_rows` (needs numpy) runs `native_rows_test` on a 4 + 1 block synthetic file:
 a row does not depend on its window; every row from a loopback expert server equals the in-process row byte for byte, for two trunk
 blocks and the Q2_K MTP block; a conductor with another model's fingerprint is refused. The whole CPU-only suite passes as CI runs it (94 tests
-without `isa_guard_check`, plus this one; 5 skipped for want of AVX-512 on the 5950X, as before), and `tools/net_experts_probe.py` (token, bad requests, busy, idle
+without `isa_guard_check`, plus this one; 5 skipped for want of AVX-512 on the 16-core CPU, as before), and `tools/net_experts_probe.py` (token, bad requests, busy, idle
 connection) passes against the refactored Flash-Next server (`strata-expert-server --pack ...` on the Flash-Next pack).
 
 Not shown by it: GPU and CPU arithmetic differ (as for every quantisation), so a hybrid run's text is not the all-in-VRAM text; on the
@@ -95,11 +95,11 @@ positions. The new GPU IQ1_M / IQ2_XXS down kernels are checked only that way (f
 
 ## 4. Placement
 
-`BigBrain/tools/xl/specs/qwen3.8-max_*.json` (DBN-AIO/AIO, `xl.model_spec/1`: 93 layers, 512 experts, top-10, the exact bytes above, rounded
+`the orchestrator's model specs` (the private orchestrator repo, `xl.model_spec/1`: 93 layers, 512 experts, top-10, the exact bytes above, rounded
 up per expert; the MTP block's Q2_K experts are averaged into the 93 layers so the total is exact; wire row 32768 B = 8192 fp32) and
-`python -m tools.xl.max_table` there. Conductor = the gaming PC (2 x 3090 over NVLink: the 35.7 GB of shared weights of all 93 blocks
+`python -m tools.xl.max_table` there. Conductor = the Linux workstation (2 x 3090 over NVLink: the 35.7 GB of shared weights of all 93 blocks
 must sit in VRAM, 43.2 GB usable pooled), reserves 10% VRAM / 20% RAM, experts never on NVMe, uniform popularity. Today's fleet = the five
-hosts of the AIO test fixtures (gaming PC 64 GB RAM, rig 32 GB, stream PC 64 GB, T340 64 GB, portable); the hypothetical server is
+hosts of the test fixtures (Linux workstation 64 GB RAM, rig 32 GB, Windows host 64 GB, host-b 64 GB, portable); the hypothetical server is
 CPU-only. Decimal GB.
 
 | quant | experts | today's 5 hosts | + 768 GB RAM server | + 1 TB RAM server | RAM the new server needs |
@@ -108,8 +108,8 @@ CPU-only. Decimal GB.
 | UD-IQ1_M | 527.1 GB | refused, short by **272.5 GB** | fits (server holds 273 GB) | fits (273 GB) | 341 GB |
 | UD-IQ2_XXS | 619.7 GB | refused, short by **365.1 GB** | fits (server holds 365 GB) | fits (365 GB) | 457 GB |
 
-("RAM needed" = shortfall / 0.8 usable.) On the fleet the other hosts hold: gaming PC 51 GB RAM + 11 GB VRAM copies, rig 26 GB RAM + 70 GB
-VRAM copies, stream PC 51 GB + 16 GB VRAM, T340 51 GB, portable 6 GB VRAM; the new server takes whatever is left. KV cache and the
+("RAM needed" = shortfall / 0.8 usable.) On the fleet the other hosts hold: Linux workstation 51 GB RAM + 11 GB VRAM copies, rig 26 GB RAM + 70 GB
+VRAM copies, Windows host 51 GB + 16 GB VRAM, host-b 51 GB, portable 6 GB VRAM; the new server takes whatever is left. KV cache and the
 conductor's buffers are not in the spec. These sizes are the files' bytes; they say nothing about speed (the Ryzen-class CPU measured
 2.9 tok/s for ten Flash-Next blocks on the rig's slower CPU; a 768 GB server's CPU decides Max's speed).
 

@@ -9,7 +9,7 @@ by truncate() would be zero-filled there).
 
   # on the host with the model:                               python3 slice_stream.py emit PACK 26-34 [E0-E1] [--perm perm.bin] > layers.stream
   # on the expert-server host (any pipe, e.g. through ssh):   python3 slice_stream.py apply OUT_DIR < layers.stream
-  ssh nobara 'python3 slice_stream.py emit PACK 26-34' | python slice_stream.py apply C:\\AIO-strata-model\\dsv41-slice
+  ssh linux-workstation 'python3 slice_stream.py emit PACK 26-34' | python slice_stream.py apply <model-dir>\\dsv41-slice
 
 --perm FILE (plan_split.py --popularity --perm-out): the experts were renumbered hottest first and the conductor calls the servers by
 RANK (STRATA_DS4_EXPERT_PERM).  E0-E1 are then ranks, and the slice holds the bytes of the original expert at the slot of its rank, so

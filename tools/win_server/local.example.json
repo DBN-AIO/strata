@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy to local.json (untracked) and fill in this machine's real paths. Never commit local.json or the token file.",
+  "python_w": "<path to pythonw.exe>",
+  "exe_cpu": "<strata-dir>\\build-cpu\\strata-expert-server.exe",
+  "exe_dsv41": "<strata-dir>\\build-cpu\\strata-dsv41-expert-server.exe",
+  "pack_qwen": "<model-dir>\\pack",
+  "native_qwen": "<model-dir>\\<first shard>.gguf",
+  "pack_dsv41": "<model-dir>\\dsv41-pack",
+  "log_qwen": "<model-dir>\\expert-server.log",
+  "log_dsv41": "<model-dir>\\dsv41-expert-server.log",
+  "token_file": "<model-dir>\\expert.token",
+  "listen": "<this machine's LAN address>:7840"
+}

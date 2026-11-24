@@ -1032,7 +1032,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                      src/dsv41/ds4_kernels.cu src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp)
       add_executable(ds4_gpu_rows_test EXCLUDE_FROM_ALL tests/dsv41/gpu_rows_test.cpp ${_ds4_gpu_server_srcs})
       # the GPU expert server without the engine (no ds4_model.cu: builds in minutes): strata-dsv41-expert-server's flags plus
-      # --expert-server-gpu, for a host with a card (the rig, the stream PC); built by name
+      # --expert-server-gpu, for a host with a card (the rig, the Windows host); built by name
       add_executable(strata-dsv41-expert-server-gpu EXCLUDE_FROM_ALL src/dsv41/ds4_expert_server_main.cpp ${_ds4_gpu_server_srcs})
       set(_ds4_gpu_server_targets ds4_gpu_rows_test strata-dsv41-expert-server-gpu)
       foreach(_t ${_ds4_gpu_server_targets})
