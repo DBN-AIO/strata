@@ -20,8 +20,8 @@ NL, NE = 8, 32
 # a small fleet: the conductor holds 3 GB (1 of them VRAM), two remotes 3 GB each; 8 layers of 1 GB do not all fit on the conductor
 FLEET = [
     {"name": "cond", "addr": None, "mem_gb": 3.0, "vram_gb": 1.0, "disk_gb": 1e9, "compute_ms": 2.5, "wire_ms": 0.0},
-    {"name": "rig", "addr": "10.0.0.2:7840", "mem_gb": 3.0, "disk_gb": 3.0, "compute_ms": 4.5, "wire_ms": 1.2},
-    {"name": "host-b", "addr": "10.0.0.3:7840", "mem_gb": 3.0, "disk_gb": 3.0, "compute_ms": 6.4, "wire_ms": 0.75},
+    {"name": "rig", "addr": "192.0.2.2:7840", "mem_gb": 3.0, "disk_gb": 3.0, "compute_ms": 4.5, "wire_ms": 1.2},
+    {"name": "host-b", "addr": "192.0.2.3:7840", "mem_gb": 3.0, "disk_gb": 3.0, "compute_ms": 6.4, "wire_ms": 0.75},
 ]
 
 
@@ -168,9 +168,9 @@ def sfleet(rig_nvme=2.0, hostb_tmpfs=3.0, rig_sata=50.0, stream=None):
     f = [
         {"name": "cond", "addr": None, "mem_gb": 3.0, "disk_gb": 1e9, "compute_ms": 2.5, "wire_ms": 0.0,
          "storage": [mount("nvmeA", "nvme", 2.0), mount("nvmeB", "nvme", 1.5), mount("bulk", "sata", 400.0)]},
-        {"name": "rig", "addr": "10.0.0.2:7840", "mem_gb": 10.0, "disk_gb": rig_nvme + rig_sata, "compute_ms": 4.5, "wire_ms": 1.2,
+        {"name": "rig", "addr": "192.0.2.2:7840", "mem_gb": 10.0, "disk_gb": rig_nvme + rig_sata, "compute_ms": 4.5, "wire_ms": 1.2,
          "storage": [mount("models", "nvme", rig_nvme), mount("root", "sata", rig_sata)]},
-        {"name": "host-b", "addr": "10.0.0.3:7840", "mem_gb": 10.0, "disk_gb": 53.0, "compute_ms": 6.4, "wire_ms": 0.75,
+        {"name": "host-b", "addr": "192.0.2.3:7840", "mem_gb": 10.0, "disk_gb": 53.0, "compute_ms": 6.4, "wire_ms": 0.75,
          "storage": [mount("shm", "tmpfs", hostb_tmpfs), mount("root", "sata", 50.0)]},
     ]
     if stream is not None:
@@ -230,7 +230,7 @@ class Storage(unittest.TestCase):
         self.assertEqual(json.loads(r.stdout)["storage"]["sata_used_gb"], 0)
 
     def test_an_excluded_disk_is_never_used_even_with_allow_sata(self):
-        stream = {"name": "stream", "addr": "10.0.0.4:7840", "mem_gb": 30.0, "disk_gb": 500.0, "compute_ms": 2.9, "wire_ms": 0.9,
+        stream = {"name": "stream", "addr": "192.0.2.4:7840", "mem_gb": 30.0, "disk_gb": 500.0, "compute_ms": 2.9, "wire_ms": 0.9,
                   "storage": [mount("C:", "nvme", 16.0, reserve=15.0), mount("D:", "excluded", 500.0)]}
         f = sfleet(rig_nvme=1.0, stream=stream)   # 1 GB usable on C:, 500 on the failing D:
         r = self.plan(f, "--allow-sata")

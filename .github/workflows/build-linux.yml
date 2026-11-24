@@ -58,6 +58,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: No home-lab specifics in added lines (public repository)
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          python3 tools/test_check_no_homelab.py
+          python3 tools/check_no_homelab.py --base origin/main
 
       - name: Disk and tools
         run: |

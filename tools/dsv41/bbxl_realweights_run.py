@@ -362,7 +362,7 @@ def main():
         man = load_json(a.manifest)
         engine = RealEngine(man)
     if not os.path.exists(fleet_path):
-        print("no fleet.json at %s: it comes with BBXL S6 (max2/s6-nvme-tier); pass --fleet FILE" % fleet_path, file=sys.stderr)
+        print("no fleet.json at %s: copy tools/dsv41/fleet.example.json to fleet.json (untracked) and fill in the real hosts, or pass --fleet FILE" % fleet_path, file=sys.stderr)
         return 2
     fleet = load_json(fleet_path)
     hosts = []
