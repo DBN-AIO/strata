@@ -387,6 +387,11 @@ bool NetExperts::connect_route(Route& r, int tmo_ms, std::string& err) {
         return fail("expert server " + r.host + " speaks protocol version " + std::to_string(ch.version) + ", this build speaks " + std::to_string(kProtoVersion));
     const bool need_token = (ch.flags & 1u) != 0;
     if (need_token && token_.empty()) return fail("expert server " + r.host + " requires a token: set STRATA_EXPERT_TOKEN");
+    // fail closed: a server that does not ask for the token we hold is either misconfigured or an impostor (an on-path host that
+    // answers CHALLENGE with flags 0 would otherwise receive every hidden state and could answer with forged expert rows)
+    if (!need_token && !token_.empty())
+        return fail("expert server " + r.host + " does not ask for a token although STRATA_EXPERT_TOKEN is set here: refusing to talk to it "
+                    "(start the server with the same token, or unset STRATA_EXPERT_TOKEN here to connect without one)");
     HelloMsg h{};
     h.version = kProtoVersion; h.n_embd = (uint32_t) H_; h.pad = id_.arch; h.n_expert = (uint32_t) n_expert_; h.n_layers = (uint32_t) n_layers_;
     h.isa = id_.isa;
@@ -405,8 +410,6 @@ bool NetExperts::connect_route(Route& r, int tmo_ms, std::string& err) {
     if (a.n_embd != (uint32_t) H_ || (int64_t) a.n_expert != n_expert_) return fail("expert server " + r.host + ": model geometry differs");
     if (a.isa != id_.isa)   // the server refuses a mismatch itself; this is the defence if it does not
         return fail("expert server " + r.host + " runs the " + net_isa_name(a.isa) + " kernels, this host the " + net_isa_name(id_.isa) + " ones");
-    if (!need_token && !token_.empty())
-        std::fprintf(stderr, "strata net: expert server %s does not ask for a token although STRATA_EXPERT_TOKEN is set here\n", r.host.c_str());
     r.top_k = (int) a.top_k;
     r.fd = (intptr_t) s;
     return true;
@@ -898,6 +901,16 @@ int serve_experts(const ExpertServeCfg& cfg, const ExpertComputeFn& compute) {
     std::fprintf(stderr, "strata net: expert server listening on %s:%d, layers %d-%d, experts %d-%d of %lld, auth %s, timeout %d ms\n", bound, cfg.port,
                  lo, hi, cfg.expert_lo, cfg.expert_hi < 0 ? (int) cfg.n_expert - 1 : cfg.expert_hi, (long long) cfg.n_expert,
                  C.token.empty() ? "off" : "token", C.tmo_ms);
+    if (!loopback && C.token.empty()) {   // an open listener on a reachable address needs an explicit opt-out, never a default
+        const char* allow = std::getenv("STRATA_EXPERT_ALLOW_NO_TOKEN");
+        if (allow == nullptr || *allow != '1') {
+            std::fprintf(stderr, "strata net: refusing to listen on %s:%d without a token: any host that can reach the port could use this machine's CPU "
+                                 "and read the conductor's hidden states. Set STRATA_EXPERT_TOKEN on both ends (or, on a closed test network only, "
+                                 "STRATA_EXPERT_ALLOW_NO_TOKEN=1)\n", bound, cfg.port);
+            sock_close(ls);
+            return 1;
+        }
+    }
     if (!loopback)
         std::fprintf(stderr, "strata net: WARNING: %s is not a loopback address: any host that can reach port %d may connect%s. Trusted LAN only: "
                              "set STRATA_EXPERT_TOKEN and firewall the port to the conductor's address\n", bound, cfg.port,

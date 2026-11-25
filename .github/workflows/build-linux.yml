@@ -5,7 +5,7 @@ name: Linux CPU-only build
 # It runs on OUR self-hosted runners (label linux-fast), not on GitHub-hosted ones (the organisation's hosted minutes are
 # refused for now).  Nothing is cached on D: - the runner's own work folder and ~/.cache/strata-ci on the runner's system disk.
 #
-# A runner for this repository is registered by hand (the existing t340-fast-* runners belong to DBN-AIO/AIO and cannot take
+# A runner for this repository is registered by hand (the existing host-b-fast-* runners belong to the private orchestrator repo and cannot take
 # jobs of this repository): docs/REMOTE_EXPERTS.md, "CI runner".
 
 on:
@@ -58,6 +58,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: No home-lab specifics in added lines (public repository)
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          python3 tools/test_check_no_homelab.py
+          python3 tools/check_no_homelab.py --base origin/main
 
       - name: Disk and tools
         run: |
@@ -67,7 +75,7 @@ jobs:
           avail_gb=$(df -BG --output=avail "$CI_CACHE" | tail -1 | tr -dc 0-9)
           echo "free on the runner's disk: ${avail_gb} GB"
           if [ "$avail_gb" -lt 8 ]; then echo "::error::less than 8 GB free for the build (needs ~2 GB, keeps 6 GB spare)"; exit 1; fi
-          case "$CI_CACHE" in /mnt/d/*|/d/*|D:*) echo "::error::the CI cache must not sit on D:"; exit 1;; esac
+          case "$CI_CACHE" in <mount>/*|/d/*|D:*) echo "::error::the CI cache must not sit on D:"; exit 1;; esac
           g++ --version | head -1
           # cmake >= 3.24 (the tree's minimum): the runner's own when it has one, else the pinned release, checked by hash
           if command -v cmake >/dev/null 2>&1 && cmake --version | head -1 | awk '{split($3,v,"."); exit !(v[1]>3 || (v[1]==3 && v[2]>=24))}'; then

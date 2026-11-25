@@ -95,3 +95,7 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+
+# machine-specific settings (copy the .example files): launcher paths and the fleet survey
+/tools/win_server/local.json
+/tools/dsv41/fleet.json

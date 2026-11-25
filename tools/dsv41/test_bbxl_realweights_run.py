@@ -22,12 +22,12 @@ def sh(args, **kw):
 
 
 def manifest(tmp, floor=None):
-    fleet = [{"name": "t340"}, {"name": "rig"}]
-    man = {"engine": {"host": "t340", "bin": "/x/strata-dsv41", "pack": "/x/pack"}, "vocab": 1000, "runs": 1, "sizes": {"2k": 2048},
-           "hosts": {"t340": {}, "rig": {"ssh": "u@rig", "os": "linux", "gpu": {"uuid": "GPU-abc", "min_free_mib": 3000}}},
+    fleet = [{"name": "host-b"}, {"name": "rig"}]
+    man = {"engine": {"host": "host-b", "bin": "/x/strata-dsv41", "pack": "/x/pack"}, "vocab": 1000, "runs": 1, "sizes": {"2k": 2048},
+           "hosts": {"host-b": {}, "rig": {"ssh": "u@rig", "os": "linux", "gpu": {"uuid": "GPU-abc", "min_free_mib": 3000}}},
            "plans": {"before": {"remote_experts": "rig:7840=0-39", "servers": [{"host": "rig", "bin": "/x/srv", "gpu_bin": "/x/gsrv", "pack": "/x/slice", "listen": "0.0.0.0:7840", "serve_layers": "0-39"}]}}}
     if floor:
-        man["floors"] = {"t340": ["ram_gb", floor]}
+        man["floors"] = {"host-b": ["ram_gb", floor]}
     fp, mp = os.path.join(tmp, "fleet.json"), os.path.join(tmp, "man.json")
     json.dump(fleet, open(fp, "w"))
     json.dump(man, open(mp, "w"))
@@ -48,7 +48,7 @@ class Arms(unittest.TestCase):
                 self.assertEqual(len(diffs), 1, (a["id"], diffs))
 
     def test_floors_are_the_ordered_ones(self):
-        self.assertEqual(R.FLOORS, {"gaming": ("ram_gb", 12.0), "t340": ("ram_gb", 16.0), "rig": ("ram_gb", 10.0), "stream": ("disk_c_gb", 15.0)})
+        self.assertEqual(R.FLOORS, {"gaming": ("ram_gb", 12.0), "host-b": ("ram_gb", 16.0), "rig": ("ram_gb", 10.0), "stream": ("disk_c_gb", 15.0)})
 
 
 class Preflight(unittest.TestCase):
@@ -59,10 +59,10 @@ class Preflight(unittest.TestCase):
             r = sh(["--manifest", mp, "--fleet", fp, "--out", os.path.join(tmp, "o"), "--dry-run"])
             # (dry-run never refuses: it prints the probes) - the real refusal needs the probes to run, so use the table check directly
             self.assertEqual(r.returncode, 0, r.stderr)
-            rows, problems = R.preflight(R.Runner(False, tmp), [{"name": "t340"}], {"t340": ("ram_gb", 10 ** 6)}, {"t340"}, False)
+            rows, problems = R.preflight(R.Runner(False, tmp), [{"name": "host-b"}], {"host-b": ("ram_gb", 10 ** 6)}, {"host-b"}, False)
             self.assertEqual(len(problems), 1)
             self.assertIn("floor", problems[0])
-            rows, problems = R.preflight(R.Runner(False, tmp), [{"name": "t340"}], {"t340": ("ram_gb", 0.001)}, {"t340"}, False)
+            rows, problems = R.preflight(R.Runner(False, tmp), [{"name": "host-b"}], {"host-b": ("ram_gb", 0.001)}, {"host-b"}, False)
             self.assertEqual(problems, [])
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "reads /proc/meminfo")
@@ -70,7 +70,7 @@ class Preflight(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             fp, mp = manifest(tmp, floor=10 ** 6)
             m = json.load(open(mp))
-            m["hosts"]["rig"] = {}   # (no ssh, no gpu probe: only the t340 RAM floor is checked, on this machine)
+            m["hosts"]["rig"] = {}   # (no ssh, no gpu probe: only the host-b RAM floor is checked, on this machine)
             json.dump(m, open(mp, "w"))
             r = sh(["--manifest", mp, "--fleet", fp, "--out", os.path.join(tmp, "o")])
             self.assertEqual(r.returncode, 3, r.stdout + r.stderr)

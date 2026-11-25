@@ -5,7 +5,7 @@
 
 What it does, in order (docs/DEEPSEEK41_SPLIT.md "The combined real-weights run (BBXL S7)"):
   1. loads the hosts from tools/dsv41/fleet.json (S6) and the site paths from the manifest (tools/dsv41/bbxl_run_manifest.example.json);
-  2. PREFLIGHT, and refuses (exit 3) when a RAM floor breaks (gaming >= 12 GB free, T340 >= 16, rig >= 10, stream C: >= 15 GB free) or a GPU lacks
+  2. PREFLIGHT, and refuses (exit 3) when a RAM floor breaks (gaming >= 12 GB free, host-b >= 16, rig >= 10, stream C: >= 15 GB free) or a GPU lacks
      the VRAM the manifest asks for (nvidia-smi, by UUID);
   3. the arms below, grouped by (server kind, plan) so the servers restart as seldom as possible: servers up, a WARM-UP engine run per arm (not counted),
      then --runs timed runs at every prompt size (2k and 16k), each run with its own UNIQUE PREFIX (so no cache of an earlier run answers it);
@@ -38,8 +38,8 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA = "bbxl-bench/1"
 
-# the floors (Captain 1 #22865): free RAM in GB on the host (MemAvailable: reclaimable cache counts), or free disk GB of a drive for the stream PC
-FLOORS = {"gaming": ("ram_gb", 12.0), "t340": ("ram_gb", 16.0), "rig": ("ram_gb", 10.0), "stream": ("disk_c_gb", 15.0)}
+# the floors (Captain 1 #22865): free RAM in GB on the host (MemAvailable: reclaimable cache counts), or free disk GB of a drive for the Windows host
+FLOORS = {"gaming": ("ram_gb", 12.0), "host-b": ("ram_gb", 16.0), "rig": ("ram_gb", 10.0), "stream": ("disk_c_gb", 15.0)}
 
 # arm: server kind (cpu|gpu), plan (before|after), env, conductor flags.  Every stage arm differs from base by one thing.
 BASE_ENV = {"STRATA_NET_SERIAL": "1"}
@@ -362,7 +362,7 @@ def main():
         man = load_json(a.manifest)
         engine = RealEngine(man)
     if not os.path.exists(fleet_path):
-        print("no fleet.json at %s: it comes with BBXL S6 (max2/s6-nvme-tier); pass --fleet FILE" % fleet_path, file=sys.stderr)
+        print("no fleet.json at %s: copy tools/dsv41/fleet.example.json to fleet.json (untracked) and fill in the real hosts, or pass --fleet FILE" % fleet_path, file=sys.stderr)
         return 2
     fleet = load_json(fleet_path)
     hosts = []

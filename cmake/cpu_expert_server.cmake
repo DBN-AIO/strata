@@ -3,7 +3,7 @@
 # Included at the end of the top-level CMakeLists.txt.  With STRATA_ENABLE_CUDA=OFF (and no HIP) the tree builds no engine
 # (the GPU engine is the `strata` target of the CUDA / HIP configure); this adds `strata-expert-server`, the one program of the
 # engine that needs no GPU: it answers a conductor's expert requests with the CPU expert kernels over the model's experts, read
-# from the GGUF in place.  It links no CUDA runtime and never initialises CUDA, so a host without a card (the T340) can serve.
+# from the GGUF in place.  It links no CUDA runtime and never initialises CUDA, so a host without a card (the host-b) can serve.
 #
 #   cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=OFF
 #   cmake --build build-cpu --target strata-expert-server -j8

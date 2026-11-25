@@ -5,7 +5,7 @@
 #   CUDA=<toolkit root> B=<build dir> [SRC=<checkout>] [ARCH="86-real;120-real"] [GG=<llama.cpp checkout>] [JOBS=3] \
 #       tools/dsv41/build_gpu_server_linux.sh
 #
-# CUDA is required and is never guessed: a user-local toolkit (e.g. /mnt/models/cuda-13.0, see the doc) or /usr/local/cuda-13.0.  The rig's own
+# CUDA is required and is never guessed: a user-local toolkit (e.g. <mount>/cuda-13.0, see the doc) or /usr/local/cuda-13.0.  The rig's own
 # /usr/bin/nvcc is Ubuntu's 12.4 (sm_86 only): with it ARCH=86-real is the only thing that builds, and ARCH with 120 is refused below.
 # Refuses, naming the missing step, when: nvcc is missing or too old for ARCH, the driver is older than the toolkit, the build dir's
 # filesystem has under MIN_FREE_GB (default 6) free, or no host compiler fits the toolkit (12.x: g++-13; 13.x: g++-15 or g++-14).
@@ -13,8 +13,8 @@
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 SRC=${SRC:-$(cd "$here/../.." && pwd)}
-B=${B:?B=<build dir> (not on a full disk: the rig /home is ~99% full, /mnt/models has room)}
-CUDA=${CUDA:?CUDA=<toolkit root, e.g. /mnt/models/cuda-13.0>: the rig has only Ubuntu nvcc 12.4, which cannot build sm_120 (doc: Blackwell builds)}
+B=${B:?B=<build dir> (not on a full disk: the rig /home is ~99% full, <mount> has room)}
+CUDA=${CUDA:?CUDA=<toolkit root, e.g. <mount>/cuda-13.0>: the rig has only Ubuntu nvcc 12.4, which cannot build sm_120 (doc: Blackwell builds)}
 ARCH=${ARCH:-86-real;120-real}
 JOBS=${JOBS:-3}
 MIN_FREE_GB=${MIN_FREE_GB:-6}
@@ -22,8 +22,8 @@ CMAKE=${CMAKE:-$(command -v cmake || true)}
 [ -n "$CMAKE" ] || CMAKE=$HOME/tools/cmake-3.31.6-linux-x86_64/bin/cmake
 die() { echo "build_gpu_server_linux.sh: $*" >&2; exit 2; }
 
-[ -x "$CUDA/bin/nvcc" ] || die "no $CUDA/bin/nvcc: install the CUDA toolkit there (runfile --toolkit --toolkitpath=$CUDA --silent, no driver; Jack-only step, doc \"Blackwell (sm_120) builds\")"
-[ -x "$CMAKE" ] || die "no cmake (CMAKE=<path>; the T340 has ~/tools/cmake-3.31.6-linux-x86_64/bin/cmake)"
+[ -x "$CUDA/bin/nvcc" ] || die "no $CUDA/bin/nvcc: install the CUDA toolkit there (runfile --toolkit --toolkitpath=$CUDA --silent, no driver; operator-only step, doc \"Blackwell (sm_120) builds\")"
+[ -x "$CMAKE" ] || die "no cmake (CMAKE=<path>; the host-b has ~/tools/cmake-3.31.6-linux-x86_64/bin/cmake)"
 [ -f "$SRC/CMakeLists.txt" ] || die "SRC=$SRC is not a strata checkout"
 
 # 1. the toolkit can build ARCH (same table the CMake configure uses)
@@ -35,7 +35,7 @@ major=${ver%%.*}
 if command -v nvidia-smi >/dev/null 2>&1; then
   drv=$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA \(UMD \)\?Version: *\([0-9][0-9]*\.[0-9][0-9]*\).*/\2/p' | head -1)
   if [ -n "$drv" ]; then
-    [ "$(printf '%s\n%s\n' "$ver" "$drv" | sort -V | tail -1)" = "$drv" ] || die "driver supports CUDA $drv only, toolkit is $ver: use a toolkit <= $drv (a driver update is Jack-only)"
+    [ "$(printf '%s\n%s\n' "$ver" "$drv" | sort -V | tail -1)" = "$drv" ] || die "driver supports CUDA $drv only, toolkit is $ver: use a toolkit <= $drv (a driver update is operator-only)"
     echo "driver CUDA $drv >= toolkit $ver"
   fi
 fi
@@ -52,7 +52,7 @@ echo "host compiler $HOSTCXX"
 # 4. disk: the build dir's filesystem (explicit path: a bare df hangs on the rig's stale NFS)
 mkdir -p "$B"
 free_kb=$(df -Pk "$B" | awk 'NR==2{print $4}')
-[ "$free_kb" -ge $((MIN_FREE_GB * 1024 * 1024)) ] || die "only $((free_kb / 1048576)) GB free under $B (need $MIN_FREE_GB): pick B on /mnt/models (explicit path), never the full /home"
+[ "$free_kb" -ge $((MIN_FREE_GB * 1024 * 1024)) ] || die "only $((free_kb / 1048576)) GB free under $B (need $MIN_FREE_GB): pick B on <mount> (explicit path), never the full /home"
 
 # 5. configure and build (only the two GPU server targets; the engine itself is not needed)
 command -v ninja >/dev/null 2>&1 || die "no ninja on PATH"

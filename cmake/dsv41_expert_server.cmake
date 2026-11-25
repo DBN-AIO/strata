@@ -2,7 +2,7 @@
 #
 # Included at the end of the top-level CMakeLists.txt, next to cpu_expert_server.cmake and under the same condition: no CUDA / HIP /
 # SYCL, x86, STRATA_NATIVE_EXPERTS.  It adds
-#   strata-dsv41-expert-server   the server for a host without a card (T340) or without the CUDA toolkit yet (the stream PC)
+#   strata-dsv41-expert-server   the server for a host without a card (host-b) or without the CUDA toolkit yet (the Windows host)
 #   ds4_net_test                 the synthetic split test's program (tools/dsv41/synthetic_split_test.py runs it)
 # Both are made of src/dsv41/ds4_net.cpp (expert map, CPU expert host, conductor Remote), the protocol (net_experts.cpp, compiled
 # through ds4_net_proto.cpp without the qwen38 pool) and the dsv41 engine's own CPU lane (ds4_gguf_cpu / ds4_iq_cpu / ds4_tq_cpu /

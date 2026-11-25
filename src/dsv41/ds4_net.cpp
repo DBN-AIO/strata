@@ -291,15 +291,21 @@ bool ExpertHost::open(const ExpertMap& m, int lo, int hi, int threads, std::stri
         for (int r = 0; r < 3; ++r) {
             const size_t fi = (size_t) L.file[r];
             if (fi >= m.files.size()) { err = "layer " + std::to_string(il) + ": bad file index"; return false; }
-            if (I.maps[fi] != nullptr) continue;
-            const std::string path = m.full_path((int) fi);
-            I.fds[fi] = os::open_ro(path);
-            if (I.fds[fi] == os::kBadFd) { err = path + ": cannot open"; return false; }
-            I.sizes[fi] = os::file_size(I.fds[fi]);
-            void* p = os::map_ro(I.fds[fi], I.sizes[fi]);
-            if (p == nullptr) { err = path + ": cannot map"; return false; }
-            I.maps[fi] = (const uint8_t*) p;
-            if (L.off[r] + (uint64_t) m.n_exp * L.stride[r] > I.sizes[fi]) { err = path + ": shorter than the pack's tensors say"; return false; }
+            if (I.maps[fi] == nullptr) {
+                const std::string path = m.full_path((int) fi);
+                I.fds[fi] = os::open_ro(path);
+                if (I.fds[fi] == os::kBadFd) { err = path + ": cannot open"; return false; }
+                I.sizes[fi] = os::file_size(I.fds[fi]);
+                void* p = os::map_ro(I.fds[fi], I.sizes[fi]);
+                if (p == nullptr) { err = path + ": cannot map"; return false; }
+                I.maps[fi] = (const uint8_t*) p;
+            }
+            // checked for EVERY layer and matrix, not only the one that first maps the file: a truncated file would otherwise pass
+            // here and kill the server with SIGBUS on the first request that reads past its end
+            if (L.off[r] + (uint64_t) m.n_exp * L.stride[r] > I.sizes[fi]) {
+                err = m.full_path((int) fi) + ": shorter than the pack's tensors say (layer " + std::to_string(il) + ")";
+                return false;
+            }
         }
         const bool mx = L.type[0] == kTypeMXFP4 && L.type[2] == kTypeMXFP4;
         I.mx[(size_t) il] = mx ? 1 : 0;
