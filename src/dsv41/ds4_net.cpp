@@ -681,11 +681,22 @@ int server_main(int argc, char** argv) {
         else if (a == "--gpu-device") gpu_device = std::atol(val("--gpu-device").c_str());
         else if (a == "--gpu-cpu-rest") gpu_cpu_rest = true;
         else if (a == "--once") once = true;
+        else if (a == "--expert-timeout-ms" || a == "--expert-idle-timeout-ms") {   // the socket timeout, and how long a session may wait for its next request
+            const bool idle = a == "--expert-idle-timeout-ms";
+            long tv = 0;
+            if (!np::parse_uint(val(a.c_str()), idle ? 0 : 100, idle ? 86400000 : 600000, tv)) {
+                std::fprintf(stderr, "strata-dsv41 --expert-server: %s takes %s\n", a.c_str(), idle ? "0..86400000 (0 = never, unsafe)" : "100..600000");
+                return 2;
+            }
+            if (idle) core::net_set_idle_timeout_ms((int) tv); else core::net_set_timeout_ms((int) tv);
+        }
         else if (a == "--help" || a == "-h") {
             std::printf("strata-dsv41 --expert-server --pack DIR --listen [HOST:]PORT [--serve-layers A-B] [--serve-experts E0-E1] [--cpu-threads N] [--no-warm]\n"
                         "  strata-dsv41 --expert-server-gpu ... [--gpu-vram-gb G] [--gpu-reserve-mib N] [--gpu-device N] [--gpu-cpu-rest]\n"
                         "  keeps the served experts in VRAM (CUDA build only): refuses, printing the shortfall, when they do not fit the card;\n"
                         "  --gpu-cpu-rest serves the layers that do not fit from the CPU lane instead.\n"
+                        "  --expert-timeout-ms N (100..600000, default 10000; env STRATA_EXPERT_TIMEOUT_MS): every socket read and write, and the time a request has to arrive once it has begun.\n"
+                        "  --expert-idle-timeout-ms N (default 600000; env STRATA_EXPERT_IDLE_MS; 0 = never, unsafe): how long a session may wait for the conductor's next request before it is closed.\n"
                         "  serves the pack's routed experts of layers A-B (default: all) to a conductor started with\n"
                         "  --remote-experts HOST:PORT=A-B.  CPU only: CUDA is never touched.  STRATA_EXPERT_TOKEN sets the shared secret.\n");
             return 0;

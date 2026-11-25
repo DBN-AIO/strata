@@ -59,6 +59,8 @@ void usage(std::FILE* f) {
         "  --serve-layers A-B   layers to hold in RAM and answer for, inclusive (default: all)\n"
         "  --pool-workers N     CPU expert pool worker count (default 0: every physical core minus the host's)\n"
         "  --no-host-worker     the calling thread does not take expert jobs (A/B arm)\n"
+        "  --expert-timeout-ms N       socket timeout, 100..600000 (default 10000; env STRATA_EXPERT_TIMEOUT_MS)\n"
+        "  --expert-idle-timeout-ms N  a session that sends no request for N ms is closed (default 600000; env STRATA_EXPERT_IDLE_MS; 0 = never, unsafe)\n"
         "  --expert-server      accepted (this program is the expert server)\n"
         "  ignored, taking the engine's command line: --gpu --max-context --prefill --spec --expert-profile --expert-cache\n"
         "                       --pcie-frac --mmap-experts --ple-gguf --max-new --tokens --greedy\n"
@@ -96,6 +98,15 @@ bool parse(int argc, char** argv, Options& o) {
         else if (a == "--serve-layers") o.serve_layers = next("--serve-layers");
         else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
         else if (a == "--no-host-worker") o.no_host_worker = true;
+        else if (a == "--expert-timeout-ms" || a == "--expert-idle-timeout-ms") {   // the socket timeout, and how long a session may wait for its next request
+            const bool idle = a == "--expert-idle-timeout-ms";
+            long tv = 0;
+            if (!strata::core::netproto::parse_uint(next(a.c_str()), idle ? 0 : 100, idle ? 86400000 : 600000, tv)) {
+                std::fprintf(stderr, "strata-expert-server: %s takes %s\n", a.c_str(), idle ? "0..86400000 (0 = never, unsafe)" : "100..600000");
+                return false;
+            }
+            if (idle) strata::core::net_set_idle_timeout_ms((int) tv); else strata::core::net_set_timeout_ms((int) tv);
+        }
         else if (a == "--help" || a == "-h") o.help = true;
         else if (ignored_flag(a, tv)) {
             if (tv) (void) next(a.c_str());

@@ -54,6 +54,11 @@ std::string net_isa_name(uint32_t isa);
 uint32_t net_isa_bits();
 /// Socket read/write/connect timeout in ms for both ends (default 10000; env STRATA_EXPERT_TIMEOUT_MS; --expert-timeout-ms).
 void net_set_timeout_ms(int ms);
+/// Server only: how long an established session may wait for the conductor's NEXT request before it is closed and the single
+/// session slot is free again (default 600000 = 10 min; env STRATA_EXPERT_IDLE_MS; --expert-idle-timeout-ms; 0 = never, unsafe: a
+/// peer that connects and sends nothing then keeps the slot for ever).  Once a request's first byte has arrived the rest of it must
+/// follow within the socket timeout above.  A conductor that was dropped for idling computes that request locally and reconnects after the 1 s back-off (NetExperts::route_up).
+void net_set_idle_timeout_ms(int ms);
 
 /// Not thread safe: one conductor thread calls begin / finish (one request in flight, `cur_`, `owned_`, `buf_`).
 class NetExperts {

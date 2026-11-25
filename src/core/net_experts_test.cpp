@@ -176,6 +176,20 @@ int main() {
         check(serve_cfg_problem(10, fp1).empty(), "serve_cfg_problem: top_k and fingerprint set: ok");
     }
 
+    {   // ---- the per-source handshake limiter (a slow peer cannot take every handshake slot from the real conductor)
+        SourceLimiter lim;
+        check(lim.admit("a") && lim.admit("a"), "SourceLimiter: two handshakes from one address admitted");
+        check(!lim.admit("a"), "SourceLimiter: the third from the same address refused");
+        check(lim.admit("b"), "SourceLimiter: another address is admitted while \"a\" is full");
+        lim.release("a");
+        check(lim.admit("a"), "SourceLimiter: admitted again after one release");
+        check(!lim.admit("a"), "SourceLimiter: and full again");
+        lim.release("a"); lim.release("a"); lim.release("b");
+        lim.release("never-admitted");   // a stray release must not go negative or throw
+        check(lim.admit("a") && lim.admit("a") && !lim.admit("a"), "SourceLimiter: all released, the cap is two again");
+        check(lim.tracked() == 1, "SourceLimiter: only addresses with a handshake in flight are kept");
+    }
+
     if (g_fail == 0) std::printf("net_experts_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }

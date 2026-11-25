@@ -72,6 +72,8 @@ constexpr uint64_t kMaxReqFrame = 1ull << 20;
 constexpr uint64_t kMaxRespFrame = 4ull << 20;
 constexpr int kMaxHandshakes = 8;          // concurrent unauthenticated connections the server will hold
 constexpr int kDefaultTimeoutMs = 10000;
+constexpr int kDefaultIdleMs = 600000;     // a session that sends no request header for this long is closed (10 min; 0 = never, unsafe)
+constexpr int kMaxIdleMs = 86400000;       // 24 h
 
 double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
 
@@ -163,6 +165,20 @@ int timeout_ms() {
     return v;
 }
 
+std::atomic<int> g_idle_ms{-1};   // -1: not set by a flag; 0 is a valid value (no idle limit)
+int idle_timeout_ms() {
+    int v = g_idle_ms.load(std::memory_order_relaxed);
+    if (v >= 0) return v;
+    v = kDefaultIdleMs;
+    if (const char* e = std::getenv("STRATA_EXPERT_IDLE_MS")) {
+        long x = 0;
+        if (np::parse_uint(e, 0, kMaxIdleMs, x)) v = (int) x;
+        else std::fprintf(stderr, "strata net: STRATA_EXPERT_IDLE_MS must be 0..%d; using %d\n", kMaxIdleMs, v);
+    }
+    g_idle_ms.store(v, std::memory_order_relaxed);
+    return v;
+}
+
 std::string env_token() {
     const char* t = std::getenv("STRATA_EXPERT_TOKEN");
     return t != nullptr ? std::string(t) : std::string();
@@ -177,7 +193,7 @@ void sock_tune(sock_t s, bool keepalive) {
 #ifdef SO_NOSIGPIPE
     setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, (const char*) &one, sizeof one);   // macOS: no SIGPIPE on a closed peer
 #endif
-    if (keepalive) {   // the server's idle session waits without a read timeout: keepalive notices a dead host
+    if (keepalive) {   // an idle session waits up to the idle limit for the next request: keepalive notices a dead host sooner
         setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char*) &one, sizeof one);
 #if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
         int idle = 30, intvl = 10, cnt = 3;
@@ -192,6 +208,17 @@ void sock_tune(sock_t s, bool keepalive) {
 thread_local std::string g_why;
 void why_errno(int e) {
     g_why = err_timeout(e) ? "timed out waiting for the peer" : "socket error (errno " + std::to_string(e) + ")";
+}
+
+/// Receive timeout only (0: none); the send timeout stays as set.
+void set_rcv_timeout(sock_t s, int rcv_ms) {
+#ifdef _WIN32
+    DWORD r = (DWORD) rcv_ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*) &r, sizeof r);
+#else
+    timeval r{rcv_ms / 1000, (rcv_ms % 1000) * 1000};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*) &r, sizeof r);
+#endif
 }
 
 bool send_all(sock_t s, const void* p, size_t n) {
@@ -216,7 +243,13 @@ bool send_all(sock_t s, const void* p, size_t n) {
 bool recv_all(sock_t s, void* p, size_t n, double deadline_ms = 0) {
     char* c = (char*) p;
     while (n > 0) {
-        if (deadline_ms > 0 && now_ms() > deadline_ms) { g_why = "timed out waiting for the peer"; return false; }
+        if (deadline_ms > 0) {   // wait for data only as long as the deadline allows, so one recv cannot outlive it (the socket's own timeout stays as set)
+            const double left = deadline_ms - now_ms();
+            if (left <= 0) { g_why = "timed out waiting for the peer"; return false; }
+            const int pr = sock_poll(s, false, (int) std::min<double>(std::max(left, 1.0), 2000000000.0));
+            if (pr == 0) { g_why = "timed out waiting for the peer"; return false; }
+            if (pr < 0) { why_errno(sock_errno()); return false; }
+        }
         const int r = (int) ::recv(s, c, (int) (n > (1u << 30) ? (1u << 30) : n), 0);
         if (r > 0) { c += r; n -= (size_t) r; continue; }
         const int e = sock_errno();
@@ -232,14 +265,39 @@ bool send_frame(sock_t s, uint32_t type, const void* payload, uint64_t len) {
     if (!send_all(s, &h, sizeof h)) return false;
     return len == 0 || send_all(s, payload, (size_t) len);
 }
-bool recv_frame(sock_t s, uint32_t& type, std::vector<uint8_t>& payload, uint64_t max_len, double deadline_ms = 0) {
-    Hdr h;
-    if (!recv_all(s, &h, sizeof h, deadline_ms)) return false;
+/// The rest of a frame once its header is in: checks, then the payload (by `deadline_ms`, 0: the socket's own timeout).
+bool recv_frame_body(sock_t s, const Hdr& h, uint32_t& type, std::vector<uint8_t>& payload, uint64_t max_len, double deadline_ms) {
     if (h.magic != kMagic) { g_why = "not an SXP frame (bad magic)"; return false; }
     if (h.len > max_len) { g_why = "frame of " + std::to_string(h.len) + " bytes exceeds the limit " + std::to_string(max_len); return false; }
     type = h.type;
     payload.resize((size_t) h.len);
     return h.len == 0 || recv_all(s, payload.data(), (size_t) h.len, deadline_ms);
+}
+bool recv_frame(sock_t s, uint32_t& type, std::vector<uint8_t>& payload, uint64_t max_len, double deadline_ms = 0) {
+    Hdr h;
+    if (!recv_all(s, &h, sizeof h, deadline_ms)) return false;
+    return recv_frame_body(s, h, type, payload, max_len, deadline_ms);
+}
+/// The next frame of an established session.  Waiting for its FIRST byte may take `idle_ms` (a conductor sits idle between
+/// prompts; 0: forever); once that byte is in, the rest of the header and the payload must arrive within `frame_ms` in total, so a
+/// peer that trickles a byte a minute fails like a stall instead of holding the session slot.
+bool recv_session_frame(sock_t s, uint32_t& type, std::vector<uint8_t>& payload, uint64_t max_len, int idle_ms, int frame_ms) {
+    Hdr h;
+    char* c = (char*) &h;
+    set_rcv_timeout(s, idle_ms);
+    for (;;) {
+        const int r = (int) ::recv(s, c, 1, 0);
+        if (r > 0) break;
+        const int e = sock_errno();
+        if (r < 0 && err_intr(e)) continue;
+        if (r == 0) g_why = "connection closed by the peer";
+        else if (err_timeout(e)) g_why = "idle: no request for " + std::to_string(idle_ms) + " ms";
+        else why_errno(e);
+        return false;
+    }
+    const double deadline = now_ms() + frame_ms;   // one deadline for the rest of the header and the payload together
+    if (!recv_all(s, c + 1, sizeof h - 1, deadline)) return false;
+    return recv_frame_body(s, h, type, payload, max_len, deadline);
 }
 void send_err(sock_t s, const std::string& m) { send_frame(s, kErr, m.data(), m.size()); }
 
@@ -312,6 +370,7 @@ void random_bytes(uint8_t* p, size_t n) {
 
 // ================================================================== identity
 void net_set_timeout_ms(int ms) { if (ms >= 100) g_timeout_ms.store(ms, std::memory_order_relaxed); }
+void net_set_idle_timeout_ms(int ms) { if (ms >= 0 && ms <= kMaxIdleMs) g_idle_ms.store(ms, std::memory_order_relaxed); }
 
 std::string net_isa_name(uint32_t isa) {
     std::string s = (isa & 1) ? "avx512" : (isa & 2) ? "avx512bw" : (isa & 4) ? "avx2" : "baseline";
@@ -707,6 +766,8 @@ struct ServerCtx {
     np::ReqLimits lim;
     std::string token;
     int tmo_ms = kDefaultTimeoutMs;
+    int idle_ms = kDefaultIdleMs;            // longest wait for a session's next request (0: unlimited)
+    np::SourceLimiter sources;               // unauthenticated connections per peer address
     int64_t H = 0;                           // hidden size on the wire
     std::atomic<bool> stop{false};
     std::atomic<bool> busy{false};           // a session owns the dispatch (one conductor at a time)
@@ -723,13 +784,15 @@ bool log_refusal(ServerCtx& C) {   // the first 20 refusals, then every 100th: a
 }
 
 /// One connection, off the dispatch thread: challenge, authenticate, check the model, claim the single session slot.
-void handshake_thread(ServerCtx* C, sock_t s) {
-    const std::string peer = peer_str(s);
+void handshake_thread(ServerCtx* C, sock_t s, const std::string& peer) {
+    struct Slot {   // the handshake slots (global and per address) are given back on EVERY way out of this function
+        ServerCtx* C; const std::string& peer;
+        ~Slot() { C->sources.release(peer); --C->handshaking; }
+    } slot{C, peer};
     auto finish_fail = [&](const std::string& tell, const std::string& log) {
         if (!tell.empty()) send_err(s, tell);
         if (log_refusal(*C)) std::fprintf(stderr, "strata net: refused connection from %s: %s\n", peer.c_str(), log.c_str());
         sock_close(s);
-        --C->handshaking;
     };
     set_io_timeouts(s, C->tmo_ms, C->tmo_ms);
     sock_tune(s, false);
@@ -776,7 +839,6 @@ void handshake_thread(ServerCtx* C, sock_t s) {
         C->ready.peer = peer;
     }
     C->cv.notify_all();
-    --C->handshaking;
 }
 
 /// The REQ loop of the one authenticated conductor, on the thread that owns the dispatch.
@@ -785,14 +847,15 @@ void serve_session(const ExpertComputeFn& compute, ServerCtx& C, sock_t s, const
     const size_t H = (size_t) C.H;
     std::fprintf(stderr, "strata net: conductor connected from %s\n", peer.c_str());
     sock_tune(s, true);
-    set_io_timeouts(s, 0, C.tmo_ms);   // a conductor may sit idle between prompts (keepalive covers a dead one); a send never waits forever
+    set_io_timeouts(s, C.idle_ms, C.tmo_ms);   // a conductor may sit idle between prompts, but not for ever (C.idle_ms); a send never waits forever
+    std::string end_why;
     uint64_t calls = 0, bad_reqs = 0, rows_asked = 0;
     double compute_ms = 0;
     const ExpertServeCfg& cf = *C.cfg;
     const uint64_t gpu0 = cf.gpu_rows != nullptr ? cf.gpu_rows(cf.gpu_user) : 0;
     for (;;) {
         uint32_t type = 0;
-        if (!recv_frame(s, type, payload, kMaxReqFrame)) break;
+        if (!recv_session_frame(s, type, payload, kMaxReqFrame, C.idle_ms, C.tmo_ms)) { end_why = g_why; break; }
         if (type == kBye) break;
         if (type != kReq) { send_err(s, "unexpected frame"); break; }
         np::ReqView v;
@@ -823,8 +886,9 @@ void serve_session(const ExpertComputeFn& compute, ServerCtx& C, sock_t s, const
         ++calls; compute_ms += us / 1000.0; rows_asked += v.rows;
     }
     sock_close(s);
-    std::fprintf(stderr, "strata net: conductor %s disconnected after %llu calls (%llu refused), mean compute %.3f ms\n", peer.c_str(),
-                 (unsigned long long) calls, (unsigned long long) bad_reqs, calls ? compute_ms / (double) calls : 0.0);
+    std::fprintf(stderr, "strata net: conductor %s disconnected%s%s after %llu calls (%llu refused), mean compute %.3f ms\n", peer.c_str(),
+                 end_why.empty() ? "" : ": ", end_why.c_str(), (unsigned long long) calls, (unsigned long long) bad_reqs,
+                 calls ? compute_ms / (double) calls : 0.0);
     if (cf.gpu_rows != nullptr) {
         const uint64_t on_gpu = cf.gpu_rows(cf.gpu_user) - gpu0;
         std::fprintf(stderr, "strata net: %llu rows asked, %llu computed on helper GPUs (%.1f%%)\n", (unsigned long long) rows_asked,
@@ -853,6 +917,7 @@ int serve_experts(const ExpertServeCfg& cfg, const ExpertComputeFn& compute) {
     C.cfg = &cfg;
     C.token = env_token();
     C.tmo_ms = timeout_ms();
+    C.idle_ms = idle_timeout_ms();
     C.H = cfg.identity.n_embd != 0 ? (int64_t) cfg.identity.n_embd : kQwenH;
     if (C.H <= 0) { std::fprintf(stderr, "strata net: the expert server has no hidden size (identity.n_embd)\n"); return 1; }
     const int64_t H = C.H;
@@ -898,9 +963,11 @@ int serve_experts(const ExpertServeCfg& cfg, const ExpertComputeFn& compute) {
         std::fprintf(stderr, "strata net: cannot listen on %s:%d (errno %d)\n", cfg.host.c_str(), cfg.port, bind_errno);
         return 1;
     }
-    std::fprintf(stderr, "strata net: expert server listening on %s:%d, layers %d-%d, experts %d-%d of %lld, auth %s, timeout %d ms\n", bound, cfg.port,
+    std::fprintf(stderr, "strata net: expert server listening on %s:%d, layers %d-%d, experts %d-%d of %lld, auth %s, timeout %d ms, idle limit %d ms\n", bound, cfg.port,
                  lo, hi, cfg.expert_lo, cfg.expert_hi < 0 ? (int) cfg.n_expert - 1 : cfg.expert_hi, (long long) cfg.n_expert,
-                 C.token.empty() ? "off" : "token", C.tmo_ms);
+                 C.token.empty() ? "off" : "token", C.tmo_ms, C.idle_ms);
+    if (C.idle_ms == 0)
+        std::fprintf(stderr, "strata net: WARNING: no idle limit (--expert-idle-timeout-ms 0): a connected peer that sends nothing keeps the one session for ever\n");
     if (!loopback && C.token.empty()) {   // an open listener on a reachable address needs an explicit opt-out, never a default
         const char* allow = std::getenv("STRATA_EXPERT_ALLOW_NO_TOKEN");
         if (allow == nullptr || *allow != '1') {
@@ -936,14 +1003,21 @@ int serve_experts(const ExpertServeCfg& cfg, const ExpertComputeFn& compute) {
             }
             backoff_ms = 0;
             if (C.handshaking.load() >= kMaxHandshakes) { sock_close(s); continue; }
+            const std::string peer = peer_str(s);
+            if (!C.sources.admit(peer)) {   // one address may hold only a few unauthenticated connections: the rest are not its to take
+                if (log_refusal(C)) std::fprintf(stderr, "strata net: refused connection from %s: %d connections from this address are already in the handshake\n", peer.c_str(), np::kMaxHandshakesPerSource);
+                sock_close(s);
+                continue;
+            }
             ++C.handshaking;
             auto c = std::make_unique<Conn>();
             Conn* cp = c.get();
             try {
-                c->t = std::thread([&C, cp, s] { handshake_thread(&C, s); cp->done = true; });
+                c->t = std::thread([&C, cp, s, peer] { handshake_thread(&C, s, peer); cp->done = true; });
                 conns.push_back(std::move(c));
             } catch (const std::exception&) {
                 sock_close(s);
+                C.sources.release(peer);
                 --C.handshaking;
             }
         }

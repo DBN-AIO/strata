@@ -3547,6 +3547,14 @@ int main(int argc, char** argv) {
             }
             strata::core::net_set_timeout_ms((int) tv);
         }
+        else if (a == "--expert-idle-timeout-ms") {
+            long tv = 0;
+            if (!strata::core::netproto::parse_uint(next("--expert-idle-timeout-ms"), 0, 86400000, tv)) {
+                std::fprintf(stderr, "strata generate: --expert-idle-timeout-ms takes 0..86400000 (0 = never, unsafe)\n");
+                return 2;
+            }
+            strata::core::net_set_idle_timeout_ms((int) tv);
+        }
         else if (a == "--serve-layers") o.serve_layers = next("--serve-layers");
         else if (a == "--remote-experts") o.remote_experts = next("--remote-experts");
         else if (a == "--vision") o.vision = true;

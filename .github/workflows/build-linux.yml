@@ -131,6 +131,41 @@ jobs:
       - name: DeepSeek split test (synthetic)
         run: python3 tools/dsv41/synthetic_split_test.py build-cpu --tmp build-cpu/synthetic-tmp
 
+      # The wire protocol's socket cases (tools/net_experts_probe.py; docs/REMOTE_EXPERTS.md, "Security"): a wrong token, an oversized
+      # pre-auth frame, bad requests that keep the session, a second conductor told busy, an idle connection, one address holding
+      # the handshake slots, a request that starts and never finishes, a session that says nothing.  A real server on a synthetic
+      # pack on loopback, a free port picked by the OS, killed by the PID this step started.  About 40 s (it waits out its timeouts).
+      - name: Expert server socket probe (synthetic pack)
+        run: |
+          set -eu
+          work=$(mktemp -d build-cpu/probe-XXXXXX)   # a disk dir under the build tree, never /tmp
+          python3 tools/dsv41/make_synthetic_pack.py "$work/pack" --seed 1 > /dev/null
+          port=$(python3 -c "import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1])")
+          export STRATA_EXPERT_TOKEN=ci-probe-token-123456 TMPDIR="$work"
+          build-cpu/strata-dsv41-expert-server --pack "$work/pack" --listen "127.0.0.1:$port" --serve-layers 0-7 --no-warm --cpu-threads 2 \
+              --expert-timeout-ms 3000 --expert-idle-timeout-ms 4000 > "$work/server.log" 2>&1 &
+          srv=$!
+          up=0
+          for _ in $(seq 1 300); do
+            kill -0 "$srv" 2>/dev/null || break
+            if python3 -c "import socket,sys; socket.create_connection(('127.0.0.1', int(sys.argv[1])), 0.5).close()" "$port" 2>/dev/null; then up=1; break; fi
+            sleep 0.1
+          done
+          rc=1
+          if [ "$up" = 1 ]; then
+            rc=0
+            python3 tools/net_experts_probe.py --host 127.0.0.1 --port "$port" --pack "$work/pack" --timeout-ms 3000 --idle-ms 4000 > "$work/probe.out" 2>&1 || rc=$?
+            cat "$work/probe.out"
+            echo "PASS lines: $(grep -c '^PASS' "$work/probe.out" || true)"
+          else
+            echo "::error::the expert server did not start"
+          fi
+          kill "$srv" 2>/dev/null || true
+          wait "$srv" 2>/dev/null || true
+          echo "---- server log (tail)"; tail -n 25 "$work/server.log"
+          if grep -q '^FAIL' "$work/probe.out" 2>/dev/null; then rc=1; fi
+          exit "$rc"
+
       # BBXL: popularity-aware placement (plan_split.py --popularity) and the rank-ordered slice (slice_stream.py emit --perm); pure python, about 2 s.
       - name: DeepSeek split planner tests
         run: |

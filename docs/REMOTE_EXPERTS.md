@@ -70,9 +70,12 @@ strata ... --remote-experts 192.0.2.10:7840=38-47[,host2:7840=24-37]
 - `--expert-server` and `--remote-experts` are exclusive. A server always runs the plain CPU pool: a peer GPU, helper GPUs
   and a net route are forced off in server mode (and `serve_experts` refuses to start if any is set).
 - Timeouts: every socket read, write and connect on both ends gives up after 10 s (`--expert-timeout-ms N` or
-  `STRATA_EXPERT_TIMEOUT_MS`, 100..600000). The server's idle session waits for the next request without a read timeout
-  (a conductor may pause between prompts; TCP keepalive notices a dead host), but a connection that has not completed the
-  handshake within the timeout is dropped.
+  `STRATA_EXPERT_TIMEOUT_MS`, 100..600000; the servers take both flags too). An established session waits for the next
+  request up to the **idle limit**, 10 minutes by default (`--expert-idle-timeout-ms N` or `STRATA_EXPERT_IDLE_MS`,
+  0..86400000; 0 = never, which the server warns about at start); a conductor that pauses longer is dropped, computes that
+  request locally and reconnects after the 1 s back-off (see "Faults on the conductor"). Once the first byte of a request
+  has arrived the rest of it must follow within the timeout above in total, so a peer that sends a byte a minute fails
+  like a stall. A connection that has not completed the handshake within the timeout is dropped.
 - The server holds its experts in RAM: it touches every page of its layers at start (`strata net: served layers ...
   resident ...` line gives the resident GiB). `mlock` is attempted and needs `ulimit -l` headroom; without it the pages
   stay in the page cache and the OS may evict them under memory pressure.
@@ -103,13 +106,21 @@ port 7840 proto tcp`), and never expose it to the internet.
   dispatch state is reset before each request, so one bad request can no longer disable the server (it did before:
   `d.failed` stayed set until a restart). Frame sizes are capped (4 KiB before authentication, 1 MiB per request).
 - **One conductor at a time**, because the dispatch is single-threaded. Handshakes run on their own threads (at most 8 at
-  once), so an idle or half-open connection cannot block the real conductor; a second authenticated conductor gets ERR
-  "busy".
+  once, and at most 2 from one peer address), so an idle or half-open connection cannot block the real conductor and one
+  host cannot take every handshake slot; a second authenticated conductor gets ERR "busy".
+- **A session cannot sit on the slot.** An authenticated peer that connects and sends nothing is closed after the idle
+  limit; one that starts a request and stops (or trickles) is closed after the socket timeout. The server log names the
+  peer address and the reason ("conductor 192.0.2.7 disconnected: idle: no request for 600000 ms ...").
 - **SIGPIPE** is ignored in both modes and sends use `MSG_NOSIGNAL` (`SO_NOSIGPIPE` on macOS): a peer that dies mid-frame
   gives an error, not a dead process.
 
 `tools/net_experts_probe.py` checks all of this against a running server (wrong/missing token, oversized pre-auth frame,
-each kind of bad request followed by a good one, busy, idle connection).
+each kind of bad request followed by a good one, busy, idle connection, one address holding the handshake slots, a request
+that starts and never finishes, a session that sends nothing). CI runs it on every push against a synthetic-pack server on
+loopback (the step "Expert server socket probe (synthetic pack)" of `build-linux.yml`); run it by hand with
+`STRATA_EXPERT_TOKEN=... python3 tools/net_experts_probe.py --host H --port P [--pack DIR] --timeout-ms 3000 --idle-ms N`
+(`--pack` takes the model's geometry and engine family from a synthetic dsv41 pack, `--timeout-ms` and `--idle-ms` are the
+server's own settings).
 
 ## Faults on the conductor
 

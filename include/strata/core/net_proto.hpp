@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -321,5 +323,37 @@ inline bool layer_covered(const std::vector<RouteSpec>& rs, int64_t layer, int64
     for (uint8_t o : own) if (!o) return false;
     return true;
 }
+
+// ---------------------------------------------------------------- per-source cap on unauthenticated connections
+/// Concurrent connections from ONE peer address that may sit in the handshake (before the token is checked).  The server's global
+/// cap (8) alone let one slow host hold every slot, renewed every handshake deadline, and keep the real conductor out.
+inline constexpr int kMaxHandshakesPerSource = 2;
+/// Counts the handshakes in flight per peer address (the string the server already logs).  Thread safe: admit() runs on the
+/// acceptor thread, release() on the handshake threads.
+class SourceLimiter {
+public:
+    explicit SourceLimiter(int cap = kMaxHandshakesPerSource) : cap_(cap) {}
+    /// False when `cap` handshakes from `peer` are already in flight (the caller closes the connection and does NOT release).
+    bool admit(const std::string& peer) {
+        std::lock_guard<std::mutex> lk(mu_);
+        int& n = n_[peer];
+        if (n >= cap_) { if (n == 0) n_.erase(peer); return false; }
+        ++n;
+        return true;
+    }
+    /// One admitted handshake of `peer` ended (any outcome).  A release of an address that holds none is ignored.
+    void release(const std::string& peer) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = n_.find(peer);
+        if (it == n_.end()) return;
+        if (--it->second <= 0) n_.erase(it);
+    }
+    /// Addresses with at least one handshake in flight (the map never keeps an idle address).
+    size_t tracked() const { std::lock_guard<std::mutex> lk(mu_); return n_.size(); }
+private:
+    int cap_;
+    mutable std::mutex mu_;
+    std::map<std::string, int> n_;
+};
 
 }  // namespace strata::core::netproto
