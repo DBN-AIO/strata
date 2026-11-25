@@ -322,4 +322,15 @@ inline bool layer_covered(const std::vector<RouteSpec>& rs, int64_t layer, int64
     return true;
 }
 
+// ---------------------------------------------------------------- the shared secret's minimum length
+/// docs/REMOTE_EXPERTS.md, "Security": a token of 16 or more bytes.  The empty token means "no token" (another gate decides
+/// whether that is allowed); anything between 1 and 15 bytes is refused, it is guessable offline from one captured HELLO.
+inline constexpr size_t kMinTokenBytes = 16;
+inline bool token_ok(const std::string& t) { return t.empty() || t.size() >= kMinTokenBytes; }
+
+/// `--serve-layers A` or `A-B` (digits only, A <= B): false is a typo, never a silent layer 0.
+inline bool serve_layers_ok(const std::string& s) {
+    int lo = 0, hi = 0;
+    return parse_range(s, 0, 100000, lo, hi);
+}
 }  // namespace strata::core::netproto

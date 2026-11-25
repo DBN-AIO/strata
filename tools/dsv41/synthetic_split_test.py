@@ -48,6 +48,7 @@ build = args_.build
 exe = ".exe" if os.name == "nt" else ""
 test_bin = os.path.join(build, "ds4_net_test" + exe)
 srv_bin = os.path.join(build, "strata-dsv41-expert-server" + exe)
+srv_hooks_bin = os.path.join(build, "strata-dsv41-expert-server-test" + exe)   # the same server with the STRATA_DS4_SERVER_* test hooks compiled in
 fails = []
 
 
@@ -107,13 +108,16 @@ def _kill_servers():   # a failure or SIGTERM must not leave servers running on 
 atexit.register(_kill_servers)
 
 
-def start(pack, port, layers, env=None, experts=None):
+def start(pack, port, layers, env=None, experts=None, release=False):
     e = dict(os.environ)
     e.update(env or {})
-    cmd = [srv_bin]
+    # the test hooks (die after N requests, delay every request) exist only in the -test build; a run that asks for one gets that
+    # binary, everything else (and `release=True`, whatever the environment says) runs the server as it ships
+    binary = srv_hooks_bin if (not release and any(k.startswith("STRATA_DS4_SERVER_") for k in (env or {}))) else srv_bin
+    cmd = [binary]
     delay = os.environ.get("STRATA_TEST_SERVER_START_DELAY")   # fault injection: the server binds late, as on a loaded runner
     if delay:
-        cmd = [sys.executable, "-c", "import os,sys,time;time.sleep(float(sys.argv[1]));os.execv(sys.argv[2],sys.argv[2:])", delay, srv_bin]
+        cmd = [sys.executable, "-c", "import os,sys,time;time.sleep(float(sys.argv[1]));os.execv(sys.argv[2],sys.argv[2:])", delay, binary]
     p = subprocess.Popen(cmd + ["--pack", pack, "--listen", "127.0.0.1:%d" % port, "--serve-layers", layers, "--no-warm", "--cpu-threads", "2"]
                          + (["--serve-experts", experts] if experts else []),
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=e)
@@ -389,7 +393,7 @@ with tempfile.TemporaryDirectory(prefix="synth-split-", dir=parent) as tmp:
     e = start(pack, 17845, "0-7", token)
     r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17845=0-7", "--arch", "0", "--expect-open-fail"], token)
     check("a qwen38 conductor is refused", "engine family differs" in r.stdout, r.stdout + r.stderr[-200:])
-    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17845=0-7", "--expect-open-fail"], {"STRATA_EXPERT_TOKEN": "wrong"})
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17845=0-7", "--expect-open-fail"], {"STRATA_EXPERT_TOKEN": "a-wrong-token-0123456789"})
     check("a wrong token is refused", "authentication failed" in r.stdout, r.stdout)
     r = run(["--pack", pack3, "--mode", "remote", "--remote", "127.0.0.1:17845=0-7", "--expect-open-fail"], token)
     check("another expert count is refused", "OPEN_FAILED" in r.stdout, r.stdout)
@@ -399,6 +403,24 @@ with tempfile.TemporaryDirectory(prefix="synth-split-", dir=parent) as tmp:
     ob = subprocess.run([srv_bin, "--pack", pack, "--listen", "0.0.0.0:17899", "--serve-layers", "0-7", "--no-warm", "--cpu-threads", "2"],
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env_nt, timeout=60)
     check("a non-loopback listener without a token is refused", ob.returncode != 0 and "refusing to listen" in ob.stdout, ob.stdout[-300:])
+    # 5b2. a token under 16 bytes: the server refuses to start, the conductor refuses to connect (the docs said 16+, the code took anything)
+    env_short = dict(os.environ, STRATA_EXPERT_TOKEN="short")
+    env_short.pop("STRATA_EXPERT_ALLOW_SHORT_TOKEN", None)
+    osrv = subprocess.run([srv_bin, "--pack", pack, "--listen", "127.0.0.1:17896", "--serve-layers", "0-7", "--no-warm", "--cpu-threads", "2"],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env_short, timeout=60)
+    check("a server with a 5 byte token is refused at start", osrv.returncode != 0 and "use at least 16" in osrv.stdout, osrv.stdout[-300:])
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17845=0-7", "--expect-open-fail"], {"STRATA_EXPERT_TOKEN": "short"})
+    check("a conductor with a 5 byte token is refused before it connects", "use at least 16" in r.stdout, r.stdout + r.stderr[-200:])
+    sh = start(pack, 17895, "0-7", {"STRATA_EXPERT_TOKEN": "short", "STRATA_EXPERT_ALLOW_SHORT_TOKEN": "1"})   # (the test-only override works)
+    stop(sh)
+    # 5b3. the released server has no test hooks: it ignores STRATA_DS4_SERVER_DIE_AFTER (the -test build would have exited after 1 request)
+    rel = start(pack, 17894, "0-7", dict(token, STRATA_DS4_SERVER_DIE_AFTER="1", STRATA_DS4_SERVER_DELAY_MS="50"), release=True)
+    r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17894=0-7"], token)
+    out_rel = stop(rel)
+    L = lines(r)
+    check("the released server ignores STRATA_DS4_SERVER_DIE_AFTER: the run is complete, no row computed locally",
+          r.returncode == 0 and L.get("TOKENS") == R.get("TOKENS") and re.search(r"remote expert rows [1-9]\d*, computed locally 0,", L.get("STATS", "")) is not None
+          and "DIE_AFTER reached" not in (out_rel or ""), L.get("STATS", "") + r.stderr[-200:])
     # 5c. a conductor holding a token refuses a server that does not ask for one (downgrade: an impostor skips the challenge flag)
     nt = start(pack, 17898, "0-7")
     r = run(["--pack", pack, "--mode", "remote", "--remote", "127.0.0.1:17898=0-7", "--expect-open-fail"], token)

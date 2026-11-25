@@ -2,6 +2,7 @@
 // SHA-256 / HMAC-SHA256 against FIPS 180 / RFC 4231 vectors, strict address and range parsing, and the server's
 // request validation (the cases that used to poison the server: an expert id out of range, a wrong k, an oversized window).
 #include "strata/core/net_proto.hpp"
+#include "strata/core/net_random.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -174,6 +175,30 @@ int main() {
         check(!serve_cfg_problem(0, fp1).empty(), "serve_cfg_problem: top_k 0 refused");
         check(!serve_cfg_problem(10, fp0).empty(), "serve_cfg_problem: an all-zero fingerprint refused");
         check(serve_cfg_problem(10, fp1).empty(), "serve_cfg_problem: top_k and fingerprint set: ok");
+    }
+
+    {   // ---- the shared secret must be 16 bytes or more (docs said so, the code took any length)
+        check(!token_ok("short"), "token_ok: 5 bytes refused");
+        check(!token_ok(std::string(15, 'a')), "token_ok: 15 bytes refused");
+        check(token_ok(std::string(16, 'a')), "token_ok: 16 bytes accepted");
+        check(token_ok(""), "token_ok: empty = no token, left to the other gate");
+    }
+    {   // ---- --serve-layers: a typo is an error, not layer 0 (atoi turned "x" into 0)
+        check(serve_layers_ok("5") && serve_layers_ok("3-5") && serve_layers_ok("0-0"), "serve_layers_ok: A and A-B accepted");
+        check(!serve_layers_ok("x") && !serve_layers_ok("5-3") && !serve_layers_ok("-1") && !serve_layers_ok("3-") && !serve_layers_ok("") &&
+              !serve_layers_ok("3-5x") && !serve_layers_ok("1-2-3"), "serve_layers_ok: garbage, reversed, negative, empty refused");
+    }
+    {   // ---- the handshake nonce comes from the operating system
+        uint8_t a[32] = {}, b[32] = {};
+        check(os_random(a, 32) && os_random(b, 32), "os_random: succeeds");
+        uint8_t zero[32] = {};
+        check(std::memcmp(a, zero, 32) != 0 && std::memcmp(b, zero, 32) != 0, "os_random: a block is not all zero");
+        check(std::memcmp(a, b, 32) != 0, "os_random: two consecutive blocks differ");
+        std::vector<uint8_t> big(3 * 1024 * 1024 + 5, 0);   // longer than one getrandom / BCrypt call hands out
+        check(os_random(big.data(), big.size()), "os_random: a multi-megabyte fill succeeds");
+        size_t nz = 0;
+        for (uint8_t c : big) nz += c != 0;
+        check(nz > big.size() / 2, "os_random: the multi-megabyte fill is not mostly zero");
     }
 
     if (g_fail == 0) std::printf("net_experts_test: all checks passed\n");

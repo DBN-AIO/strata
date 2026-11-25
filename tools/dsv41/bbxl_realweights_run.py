@@ -290,7 +290,7 @@ class SyntheticEngine(RealEngine):
 
     def env(self, arm, plan):
         e = dict(self.MAP[arm["id"]][1])
-        e["STRATA_EXPERT_TOKEN"] = "bbxl-synthetic"
+        e["STRATA_EXPERT_TOKEN"] = "bbxl-synthetic-token"
         if "STRATA_NET_SERIAL" in arm["env"]:
             e["STRATA_NET_SERIAL"] = "1"
         return e
@@ -454,7 +454,7 @@ def main():
                     if s.get("serve_experts"):
                         argv += ["--serve-experts", s["serve_experts"]]
                     if a.synthetic:
-                        env["STRATA_EXPERT_TOKEN"] = "bbxl-synthetic"
+                        env["STRATA_EXPERT_TOKEN"] = "bbxl-synthetic-token"
                     handles.append(run.spawn(h, argv, env, log="server-%s-%s-%s.log" % (s["host"], kind, planname), token_file=s.get("token_file")))
                 port_addr = s["listen"].replace("0.0.0.0", s.get("connect_host", h.get("addr", "127.0.0.1").split(":")[0] if h.get("addr") else "127.0.0.1"))
                 if not wait_port(port_addr, man.get("ready_timeout_s", 900), a.dry_run):

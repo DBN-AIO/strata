@@ -31,9 +31,14 @@ if(STRATA_BUILD_EXPERT_SERVER AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_H
 
   add_executable(strata-expert-server src/program/expert_server_main.cpp src/program/q36_expert_server.cpp)
   if(WIN32)
-    target_link_libraries(strata-expert-server PRIVATE ws2_32)   # the socket shim in net_experts.cpp (Winsock)
+    target_link_libraries(strata-expert-server PRIVATE ws2_32 bcrypt)   # the socket shim in net_experts.cpp (Winsock), its nonce (BCryptGenRandom)
   endif()
   target_link_libraries(strata-expert-server PRIVATE strata_expert_host)
+  # `--check-args` parses the command line and exits: no model, no GPU (tools/test_expert_server_args.py)
+  find_program(STRATA_PYTHON3 NAMES python3 python)
+  if(STRATA_BUILD_TESTS AND STRATA_PYTHON3)
+    add_test(NAME expert_server_args COMMAND ${STRATA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_expert_server_args.py $<TARGET_FILE:strata-expert-server>)
+  endif()
   message(STATUS "Strata: CPU-only expert server enabled (strata-expert-server; no CUDA)")
 
   if(STRATA_BUILD_TESTS)

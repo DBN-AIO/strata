@@ -4,6 +4,7 @@
 # SYCL, x86, STRATA_NATIVE_EXPERTS.  It adds
 #   strata-dsv41-expert-server   the server for a host without a card (host-b) or without the CUDA toolkit yet (the Windows host)
 #   ds4_net_test                 the synthetic split test's program (tools/dsv41/synthetic_split_test.py runs it)
+#   strata-dsv41-expert-server-test   the server with the test hooks (STRATA_TEST_HOOKS); only that test runs it
 # Both are made of src/dsv41/ds4_net.cpp (expert map, CPU expert host, conductor Remote), the protocol (net_experts.cpp, compiled
 # through ds4_net_proto.cpp without the qwen38 pool) and the dsv41 engine's own CPU lane (ds4_gguf_cpu / ds4_iq_cpu / ds4_tq_cpu /
 # ds4_gg_cpu + ggml-cpu): the same files strata-dsv41 uses, so the rows are the same bits.
@@ -30,11 +31,18 @@ if(STRATA_BUILD_DSV41_EXPERT_SERVER AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_EN
   target_compile_definitions(strata_dsv41_expert_host PUBLIC STRATA_DSV41_TQ_CPU=1)
   target_link_libraries(strata_dsv41_expert_host PUBLIC strata_kernels_cpu Threads::Threads)
   if(WIN32)
-    target_link_libraries(strata_dsv41_expert_host PUBLIC ws2_32)
+    target_link_libraries(strata_dsv41_expert_host PUBLIC ws2_32 bcrypt)   # bcrypt: BCryptGenRandom for the handshake nonce
   endif()
 
   add_executable(strata-dsv41-expert-server src/dsv41/ds4_expert_server_main.cpp)
   target_link_libraries(strata-dsv41-expert-server PRIVATE strata_dsv41_expert_host)
+
+  # The same server with the test hooks (STRATA_DS4_SERVER_DIE_AFTER / _DELAY_MS) compiled in: ONLY tools/dsv41/synthetic_split_test.py runs
+  # it, for the "server dies mid-run" and "slow server" cases.  strata-dsv41-expert-server above is built without them and ignores both
+  # variables (the test checks that too).  ds4_net.cpp is compiled again here with STRATA_TEST_HOOKS; the rest comes from the library.
+  add_executable(strata-dsv41-expert-server-test src/dsv41/ds4_expert_server_main.cpp src/dsv41/ds4_net.cpp)
+  target_compile_definitions(strata-dsv41-expert-server-test PRIVATE STRATA_TEST_HOOKS=1)
+  target_link_libraries(strata-dsv41-expert-server-test PRIVATE strata_dsv41_expert_host)
 
   add_executable(ds4_net_test tests/dsv41/ds4_net_test.cpp)
   target_link_libraries(ds4_net_test PRIVATE strata_dsv41_expert_host)

@@ -4,6 +4,7 @@
 #include "strata/core/net_experts.hpp"
 
 #include "strata/core/net_proto.hpp"
+#include "strata/core/net_random.hpp"
 #include "strata/kernels/window_limits.hpp"
 // STRATA_NET_NO_QWEN: the dsv41 expert server (src/dsv41/ds4_net_server.cpp) compiles this file without the qwen38 engine's
 // expert pool, layout and kernels: only the protocol, the client and the generic server loop (serve_experts with a callback).
@@ -167,6 +168,17 @@ std::string env_token() {
     const char* t = std::getenv("STRATA_EXPERT_TOKEN");
     return t != nullptr ? std::string(t) : std::string();
 }
+/// The token of the environment for a server start or a client connect.  False, with the reason in `err`, for a token under
+/// 16 bytes (STRATA_EXPERT_ALLOW_SHORT_TOKEN=1 lets a test through); an empty token is not this gate's business.
+bool token_from_env(std::string& out, std::string& err) {
+    out = env_token();
+    if (np::token_ok(out)) return true;
+    const char* allow = std::getenv("STRATA_EXPERT_ALLOW_SHORT_TOKEN");
+    if (allow != nullptr && *allow == '1') return true;
+    err = "STRATA_EXPERT_TOKEN is " + std::to_string(out.size()) + " bytes; use at least " + std::to_string(np::kMinTokenBytes) +
+          " (a short token can be guessed offline from one captured HELLO)";
+    return false;
+}
 
 void sock_tune(sock_t s, bool keepalive) {
     int one = 1;
@@ -301,13 +313,6 @@ void hello_mac(const std::string& token, const uint8_t nonce[32], const HelloMsg
     np::hmac_sha256(token.data(), token.size(), nonce, 32, &h, kHelloSigned, out);
 }
 
-void random_bytes(uint8_t* p, size_t n) {
-    std::random_device rd;   // getrandom / /dev/urandom / RtlGenRandom
-    for (size_t i = 0; i < n; i += 4) {
-        uint32_t v = rd() ^ (uint32_t) Clock::now().time_since_epoch().count();
-        std::memcpy(p + i, &v, std::min<size_t>(4, n - i));
-    }
-}
 }  // namespace
 
 // ================================================================== identity
@@ -422,7 +427,7 @@ bool NetExperts::open(const std::string& spec, int64_t n_layers, int64_t n_exper
     id_ = id;
     H_ = id.n_embd != 0 ? (int64_t) id.n_embd : kQwenH;
     if (H_ <= 0) { err = "the model identity has no hidden size (NetIdentity::n_embd)"; return false; }
-    token_ = env_token();
+    if (!token_from_env(token_, err)) return false;
     size_t pos = 0;
     std::vector<np::RouteSpec> specs;
     while (pos < spec.size()) {
@@ -735,7 +740,7 @@ void handshake_thread(ServerCtx* C, sock_t s) {
     sock_tune(s, false);
     ChallengeMsg ch{};
     ch.version = kProtoVersion; ch.flags = C->token.empty() ? 0u : 1u;
-    random_bytes(ch.nonce, 32);
+    if (!np::os_random(ch.nonce, 32)) return finish_fail("", "no random nonce from the operating system");
     if (!send_frame(s, kChallenge, &ch, sizeof ch)) return finish_fail("", "challenge not sent (" + g_why + ")");
     uint32_t type = 0;
     std::vector<uint8_t> in;
@@ -844,6 +849,8 @@ int serve_experts(const ExpertServeCfg& cfg, const ExpertComputeFn& compute) {
         std::fprintf(stderr, "strata net: the expert server is misconfigured: %s\n", why.c_str());
         return 1;
     }
+    std::string token, token_err;
+    if (!token_from_env(token, token_err)) { std::fprintf(stderr, "strata net: %s\n", token_err.c_str()); return 1; }   // before the warm-up, which takes minutes
     ignore_sigpipe();
     if (!sock_init()) return 1;
     const int lo = cfg.layer_lo, hi = cfg.layer_hi < 0 ? (int) cfg.n_layers - 1 : cfg.layer_hi;
@@ -851,7 +858,7 @@ int serve_experts(const ExpertServeCfg& cfg, const ExpertComputeFn& compute) {
 
     ServerCtx C;
     C.cfg = &cfg;
-    C.token = env_token();
+    C.token = token;
     C.tmo_ms = timeout_ms();
     C.H = cfg.identity.n_embd != 0 ? (int64_t) cfg.identity.n_embd : kQwenH;
     if (C.H <= 0) { std::fprintf(stderr, "strata net: the expert server has no hidden size (identity.n_embd)\n"); return 1; }

@@ -745,17 +745,21 @@ int server_main(int argc, char** argv) {
 #if defined(STRATA_DS4_NET_GPU)
     if (gpuh) { cfg.gpu = true; cfg.gpu_user = gpuh.get(); cfg.gpu_rows = [](void* u) -> uint64_t { return ((GpuExpertHost*) u)->rows(); }; }
 #endif
+#ifdef STRATA_TEST_HOOKS   // only strata-dsv41-expert-server-test (tools/dsv41/synthetic_split_test.py): the released server does not read these
     long die_after = 0;   // test hook: the server exits after N requests, as if the host had gone (STRATA_DS4_SERVER_DIE_AFTER)
     if (const char* v = std::getenv("STRATA_DS4_SERVER_DIE_AFTER")) die_after = std::atol(v);
     std::atomic<long> served{0};
     long delay_ms = 0;   // test hook (BBXL S4): every request takes this long more, so the timing tests are deterministic (STRATA_DS4_SERVER_DELAY_MS)
     if (const char* v = std::getenv("STRATA_DS4_SERVER_DELAY_MS")) delay_ms = std::atol(v);
+#endif
     std::fprintf(stderr, "strata net: dsv41 expert server, %d layers x %d experts (top-%d), hidden %d, ffn %d, threads %d, fingerprint %s\n",
                  map.n_layers, map.n_exp, map.top_k, map.dim, map.ff, std::max(1, threads > 0 ? threads : (int) std::thread::hardware_concurrency()),
                  np::hex(cfg.identity.fingerprint, 8).c_str());
     return core::serve_experts(cfg, [&](uint32_t layer, uint32_t n_tok, uint32_t k, int, const int32_t* ids, const uint8_t* mask, const float* x, float* out, std::string& e2) {
+#ifdef STRATA_TEST_HOOKS
         if (die_after > 0 && ++served > die_after) { std::fprintf(stderr, "strata net: STRATA_DS4_SERVER_DIE_AFTER reached, exiting\n"); std::fflush(stderr); std::_Exit(3); }
         if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+#endif
 #if defined(STRATA_DS4_NET_GPU)
         if (gpuh && gpuh->holds((int) layer)) {
             // BBXL S5 x S3: a prompt window holds up to kMaxPromptTok (32) tokens, the GPU lane's buffers and the engine's window kernels kMaxTok (16):

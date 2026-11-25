@@ -58,7 +58,10 @@ strata ... --remote-experts 192.0.2.10:7840=38-47[,host2:7840=24-37]
 - `--listen` takes `host:port`, `[v6addr]:port` or a bare port, and **binds exactly that address**. The default is
   `127.0.0.1:7840`: reachable from this PC only (the localhost test below). For a conductor on another PC write the
   interface address (`192.0.2.10:7840`) or, deliberately, `0.0.0.0:7840` (every interface). Ports must be 1..65535 and
-  `--serve-layers a-b` / `--remote-experts` ranges are digits only: a typo is an error, never a silent 0.
+  `--serve-layers a-b` / `--remote-experts` ranges are digits only: a typo is an error, never a silent 0
+  (`strata-expert-server --serve-layers x` prints `bad --serve-layers 'x' (want A or A-B)` and exits with status 2; so does
+  `--pool-workers` outside 1..256; `strata-expert-server --check-args ...` parses the command line and exits, which is what
+  `tools/test_expert_server_args.py` runs in CI).
 - Layer ranges are inclusive and must not overlap; the handshake checks the protocol version (both directions), n_embd,
   n_expert, n_layers, a **model fingerprint**, the **CPU kernel path** and that the server's range covers the requested one.
   The fingerprint is a SHA-256 over the expert layout (tensor types, per-layer formats, offsets, sizes) and the sizes of
@@ -89,8 +92,11 @@ port 7840 proto tcp`), and never expose it to the internet.
 - **Bind address.** Loopback unless you write another address after `--listen`. A non-loopback bind prints a warning with
   the address, and **is refused when no token is set** (`STRATA_EXPERT_ALLOW_NO_TOKEN=1` overrides it, for a closed test
   network only).
-- **Shared secret.** Set `STRATA_EXPERT_TOKEN` (any string, 16+ random characters; never put it on a command line) in the
-  environment of the server **and** the conductor. The server sends a random 32-byte nonce; the conductor answers in HELLO
+- **Shared secret.** Set `STRATA_EXPERT_TOKEN` (16 or more bytes, random; never put it on a command line) in the
+  environment of the server **and** the conductor. A shorter token is refused at server start and at conductor connect
+  (`STRATA_EXPERT_TOKEN is N bytes; use at least 16`; `STRATA_EXPERT_ALLOW_SHORT_TOKEN=1` lifts it for a test, never for a
+  real network: a short token can be guessed offline from one captured HELLO). The server's nonce comes from the operating
+  system (`getrandom`, `arc4random_buf`, `BCryptGenRandom`), never from `std::random_device`. The server sends a random 32-byte nonce; the conductor answers in HELLO
   with `HMAC-SHA256(token, nonce || hello fields)`; the server compares in constant time and refuses with a generic
   "authentication failed". The token never crosses the wire and a recorded HELLO cannot be replayed (new nonce per
   connection). A server with a token refuses a conductor without one, and the other way round the conductor refuses a server

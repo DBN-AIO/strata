@@ -45,7 +45,8 @@ struct Options {
     int listen_port = 7840;
     std::string listen_host;       ///< --listen HOST:PORT (empty: 127.0.0.1)
     std::string serve_layers;      ///< "a-b" (inclusive); empty: every layer
-    int pool_workers = 0;          ///< 0: every physical core minus the host's (the engine's default)
+    int pool_workers = 0;          ///< 0: every physical core minus the host's (the engine's default); a flag value is 1..256
+    bool check_args = false;       ///< --check-args: parse the command line, report, exit (no model is opened)
     bool no_host_worker = false;
     bool help = false;
 };
@@ -57,7 +58,8 @@ void usage(std::FILE* f) {
         "  --native SHARD1      the model's first GGUF shard (the experts are read from the shards in place)\n"
         "  --listen [HOST:]PORT bind address (default 127.0.0.1:7840; a bare port is loopback)\n"
         "  --serve-layers A-B   layers to hold in RAM and answer for, inclusive (default: all)\n"
-        "  --pool-workers N     CPU expert pool worker count (default 0: every physical core minus the host's)\n"
+        "  --pool-workers N     CPU expert pool worker count, 1..256 (default: every physical core minus the host's)\n"
+        "  --check-args         parse the command line, print `arguments ok` and exit 0 (opens no model)\n"
         "  --no-host-worker     the calling thread does not take expert jobs (A/B arm)\n"
         "  --expert-server      accepted (this program is the expert server)\n"
         "  ignored, taking the engine's command line: --gpu --max-context --prefill --spec --expert-profile --expert-cache\n"
@@ -90,11 +92,26 @@ bool parse(int argc, char** argv, Options& o) {
             std::string why;
             if (!strata::core::netproto::parse_hostport(next("--listen"), "127.0.0.1", 7840, true, o.listen_host, o.listen_port, why)) {
                 std::fprintf(stderr, "strata-expert-server: --listen: %s\n", why.c_str());
-                return 2;
+                return false;
             }
         }
-        else if (a == "--serve-layers") o.serve_layers = next("--serve-layers");
-        else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
+        else if (a == "--serve-layers") {
+            o.serve_layers = next("--serve-layers");
+            if (!strata::core::netproto::serve_layers_ok(o.serve_layers)) {
+                std::fprintf(stderr, "strata-expert-server: bad --serve-layers '%s' (want A or A-B)\n", o.serve_layers.c_str());
+                return false;
+            }
+        }
+        else if (a == "--pool-workers") {
+            const std::string v = next("--pool-workers");
+            long w = 0;
+            if (!strata::core::netproto::parse_uint(v, 1, 256, w)) {
+                std::fprintf(stderr, "strata-expert-server: bad --pool-workers '%s' (want 1..256)\n", v.c_str());
+                return false;
+            }
+            o.pool_workers = (int) w;
+        }
+        else if (a == "--check-args") o.check_args = true;
         else if (a == "--no-host-worker") o.no_host_worker = true;
         else if (a == "--help" || a == "-h") o.help = true;
         else if (ignored_flag(a, tv)) {
@@ -169,6 +186,7 @@ int main(int argc, char** argv) {
     Options o;
     if (!parse(argc, argv, o)) return 2;
     if (o.help) { usage(stdout); return 0; }
+    if (o.check_args) { std::printf("strata-expert-server: arguments ok\n"); return 0; }
     if (o.native.empty()) {
         std::fprintf(stderr, "strata-expert-server: --native is required, and --pack for a Flash-Next model (--help)\n");
         return 2;
@@ -265,9 +283,7 @@ int main(int argc, char** argv) {
     sc.layer_lo = 0;
     sc.layer_hi = (int) g.n_layers - 1;
     if (!o.serve_layers.empty()) {
-        const size_t dash = o.serve_layers.find('-');
-        sc.layer_lo = std::atoi(o.serve_layers.c_str());
-        sc.layer_hi = dash == std::string::npos ? sc.layer_lo : std::atoi(o.serve_layers.c_str() + dash + 1);
+        strata::core::netproto::parse_range(o.serve_layers, 0, 100000, sc.layer_lo, sc.layer_hi);   // (checked in parse())
     }
     if (sc.layer_lo < 0 || sc.layer_hi < sc.layer_lo || sc.layer_hi >= g.n_layers) {
         std::fprintf(stderr, "strata-expert-server: --serve-layers a-b is outside 0..%lld\n", (long long) g.n_layers - 1);
