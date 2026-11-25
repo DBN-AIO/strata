@@ -53,7 +53,7 @@ commands (nothing is started): the conductor keeps the first layers, each server
 fits its RAM after a 15% headroom.
 
 ```sh
-python tools/remote_experts_plan.py --shards MODEL-00001-of-0000N.gguf     --host rig=192.0.2.10:7840:24 --host t340=192.0.2.11:7840:48        # NAME=ADDRESS:PORT:RAM_GB
+python tools/remote_experts_plan.py --shards MODEL-00001-of-0000N.gguf     --host rig=192.0.2.10:7840:24 --host box2=192.0.2.11:7840:48        # NAME=ADDRESS:PORT:RAM_GB
 python tools/remote_experts_plan.py --layers 48 --layer-gib 0.71 --host rig=192.0.2.10:7840:12   # without the files
 ```
 

@@ -6,7 +6,7 @@ The conductor keeps the first layers (and attention, router, shared expert); eve
 layers, as many as its RAM holds (after a headroom), in the order the hosts are given.
 
     python tools/remote_experts_plan.py --shards MODEL-00001-of-0000N.gguf [...] \
-        --host rig=192.0.2.10:7840:24 --host t340=192.0.2.11:7840:48 [--headroom 0.15] [--json]
+        --host rig=192.0.2.10:7840:24 --host box2=192.0.2.11:7840:48 [--headroom 0.15] [--json]
     python tools/remote_experts_plan.py --layers 48 --layer-gib 0.71 --host rig=192.0.2.10:7840:24    # no files
 
 --host NAME=ADDRESS:PORT:RAM_GB (RAM_GB = memory the server may use for experts).  Nothing is started or changed.
